@@ -59,8 +59,26 @@ def build_dashboard(
         else "[green]INACTIVE[/green]"
     )
 
+    # V4: VIX display
+    vix_str = ""
+    if config.VIX_RISK_SCALING_ENABLED:
+        try:
+            from risk import get_vix_level, get_vix_risk_scalar
+            vix = get_vix_level()
+            scalar = get_vix_risk_scalar()
+            if vix >= 40:
+                vix_str = f" | VIX: [bold red blink]{vix:.0f} HALT[/bold red blink]"
+            elif vix >= 30:
+                vix_str = f" | VIX: [bold red]{vix:.0f}[/bold red] ({scalar:.0%})"
+            elif vix >= 25:
+                vix_str = f" | VIX: [yellow]{vix:.0f}[/yellow] ({scalar:.0%})"
+            else:
+                vix_str = f" | VIX: [green]{vix:.0f}[/green]"
+        except Exception:
+            pass
+
     # Header
-    header = f"  ALGO BOT V3 | {mode} MODE | Regime: {regime_text} | Up: {uptime}"
+    header = f"  ALGO BOT V4 | {mode} MODE | Regime: {regime_text}{vix_str} | Up: {uptime}"
 
     # Portfolio section
     day_pnl_dollars = risk.day_pnl * risk.starting_equity if risk.starting_equity else 0
@@ -199,7 +217,7 @@ def build_dashboard(
     content += f"{sep}\n RECENT TRADES\n" + "\n".join(recent_lines) + "\n"
     content += f"{sep}\n{footer}"
 
-    return Panel(content, title="[bold cyan]ALGO TRADING BOT V3[/bold cyan]", border_style="cyan")
+    return Panel(content, title="[bold cyan]ALGO TRADING BOT V4[/bold cyan]", border_style="cyan")
 
 
 def print_day_summary(summary: dict):

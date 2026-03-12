@@ -1,119 +1,134 @@
-# Algo Trading Bot V2
+# Algo Trading Bot V4
 
-Algorithmic trading bot using Alpaca API with three strategies: Opening Range Breakout (ORB), VWAP Mean Reversion, and Catalyst Momentum.
+<!-- Badges -->
+![CI](https://github.com/YOUR_USERNAME/trading-bot/actions/workflows/ci.yml/badge.svg)
+[![codecov](https://codecov.io/gh/YOUR_USERNAME/trading-bot/badge.svg)](https://codecov.io/gh/YOUR_USERNAME/trading-bot)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 
-## Quick Start (< 5 minutes)
+An automated equity trading bot built on the Alpaca API, featuring 6 strategies, ML-based signal filtering, real-time WebSocket monitoring, and a web dashboard. Supports both paper and live trading with comprehensive risk management.
 
-### 1. Get Alpaca API Keys
+---
 
-Sign up at [alpaca.markets](https://alpaca.markets) and create a paper trading API key.
-
-### 2. Install Dependencies
+## Quick Start
 
 ```bash
-cd trading_bot
+git clone https://github.com/YOUR_USERNAME/trading-bot.git
+cd trading-bot
 pip install -r requirements.txt
 ```
 
-### 3. Set Environment Variables
+Set your environment variables:
 
 ```bash
 export ALPACA_API_KEY="your-api-key"
-export ALPACA_API_SECRET="your-api-secret"
+export ALPACA_SECRET_KEY="your-secret-key"
+export ALPACA_LIVE=false          # true for live trading
+export TELEGRAM_TOKEN=""          # optional
+export TELEGRAM_CHAT_ID=""        # optional
 ```
 
-### 4. Run
+Run:
 
 ```bash
 python main.py
 ```
 
-Paper mode by default. For live trading: `python main.py --live`
+---
 
-### 5. Run Backtest
+## Strategies
 
-```bash
-python main.py --backtest
-```
+| Strategy | Type | Hold | Description |
+|---|---|---|---|
+| ORB | Breakout | Day | Opening range breakout with 3:1 R/R |
+| VWAP | Mean Reversion | Day | VWAP band bounce with time stop |
+| Momentum | Trend | Swing | Multi-day momentum continuation |
+| Gap & Go | Breakout | Day | Pre-market gap continuation |
+| Sector Rotation | Momentum | Swing | Sector ETF relative strength |
+| Pairs Trading | Market-Neutral | Swing | Cointegration-based pairs |
 
-## V2 Features
+---
 
-### Three Strategies
-- **ORB**: Trades breakouts above 30-min opening range. 3:1 R/R. Exits by 3:45 PM.
-- **VWAP**: Buys at lower VWAP band with RSI confirmation. 45-min time stop.
-- **Momentum**: Trades post-catalyst continuation. Holds 1-5 days. Max 1 position.
-
-### 150 Symbol Universe
-- 50 core liquid stocks/ETFs + 100 extended (growth, sector ETFs, mid-caps)
-- Leveraged ETFs restricted to VWAP strategy only
-
-### Smart Filters
-- Earnings filter (skips trades within 48h of earnings)
-- Correlation filter (skips if >75% correlated with open position)
-
-### ATR-Based Position Sizing
-- Risks 1% of portfolio per trade based on stop distance
-- Hard cap: 6% per position. Bearish regime cuts size 40%.
-
-### SQLite Database (bot.db)
-- All trades, signals, daily snapshots, backtest results logged
-- Open positions persisted (replaces state.json)
-
-### Backtesting Engine
-- 6 months hourly data via yfinance
-- Slippage + commission simulation. Results saved to DB.
-
-### Performance Dashboard
-- Sharpe, Sortino, profit factor, max drawdown
-- Strategy attribution, week P&L, earnings exclusion count
-
-## Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ALPACA_API_KEY` | (required) | Alpaca API key |
-| `ALPACA_API_SECRET` | (required) | Alpaca API secret |
-| `ALPACA_LIVE` | `false` | `true` for live trading |
-| `ALLOW_SHORT` | `false` | Enable short selling |
-| `ALLOW_MOMENTUM` | `true` | Enable momentum strategy |
-
-## File Structure
+## Architecture
 
 ```
 trading_bot/
-├── main.py              # Entry point (--backtest, --live)
-├── config.py            # Settings, 150 symbols, leveraged ETFs
-├── database.py          # SQLite schema + queries
-├── data.py              # Alpaca data fetching
-├── strategies/          # Strategy package
-│   ├── base.py          # Signal dataclass
-│   ├── regime.py        # Market regime (SPY EMA)
-│   ├── orb.py           # Opening Range Breakout
-│   ├── vwap.py          # VWAP Mean Reversion
-│   └── momentum.py      # Catalyst Momentum
-├── backtester.py        # 6-month backtest engine
-├── execution.py         # Order placement
-├── risk.py              # ATR sizing + circuit breaker
-├── earnings.py          # Earnings filter
-├── correlation.py       # Correlation filter
-├── analytics.py         # Sharpe, Sortino, drawdown
-├── dashboard.py         # Rich terminal UI V2
-├── start.sh / stop.sh / status.sh
-├── trading_bot.service  # Systemd unit
-└── requirements.txt
+  main.py            # Entry point, orchestrator loop
+  config.py          # All configuration flags and parameters
+  data.py            # Market data fetching and caching
+  strategies/        # Strategy implementations (ORB, VWAP, Momentum, etc.)
+  execution.py       # Order routing, bracket orders, position management
+  risk.py            # Risk manager, circuit breaker, position sizing
+  dashboard.py       # Rich terminal dashboard + web dashboard
+  models/            # ML signal filter model artifacts
+  tests/             # Test suite
+  requirements.txt
+  Dockerfile
+  docker-compose.yml
 ```
 
-## Month 1 Testing Guide
+---
 
-**Week 1** (done): Validate basic mechanics run correctly.
+## Features
 
-**Week 2**: Run V2 paper mode. Monitor strategy attribution.
+### V3
+- ML-based signal filter for trade quality scoring
+- WebSocket real-time price monitoring
+- Dynamic capital allocation across strategies
+- Short selling support
+- Telegram alerts for fills, errors, and daily P&L
+- Web dashboard with live positions and equity curve
 
-**Week 3**: Run backtest, compare to live paper results.
+### V4
+- Multi-timeframe (MTF) confirmation for entries
+- VIX-based risk scaling (reduce size in high-vol regimes)
+- News sentiment filter via API integration
+- Sector rotation strategy with ETF relative strength
+- Pairs trading with cointegration detection
+- Advanced exits: scaled take-profits, trailing stops, RSI-based exits, volatility-based exits
+- Docker deployment
+- Comprehensive test suite with CI/CD
 
-**Week 4**: If Sharpe > 0.8, win rate > 50% for 3 weeks, consider small live test ($1k max).
+---
 
-### Daily Checklist
-- ORB signals: 3-8/day. VWAP: 5-15/day. Momentum: 0-2/week.
-- Too many time-stops = entries too early.
-- Check `./status.sh` and `bot.log` daily.
+## Configuration Reference
+
+| Flag | Default | Description |
+|---|---|---|
+| `ALPACA_LIVE` | `false` | Paper vs live trading |
+| `MAX_POSITIONS` | `10` | Maximum concurrent positions |
+| `MAX_DAILY_LOSS` | `-2.5%` | Circuit breaker threshold |
+| `ORB_ENABLED` | `true` | Enable ORB strategy |
+| `VWAP_ENABLED` | `true` | Enable VWAP strategy |
+| `MOMENTUM_ENABLED` | `true` | Enable Momentum strategy |
+| `GAP_GO_ENABLED` | `true` | Enable Gap & Go strategy |
+| `SECTOR_ROTATION_ENABLED` | `false` | Enable Sector Rotation |
+| `PAIRS_ENABLED` | `false` | Enable Pairs Trading |
+| `ML_FILTER` | `true` | Enable ML signal filter |
+| `VIX_SCALING` | `true` | Scale risk by VIX level |
+| `NEWS_FILTER` | `false` | Enable news sentiment filter |
+| `TELEGRAM_ENABLED` | `false` | Enable Telegram alerts |
+| `WEB_DASHBOARD` | `false` | Enable web dashboard |
+| `SCAN_INTERVAL` | `60` | Seconds between scans |
+
+---
+
+## Docker
+
+```bash
+docker-compose up -d
+```
+
+The bot runs in a container with automatic restarts. Set environment variables in `.env` or `docker-compose.yml`.
+
+---
+
+## Risk Warning
+
+> **This is experimental software. Use at your own risk. Past performance is not indicative of future results.** Trading equities involves substantial risk of loss. This software is provided for educational and research purposes. The authors are not responsible for any financial losses incurred through the use of this software.
+
+---
+
+## License
+
+[MIT](LICENSE)

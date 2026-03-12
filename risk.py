@@ -1,6 +1,7 @@
-"""Risk management — position sizing, circuit breaker, portfolio limits."""
+"""Risk management — position sizing, circuit breaker, portfolio limits, VIX scaling."""
 
 import logging
+import time as time_mod
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -8,6 +9,50 @@ import config
 import database
 
 logger = logging.getLogger(__name__)
+
+# --- V4: VIX Risk Scaling ---
+_vix_cache: tuple[float, float] | None = None  # (vix_value, fetch_timestamp)
+
+
+def get_vix_level() -> float:
+    """Get current VIX level, cached for VIX_CACHE_SECONDS."""
+    global _vix_cache
+
+    now = time_mod.time()
+    if _vix_cache and (now - _vix_cache[1]) < config.VIX_CACHE_SECONDS:
+        return _vix_cache[0]
+
+    try:
+        import yfinance as yf
+        vix = yf.Ticker("^VIX").fast_info.get("last_price", 0)
+        if vix and vix > 0:
+            _vix_cache = (float(vix), now)
+            return float(vix)
+    except Exception as e:
+        logger.warning(f"Failed to fetch VIX: {e}")
+
+    return _vix_cache[0] if _vix_cache else 20.0  # Default to 20 if unavailable
+
+
+def get_vix_risk_scalar() -> float:
+    """Return 0.0-1.0 multiplier for position sizing based on VIX level."""
+    if not config.VIX_RISK_SCALING_ENABLED:
+        return 1.0
+
+    vix = get_vix_level()
+
+    if vix < 15:
+        return 1.0
+    elif vix < 20:
+        return 0.85
+    elif vix < 25:
+        return 0.70
+    elif vix < 30:
+        return 0.50
+    elif vix < config.VIX_HALT_THRESHOLD:
+        return 0.30
+    else:
+        return 0.0  # Halt all new positions
 
 
 @dataclass
@@ -29,6 +74,10 @@ class TradeRecord:
     time_stop: datetime | None = None
     hold_type: str = "day"           # V2: "day" or "swing" (multi-day)
     max_hold_date: datetime | None = None  # V2: for momentum max hold
+    pair_id: str = ""                # V4: links two legs of a pairs trade
+    partial_exits: int = 0           # V4: count of partial exits taken
+    highest_price_seen: float = 0.0  # V4: for trailing stop tracking
+    entry_atr: float = 0.0           # V4: ATR at time of entry
 
 
 @dataclass
@@ -96,6 +145,22 @@ class RiskManager:
             if gap_count >= config.GAP_MAX_POSITIONS:
                 return False, f"Max Gap & Go positions ({config.GAP_MAX_POSITIONS}) reached"
 
+        # V4: Check Sector Rotation limit
+        if strategy == "SECTOR_ROTATION":
+            sector_count = sum(1 for t in self.open_trades.values() if t.strategy == "SECTOR_ROTATION")
+            if sector_count >= config.MAX_SECTOR_POSITIONS:
+                return False, f"Max sector positions ({config.MAX_SECTOR_POSITIONS}) reached"
+
+        # V4: Check Pairs Trading limit
+        if strategy == "PAIRS":
+            pairs_count = len({t.pair_id for t in self.open_trades.values() if t.strategy == "PAIRS" and t.pair_id})
+            if pairs_count >= config.MAX_PAIRS_POSITIONS:
+                return False, f"Max pairs positions ({config.MAX_PAIRS_POSITIONS}) reached"
+
+        # V4: VIX halt check
+        if config.VIX_RISK_SCALING_ENABLED and get_vix_risk_scalar() == 0.0:
+            return False, f"VIX > {config.VIX_HALT_THRESHOLD} — trading halted"
+
         # Check total deployed capital
         deployed = sum(
             t.entry_price * t.qty for t in self.open_trades.values()
@@ -153,6 +218,15 @@ class RiskManager:
         # V3: Short selling size reduction
         if side == "sell":
             position_value *= config.SHORT_SIZE_MULTIPLIER
+
+        # V4: VIX-based risk scaling
+        vix_scalar = get_vix_risk_scalar()
+        if vix_scalar < 1.0:
+            position_value *= vix_scalar
+
+        # V4: Sector rotation uses fixed sizing (5% of portfolio)
+        if strategy == "SECTOR_ROTATION":
+            position_value = self.current_equity * config.SECTOR_POSITION_SIZE_PCT
 
         # Check we don't exceed max deployment
         deployed = sum(t.entry_price * t.qty for t in self.open_trades.values())
@@ -218,6 +292,57 @@ class RiskManager:
         except Exception as e:
             logger.error(f"Failed to log trade to DB: {e}")
 
+    def partial_close(self, symbol: str, qty_to_close: int, exit_price: float,
+                      now: datetime, exit_reason: str = "partial_tp"):
+        """V4: Close a portion of a position. Reduces qty, logs partial P&L."""
+        if symbol not in self.open_trades:
+            return
+
+        trade = self.open_trades[symbol]
+        qty_to_close = min(qty_to_close, trade.qty)
+        if qty_to_close <= 0:
+            return
+
+        # Calculate P&L on closed portion
+        if trade.side == "buy":
+            partial_pnl = (exit_price - trade.entry_price) * qty_to_close
+        else:
+            partial_pnl = (trade.entry_price - exit_price) * qty_to_close
+
+        pnl_pct = partial_pnl / (trade.entry_price * qty_to_close) if trade.entry_price > 0 else 0
+
+        # Update remaining qty
+        trade.qty -= qty_to_close
+        trade.partial_exits += 1
+
+        logger.info(
+            f"Partial exit: {symbol} ({trade.strategy}) closed {qty_to_close} shares "
+            f"P&L=${partial_pnl:+.2f} ({pnl_pct:.1%}) reason={exit_reason} "
+            f"remaining={trade.qty}"
+        )
+
+        # Log partial to DB as a trade
+        try:
+            database.log_trade(
+                symbol=symbol,
+                strategy=trade.strategy,
+                side=trade.side,
+                entry_price=trade.entry_price,
+                exit_price=exit_price,
+                qty=qty_to_close,
+                entry_time=trade.entry_time,
+                exit_time=now,
+                exit_reason=exit_reason,
+                pnl=partial_pnl,
+                pnl_pct=pnl_pct,
+            )
+        except Exception as e:
+            logger.error(f"Failed to log partial trade to DB: {e}")
+
+        # If no shares remaining, remove from open trades
+        if trade.qty <= 0:
+            self.open_trades.pop(symbol)
+
     def get_day_summary(self) -> dict:
         """Generate end-of-day summary stats."""
         all_trades = self.closed_trades
@@ -276,6 +401,10 @@ class RiskManager:
                     hold_type=row.get("hold_type", "day"),
                     time_stop=datetime.fromisoformat(row["time_stop"]) if row.get("time_stop") else None,
                     max_hold_date=datetime.fromisoformat(row["max_hold_date"]) if row.get("max_hold_date") else None,
+                    pair_id=row.get("pair_id", ""),
+                    partial_exits=int(row.get("partial_exits", 0)),
+                    highest_price_seen=float(row.get("highest_price_seen", 0.0)),
+                    entry_atr=float(row.get("entry_atr", 0.0)),
                 )
             logger.info(f"Restored {len(self.open_trades)} open trades from database")
         except Exception as e:

@@ -1,6 +1,7 @@
-"""V3: FastAPI web dashboard — portfolio history, trade log, signal analysis."""
+"""V4: FastAPI web dashboard — portfolio history, trade log, signal analysis, health check."""
 
 import logging
+import time as _time
 from datetime import datetime
 
 from fastapi import FastAPI, Query
@@ -11,7 +12,36 @@ import database
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Trading Bot V3 Dashboard", docs_url=None, redoc_url=None)
+app = FastAPI(title="Trading Bot V4 Dashboard", docs_url=None, redoc_url=None)
+
+_start_time = _time.time()
+
+
+@app.get("/health")
+async def health():
+    """Health check for Docker / monitoring."""
+    uptime_sec = _time.time() - _start_time
+    try:
+        positions = database.load_open_positions()
+        open_count = len(positions)
+    except Exception:
+        open_count = -1
+
+    vix_level = None
+    if config.VIX_RISK_SCALING_ENABLED:
+        try:
+            from risk import get_vix_level
+            vix_level = get_vix_level()
+        except Exception:
+            pass
+
+    return {
+        "status": "ok",
+        "uptime_seconds": round(uptime_sec),
+        "open_positions": open_count,
+        "vix": vix_level,
+        "paper_mode": config.PAPER_MODE,
+    }
 
 
 # --- API Endpoints ---

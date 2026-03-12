@@ -13,6 +13,7 @@ class Signal:
     stop_loss: float
     reason: str = ""
     hold_type: str = "day"  # "day" or "swing" (multi-day)
+    pair_id: str = ""       # V4: links two legs of a pairs trade
 
 
 @dataclass

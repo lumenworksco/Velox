@@ -232,6 +232,59 @@ SECTOR_MAP = {
     "CELH": "XLP",
 }
 
+# =============================================================================
+# V4 ADDITIONS
+# =============================================================================
+
+# --- V4: Multi-Timeframe Signal Confirmation ---
+MTF_CONFIRMATION_ENABLED = os.getenv("MTF_CONFIRMATION_ENABLED", "true") == "true"
+MTF_CACHE_SECONDS = 300              # Cache higher-TF result for 5 minutes
+
+# --- V4: VIX-Based Dynamic Risk Scaling ---
+VIX_RISK_SCALING_ENABLED = os.getenv("VIX_RISK_SCALING_ENABLED", "true") == "true"
+VIX_HALT_THRESHOLD = 40              # VIX > 40 = halt all new positions
+VIX_CACHE_SECONDS = 900              # Refresh VIX every 15 minutes
+
+# --- V4: News Sentiment Filter ---
+NEWS_FILTER_ENABLED = os.getenv("NEWS_FILTER_ENABLED", "true") == "true"
+NEWS_LOOKBACK_HOURS = 24             # Check news from last 24 hours
+NEWS_CACHE_CLEAR_TIME = time(9, 25)  # Clear stale news at 9:25 AM
+
+# --- V4: Sector Rotation Strategy ---
+SECTOR_ROTATION_ENABLED = os.getenv("SECTOR_ROTATION_ENABLED", "false") == "true"
+SECTOR_ROTATION_ETFS = [
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLP", "XLY", "XLB", "XLU", "XLRE", "XLC",
+]
+MAX_SECTOR_POSITIONS = 4             # Max 2 long + 2 short
+SECTOR_POSITION_SIZE_PCT = 0.05      # 5% of portfolio per sector position
+SECTOR_STOP_PCT = 0.035              # -3.5% stop loss
+SECTOR_MAX_HOLD_DAYS = 10            # Max 10 trading days
+SECTOR_SCAN_TIME = time(10, 30)      # Daily scan at 10:30 AM
+SECTOR_MIN_SCORE = 0.005             # Min momentum score to enter
+
+# --- V4: Pairs Trading Strategy ---
+PAIRS_TRADING_ENABLED = os.getenv("PAIRS_TRADING_ENABLED", "false") == "true"
+MAX_PAIRS_POSITIONS = 3              # Max 3 active pairs
+PAIRS_ZSCORE_ENTRY = 2.0             # Enter when z-score > 2.0
+PAIRS_ZSCORE_EXIT = 0.5              # Exit when z-score < 0.5
+PAIRS_ZSCORE_STOP = 3.5              # Stop loss: z-score > 3.5 (diverging)
+PAIRS_MAX_HOLD_DAYS = 15             # Max 15 trading days
+PAIRS_MIN_CORRELATION = 0.85         # Min correlation for pair selection
+PAIRS_REVALIDATION_THRESHOLD = 0.75  # Drop pair if correlation < 0.75
+PAIRS_DISCOVERY_SYMBOLS = 80         # Top N most liquid for pair discovery
+PAIRS_COINT_PVALUE = 0.05            # Cointegration significance threshold
+
+# --- V4: Advanced Exit Mechanics ---
+ADVANCED_EXITS_ENABLED = os.getenv("ADVANCED_EXITS_ENABLED", "true") == "true"
+SCALED_TP_ENABLED = True             # Scaled take profit (33%/50%/rest)
+BREAKEVEN_STOP_ENABLED = True        # Move stop to breakeven after first partial
+RSI_EXIT_THRESHOLD = 80              # Exit if RSI > 80 and profitable
+ATR_EXPANSION_MULT = 2.0             # Exit if ATR > 2x entry ATR and losing
+TRAILING_STOP_PCT = 0.015            # 1.5% trailing stop for swing positions
+
+# --- V4: Async Mode ---
+ASYNC_MODE = os.getenv("ASYNC_MODE", "false") == "true"
+
 # --- V3: Runtime-mutable strategy parameters (can be updated by optimizer) ---
 _runtime_params: dict = {}
 

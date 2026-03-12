@@ -6,6 +6,8 @@ from strategies.orb import ORBStrategy
 from strategies.vwap import VWAPStrategy
 from strategies.momentum import MomentumStrategy
 from strategies.gap_go import GapGoStrategy
+from strategies.sector_rotation import SectorRotationStrategy
+from strategies.pairs_trading import PairsTradingStrategy
 
 __all__ = [
     "Signal",
@@ -16,4 +18,6 @@ __all__ = [
     "VWAPStrategy",
     "MomentumStrategy",
     "GapGoStrategy",
+    "SectorRotationStrategy",
+    "PairsTradingStrategy",
 ]

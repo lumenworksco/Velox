@@ -30,10 +30,18 @@ def _send_telegram(message: str):
         logger.warning(f"Telegram notification failed: {e}")
 
 
-def notify_trade_opened(symbol: str, side: str, strategy: str,
-                        entry_price: float, qty: int,
-                        take_profit: float, stop_loss: float):
-    """Notify when a new position is opened."""
+def notify_trade_opened(trade_or_symbol, side=None, strategy=None,
+                        entry_price=None, qty=None,
+                        take_profit=None, stop_loss=None):
+    """Notify when a new position is opened. Accepts a TradeRecord or individual fields."""
+    if hasattr(trade_or_symbol, "symbol"):
+        t = trade_or_symbol
+        symbol, side, strategy = t.symbol, t.side, t.strategy
+        entry_price, qty = t.entry_price, t.qty
+        take_profit, stop_loss = t.take_profit, t.stop_loss
+    else:
+        symbol = trade_or_symbol
+
     arrow = "\U0001f4c8" if side == "buy" else "\U0001f4c9"
     _send_telegram(
         f"{arrow} <b>OPENED</b> {side.upper()} {symbol}\n"
@@ -43,9 +51,21 @@ def notify_trade_opened(symbol: str, side: str, strategy: str,
     )
 
 
-def notify_trade_closed(symbol: str, pnl: float, pnl_pct: float,
-                        exit_reason: str, hold_time: str = ""):
-    """Notify when a position is closed."""
+def notify_trade_closed(trade_or_symbol, pnl=None, pnl_pct=None,
+                        exit_reason=None, hold_time=""):
+    """Notify when a position is closed. Accepts a TradeRecord or individual fields."""
+    if hasattr(trade_or_symbol, "symbol"):
+        t = trade_or_symbol
+        symbol = t.symbol
+        pnl = t.pnl if pnl is None else pnl
+        pnl_pct = (t.pnl / (t.entry_price * t.qty) if t.entry_price * t.qty > 0 else 0) if pnl_pct is None else pnl_pct
+        exit_reason = t.exit_reason if exit_reason is None else exit_reason
+    else:
+        symbol = trade_or_symbol
+
+    pnl = pnl or 0
+    pnl_pct = pnl_pct or 0
+    exit_reason = exit_reason or ""
     icon = "\u2705" if pnl > 0 else "\u274c"
     _send_telegram(
         f"{icon} <b>CLOSED</b> {symbol}\n"
@@ -64,15 +84,27 @@ def notify_circuit_breaker(day_pnl_pct: float):
     )
 
 
-def notify_daily_summary(day_pnl: float, day_pnl_pct: float,
-                         n_trades: int, win_rate: float,
-                         best_trade: str, worst_trade: str):
-    """Notify with end-of-day summary."""
+def notify_daily_summary(summary_or_pnl, equity=None, day_pnl_pct=None,
+                         n_trades=None, win_rate=None,
+                         best_trade=None, worst_trade=None):
+    """Notify with end-of-day summary. Accepts a summary dict or individual fields."""
+    if isinstance(summary_or_pnl, dict):
+        s = summary_or_pnl
+        day_pnl = s.get("total_pnl", 0)
+        day_pnl_pct = s.get("pnl_pct", 0)
+        n_trades = s.get("trades", 0)
+        win_rate = s.get("win_rate", 0)
+        best_trade = s.get("best_trade", "N/A")
+        worst_trade = s.get("worst_trade", "N/A")
+    else:
+        day_pnl = summary_or_pnl
+
     _send_telegram(
         f"\U0001f4ca <b>DAILY SUMMARY</b>\n"
         f"P&L: ${day_pnl:+.2f} ({day_pnl_pct:+.2%})\n"
         f"Trades: {n_trades} | Win rate: {win_rate:.0%}\n"
         f"Best: {best_trade} | Worst: {worst_trade}"
+        + (f"\nEquity: ${equity:,.0f}" if equity else "")
     )
 
 
@@ -95,6 +127,28 @@ def notify_ml_retrain(results: dict):
             f"n={metrics['train_samples']}"
         )
     _send_telegram("\n".join(lines))
+
+
+def notify_vix_alert(vix_level: float, risk_scalar: float):
+    """V4: Notify when VIX crosses a significant threshold."""
+    if vix_level >= 40:
+        _send_telegram(
+            f"\U0001f6a8 <b>VIX EXTREME: {vix_level:.1f}</b>\n"
+            f"ALL NEW POSITIONS HALTED\n"
+            f"Managing existing positions only."
+        )
+    elif vix_level >= 30:
+        _send_telegram(
+            f"\u26a0\ufe0f <b>VIX HIGH: {vix_level:.1f}</b>\n"
+            f"Risk scalar: {risk_scalar:.0%}\n"
+            f"Position sizes severely reduced."
+        )
+    elif vix_level >= 25:
+        _send_telegram(
+            f"\U0001f536 <b>VIX ELEVATED: {vix_level:.1f}</b>\n"
+            f"Risk scalar: {risk_scalar:.0%}\n"
+            f"Position sizes reduced."
+        )
 
 
 def notify_optimization(strategy: str, old_sharpe: float, new_sharpe: float,

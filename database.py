@@ -64,7 +64,11 @@ def init_db():
             alpaca_order_id TEXT,
             hold_type TEXT DEFAULT 'day',
             time_stop TEXT,
-            max_hold_date TEXT
+            max_hold_date TEXT,
+            pair_id TEXT DEFAULT '',
+            partial_exits INTEGER DEFAULT 0,
+            highest_price_seen REAL DEFAULT 0.0,
+            entry_atr REAL DEFAULT 0.0
         );
 
         CREATE TABLE IF NOT EXISTS daily_snapshots (
@@ -132,6 +136,25 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_signals_acted ON signals(acted_on);
     """)
     conn.commit()
+
+    # V4: Add new columns to open_positions if they don't exist (migration)
+    try:
+        cursor = conn.execute("PRAGMA table_info(open_positions)")
+        existing_cols = {row["name"] for row in cursor.fetchall()}
+        v4_cols = {
+            "pair_id": "TEXT DEFAULT ''",
+            "partial_exits": "INTEGER DEFAULT 0",
+            "highest_price_seen": "REAL DEFAULT 0.0",
+            "entry_atr": "REAL DEFAULT 0.0",
+        }
+        for col, col_type in v4_cols.items():
+            if col not in existing_cols:
+                conn.execute(f"ALTER TABLE open_positions ADD COLUMN {col} {col_type}")
+                logger.info(f"Added column {col} to open_positions")
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"V4 schema migration note: {e}")
+
     logger.info("Database initialized")
 
 
@@ -177,14 +200,19 @@ def save_open_positions(open_trades: dict):
         conn.execute(
             """INSERT INTO open_positions (symbol, strategy, side, entry_price,
                qty, entry_time, take_profit, stop_loss, alpaca_order_id,
-               hold_type, time_stop, max_hold_date)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               hold_type, time_stop, max_hold_date,
+               pair_id, partial_exits, highest_price_seen, entry_atr)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (symbol, trade.strategy, trade.side, trade.entry_price,
              trade.qty, trade.entry_time.isoformat(), trade.take_profit,
              trade.stop_loss, trade.order_id,
              getattr(trade, 'hold_type', 'day'),
              trade.time_stop.isoformat() if trade.time_stop else None,
-             trade.max_hold_date.isoformat() if getattr(trade, 'max_hold_date', None) else None),
+             trade.max_hold_date.isoformat() if getattr(trade, 'max_hold_date', None) else None,
+             getattr(trade, 'pair_id', ''),
+             getattr(trade, 'partial_exits', 0),
+             getattr(trade, 'highest_price_seen', 0.0),
+             getattr(trade, 'entry_atr', 0.0)),
         )
     conn.commit()
 
