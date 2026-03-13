@@ -104,6 +104,7 @@ BACKTEST_TOP_N = 20                 # Run on top 20 most liquid symbols
 # --- V3: Short Selling ---
 SHORT_SIZE_MULTIPLIER = 0.75         # Short positions = 75% of equivalent long size
 SHORT_HARD_STOP_PCT = 0.04           # Close short if goes against you > 4%
+MOMENTUM_TRAILING_STOP_PCT = 0.02    # Legacy: trailing stop for position monitor
 NO_SHORT_SYMBOLS = {"SPY", "QQQ", "IWM", "DIA"}  # Never short broad market ETFs
 
 # --- V3: Dynamic Capital Allocation ---
@@ -249,6 +250,10 @@ BETA_SKIP_FIRST_MINUTES = 15
 
 # --- V6: Scan Configuration ---
 SCAN_INTERVAL_SEC = 120
+
+# --- WebSocket Position Monitoring ---
+WEBSOCKET_MONITORING = True
+WEBSOCKET_RECONNECT_SEC = 5
 
 # --- Runtime-mutable strategy parameters (can be updated by optimizer) ---
 _runtime_params: dict = {}
