@@ -1,7 +1,7 @@
 # Velox V6 — Autonomous Algorithmic Trading System
 
-![CI](https://github.com/lumenworksco/Trading-Bot/actions/workflows/ci.yml/badge.svg)
-![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+![CI](https://github.com/lumenworksco/Velox-Trader/actions/workflows/ci.yml/badge.svg)
+![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 
 An autonomous equity trading system built on the Alpaca API, targeting consistent low-variance returns through statistical mean reversion. Features volatility-targeted position sizing, daily P&L locking, beta neutralization, and a real-time web dashboard.
@@ -13,8 +13,8 @@ An autonomous equity trading system built on the Alpaca API, targeting consisten
 ## Quick Start
 
 ```bash
-git clone https://github.com/lumenworksco/Trading-Bot.git
-cd Trading-Bot
+git clone https://github.com/lumenworksco/Velox-Trader.git
+cd Velox-Trader
 pip install -r requirements.txt
 ```
 
