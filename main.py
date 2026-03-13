@@ -158,7 +158,7 @@ def sync_positions_with_broker(risk: RiskManager, now: datetime, ws_monitor=None
 
             if ws_monitor:
                 ws_monitor.unsubscribe(symbol)
-            if notifications and config.WHATSAPP_ENABLED:
+            if notifications and config.TELEGRAM_ENABLED:
                 try:
                     notifications.notify_trade_closed(trade)
                 except Exception:
@@ -394,7 +394,7 @@ def _process_single_signal(
         ws_monitor.subscribe(signal.symbol)
 
     # Notification
-    if notifications and config.WHATSAPP_ENABLED:
+    if notifications and config.TELEGRAM_ENABLED:
         try:
             notifications.notify_trade_opened(trade)
         except Exception as e:
@@ -444,7 +444,7 @@ def _handle_strategy_exits(exit_actions: list[dict], risk: RiskManager, now: dat
             risk.close_trade(symbol, exit_price, now, exit_reason=reason)
             if ws_monitor:
                 ws_monitor.unsubscribe(symbol)
-            if notifications and config.WHATSAPP_ENABLED:
+            if notifications and config.TELEGRAM_ENABLED:
                 try:
                     notifications.notify_trade_closed(trade)
                 except Exception:
@@ -467,7 +467,7 @@ def _handle_ws_close(symbol: str, reason: str, risk: RiskManager, ws_monitor):
         risk.close_trade(symbol, trade.entry_price, now_et(), exit_reason=reason)
         ws_monitor.unsubscribe(symbol)
 
-        if notifications and config.WHATSAPP_ENABLED:
+        if notifications and config.TELEGRAM_ENABLED:
             try:
                 notifications.notify_trade_closed(trade)
             except Exception:
@@ -577,7 +577,7 @@ def main():
             console.print(f"[yellow]Web dashboard failed to start: {e}[/yellow]")
 
     # Notifications setup
-    if notifications and config.WHATSAPP_ENABLED:
+    if notifications and config.TELEGRAM_ENABLED:
         console.print("[green]Notifications enabled.[/green]")
 
     # Load filters
@@ -609,7 +609,7 @@ def main():
     features = ["MR60%", "PAIRS25%", "MICRO15%"]
     if config.ALLOW_SHORT:
         features.append("Short")
-    if config.WHATSAPP_ENABLED:
+    if config.TELEGRAM_ENABLED:
         features.append("Notify")
     if config.WEB_DASHBOARD_ENABLED:
         features.append("Web")
@@ -830,7 +830,7 @@ def main():
 
                     # Check circuit breaker
                     if risk.check_circuit_breaker():
-                        if notifications and config.WHATSAPP_ENABLED:
+                        if notifications and config.TELEGRAM_ENABLED:
                             try:
                                 notifications.notify_circuit_breaker(risk.day_pnl)
                             except Exception:
@@ -846,7 +846,7 @@ def main():
                     print_day_summary(summary, consistency_score=latest_consistency_score)
                     logger.info(f"Day summary: {summary}")
 
-                    if notifications and config.WHATSAPP_ENABLED:
+                    if notifications and config.TELEGRAM_ENABLED:
                         try:
                             notifications.notify_daily_summary(summary, risk.current_equity)
                         except Exception as e:
@@ -906,7 +906,7 @@ def main():
                 if (current - last_analytics_update).total_seconds() >= 300:
                     try:
                         current_analytics = analytics_mod.compute_analytics()
-                        if current_analytics and notifications and config.WHATSAPP_ENABLED:
+                        if current_analytics and notifications and config.TELEGRAM_ENABLED:
                             dd = current_analytics.get("max_drawdown", 0)
                             if dd > 0.05:
                                 try:
@@ -1149,7 +1149,7 @@ async def _async_broker_sync(risk, ws_monitor):
                         logger.error(f"[async] Account update failed: {e}")
 
                 if risk.check_circuit_breaker():
-                    if notifications and config.WHATSAPP_ENABLED:
+                    if notifications and config.TELEGRAM_ENABLED:
                         try:
                             notifications.notify_circuit_breaker(risk.day_pnl)
                         except Exception:
@@ -1235,7 +1235,7 @@ async def _async_daily_tasks(
                 summary = risk.get_day_summary()
                 print_day_summary(summary, consistency_score=latest_consistency_score)
                 logger.info(f"Day summary: {summary}")
-                if notifications and config.WHATSAPP_ENABLED:
+                if notifications and config.TELEGRAM_ENABLED:
                     try:
                         notifications.notify_daily_summary(summary, risk.current_equity)
                     except Exception:
@@ -1279,7 +1279,7 @@ async def _async_daily_tasks(
             # Analytics
             try:
                 current_analytics = analytics_mod.compute_analytics()
-                if current_analytics and notifications and config.WHATSAPP_ENABLED:
+                if current_analytics and notifications and config.TELEGRAM_ENABLED:
                     dd = current_analytics.get("max_drawdown", 0)
                     if dd > 0.05:
                         try:
@@ -1368,7 +1368,7 @@ async def async_main():
             pass
 
     # Notifications
-    if notifications and config.WHATSAPP_ENABLED:
+    if notifications and config.TELEGRAM_ENABLED:
         console.print("[green]Notifications enabled.[/green]")
 
     # Load filters
@@ -1388,7 +1388,7 @@ async def async_main():
 
     supervisor = TaskSupervisor()
 
-    if notifications and config.WHATSAPP_ENABLED:
+    if notifications and config.TELEGRAM_ENABLED:
         async def _crash_notify(name, exc, count):
             try:
                 notifications.send_message(f"Task '{name}' crashed (#{count}): {exc}")

@@ -24,10 +24,9 @@ Set your environment variables:
 export ALPACA_API_KEY="your-api-key"
 export ALPACA_SECRET_KEY="your-secret-key"
 export ALPACA_LIVE=false                  # true for live trading
-export WHATSAPP_ENABLED=false             # optional
-export WHATSAPP_ACCESS_TOKEN=""           # optional
-export WHATSAPP_PHONE_NUMBER_ID=""        # optional
-export WHATSAPP_RECIPIENT_NUMBER=""       # optional
+export TELEGRAM_ENABLED=false              # optional
+export TELEGRAM_BOT_TOKEN=""              # from @BotFather
+export TELEGRAM_CHAT_ID=""                # your chat ID
 ```
 
 Run:
@@ -68,7 +67,7 @@ trading_bot/
   dashboard.py             # Rich terminal dashboard
   web_dashboard.py         # FastAPI web dashboard (port 8080)
   position_monitor.py      # WebSocket real-time position monitoring
-  notifications.py         # WhatsApp trade alerts
+  notifications.py         # Telegram trade alerts
   earnings.py              # Earnings calendar filter
   correlation.py           # Correlation-based position conflict filter
   strategies/
@@ -124,7 +123,7 @@ trading_bot/
 | `MR_HURST_MAX` | `0.52` | Maximum Hurst exponent for MR universe |
 | `PAIRS_ZSCORE_ENTRY` | `2.0` | Pairs z-score entry threshold |
 | `BETA_MAX_ABS` | `0.3` | Max absolute portfolio beta before hedging |
-| `WHATSAPP_ENABLED` | `false` | Enable WhatsApp trade alerts |
+| `TELEGRAM_ENABLED` | `false` | Enable Telegram trade alerts |
 | `WEBSOCKET_MONITORING` | `true` | Enable WebSocket position monitoring |
 
 ---

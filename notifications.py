@@ -1,4 +1,12 @@
-"""V3: WhatsApp notifications — trade alerts, daily summaries, warnings."""
+"""Telegram notifications — trade alerts, daily summaries, risk warnings.
+
+Setup:
+  1. Message @BotFather on Telegram → /newbot → copy the token
+  2. Message your bot, then visit:
+     https://api.telegram.org/bot<TOKEN>/getUpdates
+     to find your chat_id
+  3. Set env vars: TELEGRAM_ENABLED=true, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+"""
 
 import logging
 from datetime import datetime
@@ -8,44 +16,35 @@ import config
 logger = logging.getLogger(__name__)
 
 
-def _send_whatsapp(message: str):
-    """Send a message via WhatsApp Cloud API. Synchronous (fire-and-forget)."""
-    if not config.WHATSAPP_ENABLED:
+def _send_telegram(message: str, parse_mode: str = "Markdown"):
+    """Send a message via Telegram Bot API. Synchronous (fire-and-forget)."""
+    if not config.TELEGRAM_ENABLED:
         return
-    if not config.WHATSAPP_ACCESS_TOKEN or not config.WHATSAPP_PHONE_NUMBER_ID:
-        return
-    if not config.WHATSAPP_RECIPIENT_NUMBER:
+    if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
         return
 
     try:
         import httpx
-        url = (
-            f"https://graph.facebook.com/v21.0/"
-            f"{config.WHATSAPP_PHONE_NUMBER_ID}/messages"
-        )
+        url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
         with httpx.Client(timeout=10) as client:
             resp = client.post(
                 url,
-                headers={
-                    "Authorization": f"Bearer {config.WHATSAPP_ACCESS_TOKEN}",
-                    "Content-Type": "application/json",
-                },
                 json={
-                    "messaging_product": "whatsapp",
-                    "to": config.WHATSAPP_RECIPIENT_NUMBER,
-                    "type": "text",
-                    "text": {"body": message},
+                    "chat_id": config.TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": parse_mode,
+                    "disable_web_page_preview": True,
                 },
             )
             if resp.status_code != 200:
-                logger.warning(f"WhatsApp send failed: {resp.status_code}")
+                logger.warning(f"Telegram send failed: {resp.status_code} {resp.text}")
     except Exception as e:
-        logger.warning(f"WhatsApp notification failed: {e}")
+        logger.warning(f"Telegram notification failed: {e}")
 
 
 def send_message(message: str):
     """Public helper — send a plain text message."""
-    _send_whatsapp(message)
+    _send_telegram(message, parse_mode=None)
 
 
 def notify_trade_opened(trade_or_symbol, side=None, strategy=None,
@@ -61,8 +60,8 @@ def notify_trade_opened(trade_or_symbol, side=None, strategy=None,
         symbol = trade_or_symbol
 
     arrow = "\U0001f4c8" if side == "buy" else "\U0001f4c9"
-    _send_whatsapp(
-        f"{arrow} *OPENED* {side.upper()} {symbol}\n"
+    _send_telegram(
+        f"{arrow} *OPENED* {side.upper()} `{symbol}`\n"
         f"Strategy: {strategy}\n"
         f"Entry: ${entry_price:.2f} | Size: {qty} shares\n"
         f"TP: ${take_profit:.2f} | SL: ${stop_loss:.2f}"
@@ -85,8 +84,8 @@ def notify_trade_closed(trade_or_symbol, pnl=None, pnl_pct=None,
     pnl_pct = pnl_pct or 0
     exit_reason = exit_reason or ""
     icon = "\u2705" if pnl > 0 else "\u274c"
-    _send_whatsapp(
-        f"{icon} *CLOSED* {symbol}\n"
+    _send_telegram(
+        f"{icon} *CLOSED* `{symbol}`\n"
         f"P&L: ${pnl:+.2f} ({pnl_pct:+.2%})\n"
         f"Reason: {exit_reason}"
         + (f" | Hold: {hold_time}" if hold_time else "")
@@ -95,7 +94,7 @@ def notify_trade_closed(trade_or_symbol, pnl=None, pnl_pct=None,
 
 def notify_circuit_breaker(day_pnl_pct: float):
     """Notify when circuit breaker triggers."""
-    _send_whatsapp(
+    _send_telegram(
         f"\U0001f6a8 *CIRCUIT BREAKER TRIGGERED*\n"
         f"Daily P&L: {day_pnl_pct:.2%}\n"
         f"No new trades for remainder of day."
@@ -117,7 +116,7 @@ def notify_daily_summary(summary_or_pnl, equity=None, day_pnl_pct=None,
     else:
         day_pnl = summary_or_pnl
 
-    _send_whatsapp(
+    _send_telegram(
         f"\U0001f4ca *DAILY SUMMARY*\n"
         f"P&L: ${day_pnl:+.2f} ({day_pnl_pct:+.2%})\n"
         f"Trades: {n_trades} | Win rate: {win_rate:.0%}\n"
@@ -128,62 +127,42 @@ def notify_daily_summary(summary_or_pnl, equity=None, day_pnl_pct=None,
 
 def notify_drawdown_warning(drawdown_pct: float):
     """Notify when portfolio drawdown exceeds threshold."""
-    _send_whatsapp(
+    _send_telegram(
         f"\u26a0\ufe0f *DRAWDOWN WARNING*\n"
         f"Portfolio down {drawdown_pct:.2%} from peak.\n"
         f"Position sizing reduced."
     )
 
 
-def notify_ml_retrain(results: dict):
-    """Notify about ML model retraining results."""
-    lines = ["\U0001f9e0 *ML MODEL RETRAINED*"]
-    for strategy, metrics in results.items():
-        status = "\u2705" if metrics["active"] else "\u274c"
-        lines.append(
-            f"{status} {strategy}: precision={metrics['precision']:.1%}, "
-            f"n={metrics['train_samples']}"
+def notify_pnl_lock(state: str, day_pnl_pct: float):
+    """V6: Notify when PnL lock state changes."""
+    if state == "GAIN_LOCK":
+        _send_telegram(
+            f"\U0001f512 *GAIN LOCK ACTIVATED*\n"
+            f"Daily P&L: {day_pnl_pct:+.2%}\n"
+            f"Position sizing reduced to 30%."
         )
-    _send_whatsapp("\n".join(lines))
-
-
-def notify_vix_alert(vix_level: float, risk_scalar: float):
-    """V4: Notify when VIX crosses a significant threshold."""
-    if vix_level >= 40:
-        _send_whatsapp(
-            f"\U0001f6a8 *VIX EXTREME: {vix_level:.1f}*\n"
-            f"ALL NEW POSITIONS HALTED\n"
-            f"Managing existing positions only."
-        )
-    elif vix_level >= 30:
-        _send_whatsapp(
-            f"\u26a0\ufe0f *VIX HIGH: {vix_level:.1f}*\n"
-            f"Risk scalar: {risk_scalar:.0%}\n"
-            f"Position sizes severely reduced."
-        )
-    elif vix_level >= 25:
-        _send_whatsapp(
-            f"\U0001f536 *VIX ELEVATED: {vix_level:.1f}*\n"
-            f"Risk scalar: {risk_scalar:.0%}\n"
-            f"Position sizes reduced."
+    elif state == "LOSS_HALT":
+        _send_telegram(
+            f"\U0001f6a8 *LOSS HALT ACTIVATED*\n"
+            f"Daily P&L: {day_pnl_pct:+.2%}\n"
+            f"No new trades for remainder of day."
         )
 
 
-def notify_strategy_demoted(strategy: str, sharpe: float):
-    """Send notification when a strategy is auto-demoted to shadow mode."""
-    _send_whatsapp(
-        f"\u26a0\ufe0f *Strategy Demoted*\n\n"
-        f"Strategy: {strategy}\n"
-        f"30d Sharpe: {sharpe:.2f}\n"
-        f"Action: Demoted to shadow mode\n"
-        f"Reason: Sharpe below minimum threshold"
+def notify_beta_hedge(action: str, spy_qty: int, portfolio_beta: float):
+    """V6: Notify when beta neutralization triggers a hedge."""
+    _send_telegram(
+        f"\U0001f6e1 *BETA HEDGE*\n"
+        f"Action: {action} {abs(spy_qty)} SPY\n"
+        f"Portfolio beta: {portfolio_beta:+.2f} \u2192 ~0.00"
     )
 
 
 def notify_optimization(strategy: str, old_sharpe: float, new_sharpe: float,
                         params: dict):
     """Notify when strategy parameters are optimized."""
-    _send_whatsapp(
+    _send_telegram(
         f"\U0001f527 *{strategy} PARAMS UPDATED*\n"
         f"Sharpe: {old_sharpe:.2f} \u2192 {new_sharpe:.2f}\n"
         f"New params: {params}"

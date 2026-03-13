@@ -204,8 +204,8 @@ def build_dashboard(
     feat_parts = ["MR60%", "PAIRS25%", "MICRO15%"]
     if config.ALLOW_SHORT:
         feat_parts.append("Short")
-    if config.WHATSAPP_ENABLED:
-        feat_parts.append("Notify")
+    if config.TELEGRAM_ENABLED:
+        feat_parts.append("TG")
     if config.WEB_DASHBOARD_ENABLED:
         feat_parts.append("Web")
     if config.WEBSOCKET_MONITORING:

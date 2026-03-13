@@ -113,11 +113,10 @@ ALLOCATION_LOOKBACK_DAYS = 20        # Rolling window for Sharpe-based allocatio
 ALLOCATION_MIN_WEIGHT = 0.10         # Min 10% per strategy
 ALLOCATION_RECALC_TIME = time(9, 0)  # Recalculate at 9:00 AM ET
 
-# --- V3: WhatsApp Notifications (via Meta Cloud API) ---
-WHATSAPP_ENABLED = os.getenv("WHATSAPP_ENABLED", "false") == "true"
-WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
-WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
-WHATSAPP_RECIPIENT_NUMBER = os.getenv("WHATSAPP_RECIPIENT_NUMBER", "")
+# --- Telegram Notifications (via Bot API) ---
+TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false") == "true"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # --- V3: Web Dashboard ---
 WEB_DASHBOARD_ENABLED = os.getenv("WEB_DASHBOARD_ENABLED", "true") == "true"

@@ -6,9 +6,8 @@
 - Use environment variables for all sensitive configuration:
   - `ALPACA_API_KEY`
   - `ALPACA_SECRET_KEY`
-  - `WHATSAPP_ACCESS_TOKEN`
-  - `WHATSAPP_PHONE_NUMBER_ID`
-  - `WHATSAPP_RECIPIENT_NUMBER`
+  - `TELEGRAM_BOT_TOKEN`
+  - `TELEGRAM_CHAT_ID`
 - The `.gitignore` file excludes `.env`, `state.json`, and database files by default.
 - If using Docker, pass secrets via environment variables or Docker secrets -- do not bake them into images.
 
