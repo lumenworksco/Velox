@@ -96,8 +96,25 @@ class VWAPStrategy:
 
                 # BUY signal: price touched lower band and bounced back above
                 if prev_bar["low"] <= lower and curr_bar["close"] > lower and rsi < config.VWAP_RSI_OVERSOLD:
+                    # V5: Confirmation bar check
+                    if config.VWAP_CONFIRMATION_BARS >= 2 and len(bars) >= 3:
+                        bar_2ago = bars.iloc[-3]
+                        # Require: 2 bars ago touched band, prev bar confirmed bounce
+                        if not (bar_2ago["low"] <= lower and prev_bar["close"] > prev_bar["open"]):
+                            continue
+
                     std_dev = (upper - vwap) / config.VWAP_BAND_STD
                     stop_loss = lower - config.VWAP_STOP_EXTENSION * std_dev
+
+                    # V5: Enforce minimum stop/TP distances
+                    entry = curr_bar["close"]
+                    min_stop = entry * config.VWAP_MIN_STOP_PCT
+                    min_tp = entry * config.VWAP_MIN_TP_PCT
+                    if abs(entry - stop_loss) < min_stop:
+                        stop_loss = entry - min_stop
+                    if abs(vwap - entry) < min_tp:
+                        pass  # VWAP TP is the target, don't override upward
+
                     signals.append(Signal(
                         symbol=symbol,
                         strategy="VWAP",
@@ -120,8 +137,25 @@ class VWAPStrategy:
                     and rsi > config.VWAP_RSI_OVERBOUGHT
                     and day_move > 0.01  # Stock must be up > 1% already today
                 ):
+                    # V5: Confirmation bar check
+                    if config.VWAP_CONFIRMATION_BARS >= 2 and len(bars) >= 3:
+                        bar_2ago = bars.iloc[-3]
+                        # Require: 2 bars ago touched band, prev bar confirmed rejection
+                        if not (bar_2ago["high"] >= upper and prev_bar["close"] < prev_bar["open"]):
+                            continue
+
                     std_dev = (upper - vwap) / config.VWAP_BAND_STD
                     stop_loss = upper + config.VWAP_STOP_EXTENSION * std_dev
+
+                    # V5: Enforce minimum stop/TP distances
+                    entry = curr_bar["close"]
+                    min_stop = entry * config.VWAP_MIN_STOP_PCT
+                    min_tp = entry * config.VWAP_MIN_TP_PCT
+                    if abs(stop_loss - entry) < min_stop:
+                        stop_loss = entry + min_stop
+                    if abs(entry - vwap) < min_tp:
+                        pass  # VWAP TP is the target, don't override downward
+
                     signals.append(Signal(
                         symbol=symbol,
                         strategy="VWAP",

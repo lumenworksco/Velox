@@ -7,6 +7,7 @@ from alpaca.data.timeframe import TimeFrame
 
 import config
 from data import get_intraday_bars, get_daily_bars
+import pandas_ta as ta
 from strategies.base import Signal, ORBRange
 
 logger = logging.getLogger(__name__)
@@ -20,12 +21,14 @@ class ORBStrategy:
         self.triggered: set[str] = set()  # symbols already triggered today
         self.top_volume_symbols: list[str] = []
         self.ranges_recorded = False
+        self.pending_pullback: dict[str, tuple[float, int]] = {}  # symbol -> (orb_high, scan_count)
 
     def reset_daily(self):
         self.ranges.clear()
         self.triggered.clear()
         self.top_volume_symbols.clear()
         self.ranges_recorded = False
+        self.pending_pullback.clear()
 
     def record_opening_ranges(self, symbols: list[str], now: datetime):
         """Record ORB high/low for each symbol using 5-min bars from 9:30-10:00."""
@@ -103,16 +106,51 @@ class ORBStrategy:
 
                 latest = bars.iloc[-1]
 
-                # Volume check: current bar volume > 1.5x average
+                # Volume check: current bar volume > 1.2x average
                 avg_volume = orb.volume / 6  # 30 min / 5 min = 6 bars average
                 if latest["volume"] < config.ORB_VOLUME_MULTIPLIER * avg_volume:
                     continue
 
+                # RSI filter
+                rsi_series = ta.rsi(bars["close"], length=14)
+                if rsi_series is not None and not rsi_series.empty:
+                    rsi = rsi_series.iloc[-1]
+                    if not (config.ORB_RSI_MIN <= rsi <= config.ORB_RSI_MAX):
+                        continue
+
                 # LONG: close above ORB high
                 if latest["close"] > orb.high:
+                    # V5: Pullback entry mode
+                    if config.ORB_PULLBACK_ENTRY:
+                        if symbol not in self.pending_pullback:
+                            # Record breakout, wait for pullback
+                            self.pending_pullback[symbol] = (orb.high, 0)
+                            continue
+                        else:
+                            pb_level, pb_count = self.pending_pullback[symbol]
+                            # Check if price pulled back to ORB high area
+                            if latest["low"] <= pb_level * (1 + config.ORB_PULLBACK_TOLERANCE):
+                                # Pullback confirmed, proceed to signal
+                                del self.pending_pullback[symbol]
+                            elif pb_count >= config.ORB_PULLBACK_TIMEOUT:
+                                # Timeout, enter at market
+                                del self.pending_pullback[symbol]
+                            else:
+                                # Still waiting for pullback
+                                self.pending_pullback[symbol] = (pb_level, pb_count + 1)
+                                continue
+
                     entry_price = orb.high * (1 + config.ORB_ENTRY_SLIPPAGE)
                     take_profit = entry_price + config.ORB_TAKE_PROFIT_MULT * orb_range
                     stop_loss = entry_price - config.ORB_STOP_LOSS_MULT * orb_range
+
+                    # V5: Enforce minimum stop/TP distances
+                    min_stop = entry_price * config.ORB_MIN_STOP_PCT
+                    min_tp = entry_price * config.ORB_MIN_TP_PCT
+                    if abs(entry_price - stop_loss) < min_stop:
+                        stop_loss = entry_price - min_stop
+                    if abs(take_profit - entry_price) < min_tp:
+                        take_profit = entry_price + min_tp
 
                     signals.append(Signal(
                         symbol=symbol,
@@ -139,6 +177,14 @@ class ORBStrategy:
                         entry_price = orb.low * (1 - config.ORB_ENTRY_SLIPPAGE)
                         take_profit = entry_price - config.ORB_TAKE_PROFIT_MULT * orb_range
                         stop_loss = entry_price + config.ORB_STOP_LOSS_MULT * orb_range
+
+                        # V5: Enforce minimum stop/TP distances
+                        min_stop = entry_price * config.ORB_MIN_STOP_PCT
+                        min_tp = entry_price * config.ORB_MIN_TP_PCT
+                        if abs(stop_loss - entry_price) < min_stop:
+                            stop_loss = entry_price + min_stop
+                        if abs(entry_price - take_profit) < min_tp:
+                            take_profit = entry_price - min_tp
 
                         signals.append(Signal(
                             symbol=symbol,

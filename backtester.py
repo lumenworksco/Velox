@@ -363,6 +363,50 @@ def run_backtest():
 # V3: Walk-Forward Backtesting Validation
 # =============================================================================
 
+def quick_recent_backtest(strategy: str, days: int = 30) -> dict:
+    """Run a fast recent backtest for strategy health check.
+
+    Returns dict with: sharpe_ratio, win_rate, total_trades, total_return
+    """
+    try:
+        symbols = config.FOCUS_LIST[:10]  # Small set for speed
+
+        import yfinance as yf
+        end = datetime.now()
+        start = end - timedelta(days=days + 10)  # buffer for weekends
+
+        all_data = {}
+        for symbol in symbols:
+            try:
+                data = yf.download(symbol, start=start, end=end, interval="1h", progress=False)
+                if data.empty or len(data) < 20:
+                    continue
+                data.columns = [c.lower() for c in data.columns]
+                all_data[symbol] = data
+            except Exception:
+                continue
+
+        if not all_data:
+            return {"sharpe_ratio": 0.0, "win_rate": 0.0, "total_trades": 0, "total_return": 0.0}
+
+        if strategy == "ORB":
+            result = simulate_orb(all_data)
+        elif strategy == "VWAP":
+            result = simulate_vwap(all_data)
+        else:
+            return {"sharpe_ratio": 0.0, "win_rate": 0.0, "total_trades": 0, "total_return": 0.0}
+
+        return {
+            "sharpe_ratio": round(result.sharpe_ratio, 2),
+            "win_rate": round(result.win_rate, 2),
+            "total_trades": result.total_trades,
+            "total_return": round(result.total_return, 4),
+        }
+    except Exception as e:
+        logger.error(f"Quick backtest failed for {strategy}: {e}")
+        return {"sharpe_ratio": 0.0, "win_rate": 0.0, "total_trades": 0, "total_return": 0.0}
+
+
 def walk_forward_test(n_splits: int = 4):
     """Walk-forward out-of-sample validation.
 

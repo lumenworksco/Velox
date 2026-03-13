@@ -1,5 +1,5 @@
-"""Entry point V4 — MTF confirmation, VIX scaling, news filter, sector rotation,
-pairs trading, advanced exits, plus all V3 features."""
+"""Entry point V5 — shadow mode, EMA scalper, two-tier scanning, diagnostic mode,
+morning health check, plus all V4 features."""
 
 import argparse
 import asyncio
@@ -85,6 +85,17 @@ try:
     from exit_manager import ExitManager
 except ImportError:
     ExitManager = None
+
+# V5 imports
+try:
+    from strategies.momentum_scalp import EMAScalper
+except ImportError:
+    EMAScalper = None
+
+try:
+    from backtester import quick_recent_backtest
+except ImportError:
+    quick_recent_backtest = None
 
 # --- Logging setup ---
 _file_handler = logging.FileHandler(config.LOG_FILE)
@@ -307,6 +318,40 @@ def _process_single_signal(
             database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
             return
 
+    # V5: Shadow mode — log to shadow_trades instead of submitting real order
+    strategy_mode = config.STRATEGY_MODES.get(signal.strategy, "live")
+    if strategy_mode == "shadow":
+        try:
+            qty = risk.calculate_position_size(
+                signal.entry_price, signal.stop_loss, regime,
+                strategy=signal.strategy, side=signal.side,
+            )
+            if qty <= 0:
+                qty = 1  # Log at least 1 share for shadow tracking
+            time_stop = None
+            if signal.strategy == "VWAP":
+                time_stop = now + timedelta(minutes=config.VWAP_TIME_STOP_MINUTES)
+            elif signal.strategy == "EMA_SCALP":
+                time_stop = now + timedelta(minutes=config.EMA_SCALP_TIME_STOP_MINUTES)
+            database.log_shadow_entry(
+                symbol=signal.symbol,
+                strategy=signal.strategy,
+                side=signal.side,
+                entry_price=signal.entry_price,
+                qty=qty,
+                entry_time=now,
+                take_profit=signal.take_profit,
+                stop_loss=signal.stop_loss,
+            )
+            logger.info(
+                f"[SHADOW] {signal.side.upper()} {qty} {signal.symbol} "
+                f"@ {signal.entry_price:.2f} ({signal.strategy})"
+            )
+            database.log_signal(now, signal.symbol, signal.strategy, signal.side, True, "shadow")
+        except Exception as e:
+            logger.warning(f"Shadow trade log failed for {signal.symbol}: {e}")
+        return
+
     # Check risk limits
     allowed, reason = risk.can_open_trade(strategy=signal.strategy)
     if not allowed:
@@ -349,6 +394,8 @@ def _process_single_signal(
         max_hold_date = now + timedelta(days=config.SECTOR_MAX_HOLD_DAYS)
     elif signal.strategy == "PAIRS":
         max_hold_date = now + timedelta(days=config.PAIRS_MAX_HOLD_DAYS)
+    elif signal.strategy == "EMA_SCALP":
+        time_stop = now + timedelta(minutes=config.EMA_SCALP_TIME_STOP_MINUTES)
 
     trade = TradeRecord(
         symbol=signal.symbol,
@@ -381,6 +428,49 @@ def _process_single_signal(
 
     # Log signal as acted on
     database.log_signal(now, signal.symbol, signal.strategy, signal.side, True, "")
+
+
+def check_shadow_exits(now: datetime):
+    """Check shadow trades for TP/SL/time_stop hits and close them."""
+    try:
+        open_shadows = database.get_open_shadow_trades()
+    except Exception as e:
+        logger.warning(f"Failed to fetch shadow trades: {e}")
+        return
+
+    for shadow in open_shadows:
+        try:
+            from data import get_snapshot
+            snap = get_snapshot(shadow["symbol"])
+            if not snap or not snap.latest_trade:
+                continue
+            price = float(snap.latest_trade.price)
+            side = shadow["side"]
+            tp = shadow["take_profit"]
+            sl = shadow["stop_loss"]
+            exit_reason = None
+
+            if side == "buy":
+                if price >= tp:
+                    exit_reason = "take_profit"
+                elif price <= sl:
+                    exit_reason = "stop_loss"
+            else:  # sell/short
+                if price <= tp:
+                    exit_reason = "take_profit"
+                elif price >= sl:
+                    exit_reason = "stop_loss"
+
+            if exit_reason:
+                database.close_shadow_trade(
+                    shadow["id"], price, now.isoformat(), exit_reason
+                )
+                logger.info(
+                    f"[SHADOW] Closed {shadow['symbol']} ({shadow['strategy']}) "
+                    f"@ {price:.2f} reason={exit_reason}"
+                )
+        except Exception as e:
+            logger.warning(f"Shadow exit check failed for {shadow.get('symbol', '?')}: {e}")
 
 
 def sync_positions_with_broker(risk: RiskManager, now: datetime, ws_monitor=None):
@@ -416,7 +506,7 @@ def sync_positions_with_broker(risk: RiskManager, now: datetime, ws_monitor=None
 def main():
     """Main entry point."""
     # Parse arguments
-    parser = argparse.ArgumentParser(description="Algo Trading Bot V4")
+    parser = argparse.ArgumentParser(description="Algo Trading Bot V5")
     parser.add_argument("--backtest", action="store_true", help="Run backtesting engine")
     parser.add_argument("--walkforward", action="store_true", help="Run walk-forward test")
     parser.add_argument("--train-ml", action="store_true", help="Train ML signal filter")
@@ -458,7 +548,7 @@ def main():
         weekly_optimization()
         return
 
-    console.print("[bold cyan]Starting Algo Trading Bot V4...[/bold cyan]\n")
+    console.print("[bold cyan]Starting Algo Trading Bot V5...[/bold cyan]\n")
 
     # Initialize database
     database.init_db()
@@ -486,6 +576,12 @@ def main():
     if config.PAIRS_TRADING_ENABLED and PairsTradingStrategy:
         pairs_trading = PairsTradingStrategy()
         console.print("[green]Pairs Trading strategy initialized.[/green]")
+
+    # V5: Initialize EMA Ribbon Scalper
+    ema_scalper = None
+    if config.EMA_SCALP_ENABLED and EMAScalper:
+        ema_scalper = EMAScalper()
+        console.print("[green]EMA Ribbon Scalper initialized.[/green]")
 
     # V4: Initialize exit manager
     exit_mgr = None
@@ -581,6 +677,8 @@ def main():
 
     start_time = now_et()
     last_scan = None
+    last_tier1_scan = None  # V5: Focus list scan timing
+    last_tier2_scan = None  # V5: Full universe scan timing
     last_state_save = now_et()
     last_analytics_update = now_et()
     last_day = now_et().date()
@@ -589,6 +687,7 @@ def main():
     gap_candidates_found = False
     gap_first_candle_recorded = False
     allocation_updated_today = False
+    health_check_done_today = False  # V5: morning strategy health check
     last_sunday_task = None  # Track Sunday midnight ML/optimize/pairs runs
     news_cache_cleared_today = False  # V4: track news cache clear
     last_vix_alert_level = None  # V4: track VIX alert to avoid spam
@@ -635,9 +734,12 @@ def main():
         strategies_list.append("SECTOR_ROT")
     if config.PAIRS_TRADING_ENABLED:
         strategies_list.append("PAIRS")
+    if config.EMA_SCALP_ENABLED:
+        strategies_list.append("EMA_SCALP")
+        features.append("Scalp")
 
     features_str = ", ".join(features) if features else "none"
-    console.print(f"\n[bold green]Bot V4 is running. Press Ctrl+C to stop.[/bold green]")
+    console.print(f"\n[bold green]Bot V5 is running. Press Ctrl+C to stop.[/bold green]")
     console.print(f"[dim]Strategies: {' + '.join(strategies_list)}[/dim]")
     console.print(f"[dim]Features: {features_str}[/dim]\n")
 
@@ -667,9 +769,12 @@ def main():
                         gap_go.reset_daily()
                     if sector_rotation:
                         sector_rotation.reset_daily()
+                    if ema_scalper:
+                        ema_scalper.reset_daily()
                     gap_candidates_found = False
                     gap_first_candle_recorded = False
                     allocation_updated_today = False
+                    health_check_done_today = False
                     news_cache_cleared_today = False
 
                     if rs_tracker:
@@ -748,6 +853,32 @@ def main():
                     except Exception as e:
                         logger.error(f"Failed to update strategy weights: {e}")
 
+                # V5: Morning strategy health check at 9:00 AM
+                if (config.MORNING_HEALTH_CHECK_ENABLED
+                        and quick_recent_backtest
+                        and not health_check_done_today
+                        and current_time >= config.MORNING_HEALTH_CHECK_TIME):
+                    health_check_done_today = True
+                    for strat_name in ["ORB", "VWAP", "MOMENTUM"]:
+                        try:
+                            result = quick_recent_backtest(strat_name, days=config.HEALTH_CHECK_LOOKBACK_DAYS)
+                            if (result.get("total_trades", 0) >= config.HEALTH_CHECK_MIN_TRADES
+                                    and result.get("sharpe_ratio", 1.0) < config.HEALTH_CHECK_MIN_SHARPE):
+                                config.STRATEGY_MODES[strat_name] = "shadow"
+                                logger.warning(
+                                    f"Health check: demoting {strat_name} to shadow "
+                                    f"(Sharpe={result['sharpe_ratio']:.2f})"
+                                )
+                                if notifications and config.WHATSAPP_ENABLED:
+                                    try:
+                                        notifications.notify_strategy_demoted(
+                                            strat_name, result["sharpe_ratio"]
+                                        )
+                                    except Exception:
+                                        pass
+                        except Exception as e:
+                            logger.warning(f"Health check failed for {strat_name}: {e}")
+
                 # V4: VIX alert notifications
                 if config.VIX_RISK_SCALING_ENABLED and notifications and config.WHATSAPP_ENABLED:
                     try:
@@ -800,21 +931,47 @@ def main():
                     if is_trading_hours(current_time):
                         signals = []
 
-                        # Run strategies based on regime
-                        if regime in ("BULLISH", "UNKNOWN"):
-                            orb_signals = orb.scan(config.STANDARD_SYMBOLS, current)
-                            signals.extend(orb_signals)
+                        # V5: Two-tier scanning
+                        tier1_due = (last_tier1_scan is None
+                                     or (current - last_tier1_scan).total_seconds() >= config.TIER1_SCAN_INTERVAL_SEC)
+                        tier2_due = (last_tier2_scan is None
+                                     or (current - last_tier2_scan).total_seconds() >= config.TIER2_SCAN_INTERVAL_SEC)
 
-                        # V3: ORB short signals in bearish regime
-                        if config.ALLOW_SHORT and regime in ("BEARISH", "UNKNOWN"):
-                            orb_short_signals = orb.scan(config.STANDARD_SYMBOLS, current, regime=regime)
-                            for sig in orb_short_signals:
-                                if sig.side == "sell" and sig.symbol not in [s.symbol for s in signals]:
-                                    signals.append(sig)
+                        # Determine which symbols to scan this cycle
+                        focus_set = set(config.FOCUS_LIST)
+                        orb_tier1 = [s for s in config.STANDARD_SYMBOLS if s in focus_set]
+                        orb_tier2 = [s for s in config.STANDARD_SYMBOLS if s not in focus_set]
+                        vwap_tier1 = [s for s in config.SYMBOLS if s in focus_set]
+                        vwap_tier2 = [s for s in config.SYMBOLS if s not in focus_set]
+
+                        orb_symbols_now = []
+                        vwap_symbols_now = []
+                        if tier1_due:
+                            orb_symbols_now.extend(orb_tier1)
+                            vwap_symbols_now.extend(vwap_tier1)
+                            last_tier1_scan = current
+                        if tier2_due:
+                            orb_symbols_now.extend(orb_tier2)
+                            vwap_symbols_now.extend(vwap_tier2)
+                            last_tier2_scan = current
+
+                        # Run strategies based on regime
+                        if orb_symbols_now:
+                            if regime in ("BULLISH", "UNKNOWN"):
+                                orb_signals = orb.scan(orb_symbols_now, current)
+                                signals.extend(orb_signals)
+
+                            # V3: ORB short signals in bearish regime
+                            if config.ALLOW_SHORT and regime in ("BEARISH", "UNKNOWN"):
+                                orb_short_signals = orb.scan(orb_symbols_now, current, regime=regime)
+                                for sig in orb_short_signals:
+                                    if sig.side == "sell" and sig.symbol not in [s.symbol for s in signals]:
+                                        signals.append(sig)
 
                         # VWAP runs on all symbols in all regimes
-                        vwap_signals = vwap.scan(config.SYMBOLS, current, regime)
-                        signals.extend(vwap_signals)
+                        if vwap_symbols_now:
+                            vwap_signals = vwap.scan(vwap_symbols_now, current, regime)
+                            signals.extend(vwap_signals)
 
                         # Momentum: once daily at 10:30 AM
                         if (config.ALLOW_MOMENTUM
@@ -856,6 +1013,16 @@ def main():
                                 signals.extend(pair_signals)
                             except Exception as e:
                                 logger.error(f"Pairs Trading scan failed: {e}")
+
+                        # V5: EMA Ribbon Scalper (Tier 1 only — FOCUS_LIST)
+                        if ema_scalper and tier1_due:
+                            try:
+                                ema_signals = ema_scalper.scan(
+                                    config.FOCUS_LIST, current, regime
+                                )
+                                signals.extend(ema_signals)
+                            except Exception as e:
+                                logger.error(f"EMA Scalper scan failed: {e}")
 
                         # Process signals
                         if signals:
@@ -937,6 +1104,9 @@ def main():
                                             ws_monitor.unsubscribe(symbol)
                             except Exception as e:
                                 logger.error(f"Pairs z-score exit check failed: {e}")
+
+                        # V5: Check shadow trade exits
+                        check_shadow_exits(current)
 
                     # ORB exit time (15:45)
                     if current_time >= config.ORB_EXIT_TIME:
@@ -1033,8 +1203,8 @@ def main():
                     )
                 )
 
-                # Sleep until next scan
-                time_mod.sleep(config.SCAN_INTERVAL_SEC)
+                # Sleep until next scan (V5: use tier1 interval for faster focus list scanning)
+                time_mod.sleep(config.TIER1_SCAN_INTERVAL_SEC)
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down gracefully...[/yellow]")
@@ -1466,7 +1636,7 @@ async def async_main():
     import asyncio as _asyncio
     from supervisor import TaskSupervisor
 
-    console.print("[bold cyan]Starting Algo Trading Bot V4 (ASYNC MODE)...[/bold cyan]\n")
+    console.print("[bold cyan]Starting Algo Trading Bot V5 (ASYNC MODE)...[/bold cyan]\n")
 
     # Initialize database
     database.init_db()
@@ -1611,8 +1781,185 @@ async def async_main():
         console.print("[green]State saved. Bot stopped.[/green]")
 
 
+def run_diagnostic():
+    """Run one diagnostic scan cycle and print what's blocking trades."""
+    print("\n=== V5 SIGNAL DIAGNOSTIC MODE ===\n")
+    print("Initializing strategies and filters...\n")
+
+    # Initialize same as main startup
+    from strategies import ORBStrategy, VWAPStrategy
+    from strategies.mtf_confirmation import mtf_confirmer
+    from news_filter import news_filter
+    from earnings import has_earnings_soon, load_earnings_cache
+    from correlation import is_too_correlated, load_correlation_cache
+
+    orb = ORBStrategy()
+    vwap = VWAPStrategy()
+
+    # Get current time and account
+    from data import get_clock, get_account
+    clock = get_clock()
+    now = clock.timestamp
+
+    account = get_account()
+    print(f"Account equity: ${float(account.equity):,.2f}")
+    print(f"Market status: {'OPEN' if clock.is_open else 'CLOSED'}")
+    print(f"Time: {now}\n")
+
+    # Load filters
+    try:
+        load_earnings_cache(config.SYMBOLS)
+    except Exception as e:
+        print(f"  Earnings cache: {e}")
+    try:
+        load_correlation_cache(config.SYMBOLS)
+    except Exception as e:
+        print(f"  Correlation cache: {e}")
+
+    # Detect regime
+    from strategies.regime import detect_regime
+    regime = detect_regime(now)
+    print(f"Market regime: {regime}\n")
+
+    # Track rejections
+    rejection_counts: dict[str, int] = {}
+    signals_generated: list[str] = []
+    symbol_details: list[tuple[str, str, str]] = []  # (symbol, strategy, reason)
+
+    def count(reason: str):
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+
+    # --- ORB Diagnostic ---
+    orb_signals = []
+    vwap_signals = []
+
+    if clock.is_open:
+        print("Recording ORB ranges...")
+        orb.record_opening_ranges(config.STANDARD_SYMBOLS, now)
+        print(f"  ORB ranges recorded: {len(orb.ranges)}")
+        print(f"  Top volume symbols: {len(orb.top_volume_symbols)}")
+
+        for symbol in config.STANDARD_SYMBOLS:
+            if symbol not in orb.ranges:
+                count("orb_no_range_data")
+                continue
+            if symbol not in orb.top_volume_symbols:
+                count("orb_not_in_top_volume")
+                continue
+
+            orb_data = orb.ranges[symbol]
+            gap_pct = abs(orb_data.low - orb_data.prev_close) / orb_data.prev_close
+            if gap_pct > config.MAX_GAP_PCT:
+                count("orb_gap_too_large")
+                symbol_details.append((symbol, "ORB", f"gap={gap_pct:.1%} > {config.MAX_GAP_PCT:.1%}"))
+                continue
+
+            orb_range = orb_data.high - orb_data.low
+            range_pct = orb_range / ((orb_data.high + orb_data.low) / 2)
+            if range_pct > config.MAX_ORB_RANGE_PCT:
+                count("orb_range_too_wide")
+                symbol_details.append((symbol, "ORB", f"range={range_pct:.1%} > {config.MAX_ORB_RANGE_PCT:.1%}"))
+                continue
+
+            count("orb_no_breakout")
+
+        # Run actual ORB scan
+        orb_signals = orb.scan(config.STANDARD_SYMBOLS, now, regime)
+        for sig in orb_signals:
+            signals_generated.append(f"{sig.symbol} ORB {sig.side} @ ${sig.entry_price:.2f}")
+
+    # --- VWAP Diagnostic ---
+    if clock.is_open:
+        vwap_signals = vwap.scan(config.SYMBOLS, now, regime)
+        for sig in vwap_signals:
+            signals_generated.append(f"{sig.symbol} VWAP {sig.side} @ ${sig.entry_price:.2f}")
+
+    # --- Filter diagnostic on signals ---
+    all_signals = (orb_signals if clock.is_open else []) + (vwap_signals if clock.is_open else [])
+    blocked_signals = []
+    passed_signals = []
+
+    for sig in all_signals:
+        # Earnings check
+        try:
+            if has_earnings_soon(sig.symbol):
+                count("filter_earnings")
+                blocked_signals.append(f"{sig.symbol} {sig.strategy}: BLOCKED by earnings")
+                continue
+        except:
+            pass
+
+        # Correlation check
+        try:
+            if is_too_correlated(sig.symbol, [], config.CORRELATION_THRESHOLD):
+                count("filter_correlation")
+                blocked_signals.append(f"{sig.symbol} {sig.strategy}: BLOCKED by correlation")
+                continue
+        except:
+            pass
+
+        # MTF check
+        if config.MTF_ENABLED_FOR.get(sig.strategy, True):
+            confirmed = mtf_confirmer.confirm(
+                {"symbol": sig.symbol, "strategy": sig.strategy, "side": sig.side}, now
+            )
+            if not confirmed:
+                count("filter_mtf")
+                blocked_signals.append(f"{sig.symbol} {sig.strategy}: BLOCKED by MTF confirmation")
+                continue
+
+        # News check
+        blocked, reason = news_filter.should_block(sig.symbol, sig.side)
+        if blocked:
+            count("filter_news")
+            blocked_signals.append(f"{sig.symbol} {sig.strategy}: BLOCKED by news ({reason})")
+            continue
+
+        passed_signals.append(f"{sig.symbol} {sig.strategy} {sig.side} @ ${sig.entry_price:.2f}")
+
+    # --- Print Results ---
+    print("\n" + "=" * 60)
+    print("DIAGNOSTIC SCAN RESULTS")
+    print("=" * 60)
+    print(f"\n  Total symbols scanned:    {len(config.SYMBOLS)}")
+    print(f"  Signals generated:        {len(all_signals)}")
+    print(f"  Signals blocked:          {len(blocked_signals)}")
+    print(f"  Signals passed:           {len(passed_signals)}")
+
+    if rejection_counts:
+        print(f"\n  REJECTION BREAKDOWN:")
+        for reason, cnt in sorted(rejection_counts.items(), key=lambda x: -x[1]):
+            print(f"    {reason:<30} {cnt:>4}")
+
+    if blocked_signals:
+        print(f"\n  BLOCKED SIGNALS:")
+        for b in blocked_signals:
+            print(f"    {b}")
+
+    if passed_signals:
+        print(f"\n  PASSED SIGNALS (would trade):")
+        for p in passed_signals:
+            print(f"    {p}")
+    else:
+        print(f"\n  NO SIGNALS PASSED -- all blocked or no setups found")
+
+    if symbol_details[:10]:
+        print(f"\n  SAMPLE REJECTIONS:")
+        for sym, strat, reason in symbol_details[:10]:
+            print(f"    {sym:<6} {strat:<8} {reason}")
+
+    print()
+
+
 if __name__ == "__main__":
-    if config.ASYNC_MODE:
+    import argparse as _argparse
+    _parser = _argparse.ArgumentParser(description="Algo Trading Bot V5")
+    _parser.add_argument("--diagnose", action="store_true", help="Run one diagnostic scan cycle (read-only)")
+    _args = _parser.parse_args()
+
+    if _args.diagnose:
+        run_diagnostic()
+    elif config.ASYNC_MODE:
         import asyncio
         asyncio.run(async_main())
     else:

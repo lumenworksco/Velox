@@ -76,10 +76,10 @@ class TestSentimentScoring:
 
 class TestKeywordScoring:
     def test_bearish_keywords_counted(self):
-        """_count_keywords counts bearish keywords."""
+        """_count_keywords counts bearish keywords (V5: catastrophic-only keywords)."""
         from news_filter import NewsFilter
         bearish, bullish = NewsFilter._count_keywords(
-            "Stock plunges after fraud investigation and lawsuit"
+            "Company halted after fraud investigation and bankruptcy filing"
         )
         assert bearish >= 3
         assert bullish == 0

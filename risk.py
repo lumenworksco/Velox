@@ -157,6 +157,12 @@ class RiskManager:
             if pairs_count >= config.MAX_PAIRS_POSITIONS:
                 return False, f"Max pairs positions ({config.MAX_PAIRS_POSITIONS}) reached"
 
+        # V5: Check EMA Scalp limit
+        if strategy == "EMA_SCALP":
+            scalp_count = sum(1 for t in self.open_trades.values() if t.strategy == "EMA_SCALP")
+            if scalp_count >= config.EMA_SCALP_MAX_POSITIONS:
+                return False, f"Max EMA scalp positions ({config.EMA_SCALP_MAX_POSITIONS}) reached"
+
         # V4: VIX halt check
         if config.VIX_RISK_SCALING_ENABLED and get_vix_risk_scalar() == 0.0:
             return False, f"VIX > {config.VIX_HALT_THRESHOLD} — trading halted"

@@ -215,6 +215,38 @@ def build_dashboard(
         content += f"{sep}\n CAPITAL ALLOCATION\n" + "\n".join(alloc_lines) + "\n"
 
     content += f"{sep}\n RECENT TRADES\n" + "\n".join(recent_lines) + "\n"
+
+    # --- V5: Trade Analysis ---
+    try:
+        from database import get_exit_reason_breakdown, get_filter_block_summary
+
+        analysis_lines = []
+
+        # Exit reason breakdown
+        exit_data = get_exit_reason_breakdown(days=7)
+        if exit_data:
+            analysis_lines.append("[bold]Exit Reasons (7d):[/bold]")
+            for row in exit_data:
+                reason = row["exit_reason"] or "unknown"
+                count = row["count"]
+                avg = row["avg_pnl"] or 0
+                color = "green" if avg >= 0 else "red"
+                analysis_lines.append(f"  {reason:<20} {count:>3} trades  avg [{color}]{avg:+.2f}[/{color}]")
+
+        # Filter block summary
+        blocks = get_filter_block_summary()
+        if blocks:
+            analysis_lines.append("")
+            analysis_lines.append("[bold]Filter Blocks (today):[/bold]")
+            for reason, cnt in list(blocks.items())[:5]:
+                analysis_lines.append(f"  {reason:<25} {cnt:>4} blocked")
+
+        if analysis_lines:
+            analysis_text = "\n".join(analysis_lines)
+            content += f"{sep}\n TRADE ANALYSIS\n{analysis_text}\n"
+    except Exception:
+        pass
+
     content += f"{sep}\n{footer}"
 
     return Panel(content, title="[bold cyan]ALGO TRADING BOT V4[/bold cyan]", border_style="cyan")

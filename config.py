@@ -21,35 +21,49 @@ DATA_URL = "https://data.alpaca.markets"
 
 # --- Trading ---
 ALLOW_SHORT = os.getenv("ALLOW_SHORT", "false") == "true"
-MAX_POSITIONS = 6
-MAX_PORTFOLIO_DEPLOY = 0.25
+MAX_POSITIONS = 10
+MAX_PORTFOLIO_DEPLOY = 0.40
 TRADE_SIZE_PCT = 0.03               # Legacy flat sizing (kept for reference)
-DAILY_LOSS_HALT = -0.025
+DAILY_LOSS_HALT = -0.04
 SCAN_INTERVAL_SEC = 60
 
 # --- V2: Position Sizing (ATR-based) ---
 RISK_PER_TRADE_PCT = 0.01           # Risk 1% of portfolio per trade
-MAX_POSITION_PCT = 0.06             # Hard cap: max 6% of portfolio per position
+MAX_POSITION_PCT = 0.08             # Hard cap: max 8% of portfolio per position
 MIN_POSITION_VALUE = 100             # Min $100 per trade
 
 # --- Strategy Filters ---
-MAX_GAP_PCT = 0.03                  # Skip ORB if gap > 3%
-MAX_ORB_RANGE_PCT = 0.025           # Skip ORB if range > 2.5% of price
-MAX_INTRADAY_MOVE_PCT = 0.03        # Skip VWAP if stock moved > 3% today
+MAX_GAP_PCT = 0.04                  # Skip ORB if gap > 4%
+MAX_ORB_RANGE_PCT = 0.035           # Skip ORB if range > 3.5% of price
+MAX_INTRADAY_MOVE_PCT = 0.04        # Skip VWAP if stock moved > 4% today
 
 # --- ORB Settings ---
-ORB_VOLUME_MULTIPLIER = 1.5
+ORB_VOLUME_MULTIPLIER = 1.2
 ORB_TAKE_PROFIT_MULT = 1.5
 ORB_STOP_LOSS_MULT = 0.5
 ORB_TOP_N_SYMBOLS = 15
 ORB_ENTRY_SLIPPAGE = 0.0005
+ORB_RSI_MIN = 50                         # V5: min RSI for ORB entry
+ORB_RSI_MAX = 78                         # V5: max RSI for ORB entry
 
 # --- VWAP Settings ---
-VWAP_BAND_STD = 1.5
-VWAP_RSI_OVERSOLD = 40
-VWAP_RSI_OVERBOUGHT = 60
+VWAP_BAND_STD = 1.2
+VWAP_RSI_OVERSOLD = 45
+VWAP_RSI_OVERBOUGHT = 55
 VWAP_STOP_EXTENSION = 0.5
-VWAP_TIME_STOP_MINUTES = 45
+VWAP_TIME_STOP_MINUTES = 60
+
+# --- V5: Minimum Stop/TP Distances ---
+ORB_MIN_STOP_PCT = 0.003                 # 0.3% minimum stop distance
+ORB_MIN_TP_PCT = 0.006                   # 0.6% minimum TP distance
+VWAP_MIN_STOP_PCT = 0.0025              # 0.25% minimum stop distance
+VWAP_MIN_TP_PCT = 0.004                  # 0.4% minimum TP distance
+
+# --- V5: Entry Improvements ---
+ORB_PULLBACK_ENTRY = True                # Wait for pullback after breakout
+ORB_PULLBACK_TOLERANCE = 0.002           # Allow 0.2% overshoot on pullback
+ORB_PULLBACK_TIMEOUT = 2                 # Enter at market after 2 scans
+VWAP_CONFIRMATION_BARS = 2               # Require 2-bar confirmation
 
 # --- V2: Momentum Settings ---
 ALLOW_MOMENTUM = os.getenv("ALLOW_MOMENTUM", "true") == "true"
@@ -71,7 +85,7 @@ BEARISH_SIZE_CUT = 0.40
 
 # --- V2: Filters ---
 EARNINGS_FILTER_DAYS = 2            # Skip symbols with earnings within 2 days
-CORRELATION_THRESHOLD = 0.75        # Skip if correlated > 75% with open position
+CORRELATION_THRESHOLD = 0.88        # Skip if correlated > 88% with open position
 
 # --- Market Hours (ET) ---
 MARKET_OPEN = time(9, 30)
@@ -141,7 +155,7 @@ BACKTEST_TOP_N = 20                 # Run on top 20 most liquid symbols
 
 # --- V3: ML Signal Filter ---
 USE_ML_FILTER = os.getenv("USE_ML_FILTER", "true") == "true"
-ML_MIN_TRADES = 100                  # Min labeled trades before ML filter activates
+ML_MIN_TRADES = 200                  # Min labeled trades before ML filter activates
 ML_PROBABILITY_THRESHOLD = 0.55      # Min probability to take a trade
 ML_MIN_PRECISION = 0.58              # Model must achieve > 58% precision to be used
 
@@ -285,6 +299,64 @@ TRAILING_STOP_PCT = 0.015            # 1.5% trailing stop for swing positions
 
 # --- V4: Async Mode ---
 ASYNC_MODE = os.getenv("ASYNC_MODE", "false") == "true"
+
+# =============================================================================
+# V5 ADDITIONS
+# =============================================================================
+
+# --- V5: Multi-Timeframe Per-Strategy Toggle ---
+MTF_ENABLED_FOR = {
+    "ORB": True,
+    "MOMENTUM": True,
+    "SECTOR_ROTATION": True,
+    "VWAP": False,           # Mean reversion is counter-trend by nature
+    "GAP_GO": False,         # Gap trades in first hour, trend not established
+    "PAIRS": False,          # Market neutral — trend irrelevant
+    "EMA_SCALP": False,      # Ribbon defines its own trend
+}
+
+# --- V5: Focus List (25 highest-ATR, highest-volume symbols) ---
+FOCUS_LIST = [
+    "NVDA", "TSLA", "AMD", "META", "AMZN", "GOOGL", "MSFT", "AAPL",
+    "SPY", "QQQ", "COIN", "PLTR", "SOFI", "SMCI", "CRWD",
+    "SOXL", "TQQQ", "ARKK", "IWM", "XLK",
+    "AXON", "DDOG", "NET", "SNOW", "PANW",
+]
+
+# --- V5: Two-Tier Scan Frequency ---
+TIER1_SCAN_INTERVAL_SEC = 30             # FOCUS_LIST scan interval
+TIER2_SCAN_INTERVAL_SEC = 90             # Full universe scan interval
+
+# --- V5: Shadow Mode ---
+STRATEGY_MODES = {
+    "ORB": "live",
+    "VWAP": "live",
+    "MOMENTUM": "live",
+    "GAP_GO": "live",
+    "SECTOR_ROTATION": "shadow",
+    "PAIRS": "shadow",
+    "EMA_SCALP": "shadow",
+}
+SHADOW_PROMOTE_SHARPE = 0.8              # Promote to live if shadow Sharpe > 0.8
+
+# --- V5: EMA Ribbon Scalper ---
+EMA_SCALP_ENABLED = os.getenv("EMA_SCALP_ENABLED", "true") == "true"
+EMA_SCALP_PERIODS = [5, 8, 13, 21]
+EMA_SCALP_VOLUME_MULT = 1.3
+EMA_SCALP_MAX_POSITIONS = 3
+EMA_SCALP_START_TIME = time(10, 0)
+EMA_SCALP_END_TIME = time(15, 30)
+EMA_SCALP_TIME_STOP_MINUTES = 30
+EMA_SCALP_STOP_PCT = 0.004              # 0.4% stop
+EMA_SCALP_TP_MULT = 2.0                 # 2:1 R/R (TP = 2x stop distance)
+EMA_SCALP_COOLDOWN_SEC = 600            # 10-min cooldown per symbol
+
+# --- V5: Morning Strategy Health Check ---
+MORNING_HEALTH_CHECK_ENABLED = os.getenv("MORNING_HEALTH_CHECK_ENABLED", "true") == "true"
+MORNING_HEALTH_CHECK_TIME = time(9, 0)
+HEALTH_CHECK_LOOKBACK_DAYS = 30
+HEALTH_CHECK_MIN_TRADES = 10
+HEALTH_CHECK_MIN_SHARPE = 0.0
 
 # --- V3: Runtime-mutable strategy parameters (can be updated by optimizer) ---
 _runtime_params: dict = {}

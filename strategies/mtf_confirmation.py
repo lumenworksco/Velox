@@ -20,8 +20,7 @@ _HIGHER_TF = {
     "MOMENTUM":        TimeFrame.Day,
 }
 
-# Strategies that are always confirmed (no higher TF needed)
-_ALWAYS_CONFIRMED = {"SECTOR_ROTATION", "PAIRS"}
+# (V5: per-strategy MTF toggle moved to config.MTF_ENABLED_FOR)
 
 # Lookback durations to ensure we get at least 30 bars
 _LOOKBACK = {
@@ -56,8 +55,8 @@ class MultiTimeframeConfirmation:
         symbol = signal.get("symbol", "")
         side = signal.get("side", "buy").lower()
 
-        # 2. Always-confirmed strategies
-        if strategy in _ALWAYS_CONFIRMED:
+        # 2. Check per-strategy MTF toggle
+        if not config.MTF_ENABLED_FOR.get(strategy, True):
             return True
 
         # 3. Look up higher timeframe

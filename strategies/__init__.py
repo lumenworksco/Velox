@@ -8,6 +8,7 @@ from strategies.momentum import MomentumStrategy
 from strategies.gap_go import GapGoStrategy
 from strategies.sector_rotation import SectorRotationStrategy
 from strategies.pairs_trading import PairsTradingStrategy
+from strategies.momentum_scalp import EMAScalper
 
 __all__ = [
     "Signal",
@@ -20,4 +21,5 @@ __all__ = [
     "GapGoStrategy",
     "SectorRotationStrategy",
     "PairsTradingStrategy",
+    "EMAScalper",
 ]

@@ -21,12 +21,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 BEARISH_KEYWORDS: set[str] = {
-    "downgrade", "miss", "missed", "below expectations", "loss", "losses",
-    "lawsuit", "sec investigation", "fraud", "recall", "bankruptcy",
-    "layoffs", "lay off", "cut", "reduces guidance", "lowers guidance",
-    "disappoints", "warning", "decline", "drops", "falls", "plunges",
-    "crash", "default", "delisted", "investigation", "subpoena",
-    "indictment", "fine", "penalty",
+    "bankruptcy", "fraud", "halt", "halted", "delisted",
+    "sec investigation", "indictment", "default",
+    "recall", "subpoena",
 }
 
 BULLISH_KEYWORDS: set[str] = {

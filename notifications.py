@@ -169,6 +169,17 @@ def notify_vix_alert(vix_level: float, risk_scalar: float):
         )
 
 
+def notify_strategy_demoted(strategy: str, sharpe: float):
+    """Send notification when a strategy is auto-demoted to shadow mode."""
+    _send_whatsapp(
+        f"\u26a0\ufe0f *Strategy Demoted*\n\n"
+        f"Strategy: {strategy}\n"
+        f"30d Sharpe: {sharpe:.2f}\n"
+        f"Action: Demoted to shadow mode\n"
+        f"Reason: Sharpe below minimum threshold"
+    )
+
+
 def notify_optimization(strategy: str, old_sharpe: float, new_sharpe: float,
                         params: dict):
     """Notify when strategy parameters are optimized."""

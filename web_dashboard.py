@@ -91,6 +91,28 @@ async def signal_stats(days: int = Query(7, ge=1, le=90)):
     return database.get_signal_skip_reasons(days=days)
 
 
+@app.get("/api/shadow_trades")
+async def shadow_trades(days: int = Query(14, ge=1, le=90)):
+    """Return shadow trade data and performance."""
+    try:
+        open_shadows = database.get_open_shadow_trades()
+        performance = database.get_shadow_performance(days=days)
+        return {"open": open_shadows, "performance": performance}
+    except Exception as e:
+        return {"open": [], "performance": [], "error": str(e)}
+
+
+@app.get("/api/trade_analysis")
+async def trade_analysis(days: int = Query(7, ge=1, le=90)):
+    """Return exit reason breakdown and filter block summary."""
+    try:
+        exit_breakdown = database.get_exit_reason_breakdown(days=days)
+        filter_blocks = database.get_filter_block_summary()
+        return {"exit_breakdown": exit_breakdown, "filter_blocks": filter_blocks}
+    except Exception as e:
+        return {"exit_breakdown": [], "filter_blocks": {}, "error": str(e)}
+
+
 # --- HTML Dashboard ---
 
 @app.get("/", response_class=HTMLResponse)
@@ -142,6 +164,7 @@ tr:hover{background:#161b22}
 <option value="VWAP">VWAP</option>
 <option value="MOMENTUM">Momentum</option>
 <option value="GAP_GO">Gap & Go</option>
+<option value="EMA_SCALP">EMA Scalp</option>
 </select>
 </div>
 <table>
@@ -151,11 +174,21 @@ tr:hover{background:#161b22}
 </div>
 
 <div class="section">
+<h2>Trade Analysis (7 days)</h2>
+<div id="trade-analysis"></div>
+</div>
+
+<div class="section">
+<h2>Shadow Trades</h2>
+<div id="shadow-trades"></div>
+</div>
+
+<div class="section">
 <h2>Signal Filter Reasons (7 days)</h2>
 <div id="signal-stats"></div>
 </div>
 
-<div class="footer">Auto-refreshes every 30s | Trading Bot V3</div>
+<div class="footer">Auto-refreshes every 30s | Trading Bot V5</div>
 
 <script>
 let chart=null;
@@ -226,7 +259,58 @@ async function loadSignalStats(){
  }catch(e){console.error(e)}
 }
 
-function refresh(){loadStats();loadChart();loadTrades();loadSignalStats()}
+async function loadTradeAnalysis(){
+ try{
+  const r=await fetch('/api/trade_analysis?days=7');
+  const d=await r.json();
+  const el=document.getElementById('trade-analysis');
+  let html='';
+  if(d.exit_breakdown&&d.exit_breakdown.length){
+   html+='<div style="margin-bottom:12px"><b>Exit Reasons:</b></div>';
+   html+='<table><thead><tr><th>Reason</th><th>Count</th><th>Avg P&L</th><th>Avg %</th></tr></thead><tbody>';
+   d.exit_breakdown.forEach(r=>{
+    const pnlClass=(r.avg_pnl||0)>=0?'green':'red';
+    html+=`<tr><td>${r.exit_reason||'unknown'}</td><td>${r.count}</td><td class="${pnlClass}">$${(r.avg_pnl||0).toFixed(2)}</td><td class="${pnlClass}">${((r.avg_pnl_pct||0)*100).toFixed(1)}%</td></tr>`;
+   });
+   html+='</tbody></table>';
+  }
+  if(d.filter_blocks&&Object.keys(d.filter_blocks).length){
+   html+='<div style="margin-top:12px;margin-bottom:8px"><b>Filter Blocks (today):</b></div>';
+   Object.entries(d.filter_blocks).forEach(([k,v])=>{html+=`<span style="margin-right:16px">${k}: <b>${v}</b></span>`;});
+  }
+  el.innerHTML=html||'<span>No trade analysis data</span>';
+ }catch(e){console.error(e)}
+}
+
+async function loadShadowTrades(){
+ try{
+  const r=await fetch('/api/shadow_trades?days=14');
+  const d=await r.json();
+  const el=document.getElementById('shadow-trades');
+  let html='';
+  if(d.performance&&d.performance.length){
+   html+='<div style="margin-bottom:8px"><b>Shadow Performance (14d):</b></div>';
+   html+='<table><thead><tr><th>Strategy</th><th>Trades</th><th>Wins</th><th>Total P&L</th><th>Avg %</th></tr></thead><tbody>';
+   d.performance.forEach(p=>{
+    const wr=p.trades>0?(p.wins/p.trades*100).toFixed(0)+'%':'0%';
+    const pnlClass=(p.total_pnl||0)>=0?'green':'red';
+    html+=`<tr><td>${p.strategy}</td><td>${p.trades} (${wr} win)</td><td>${p.wins}</td><td class="${pnlClass}">$${(p.total_pnl||0).toFixed(2)}</td><td>${((p.avg_pnl_pct||0)*100).toFixed(2)}%</td></tr>`;
+   });
+   html+='</tbody></table>';
+  }
+  if(d.open&&d.open.length){
+   html+='<div style="margin-top:12px;margin-bottom:8px"><b>Open Shadow Trades:</b></div>';
+   html+='<table><thead><tr><th>Symbol</th><th>Strategy</th><th>Side</th><th>Entry</th><th>TP</th><th>SL</th></tr></thead><tbody>';
+   d.open.forEach(t=>{
+    html+=`<tr><td>${t.symbol}</td><td>${t.strategy}</td><td>${t.side}</td><td>$${(t.entry_price||0).toFixed(2)}</td><td>$${(t.take_profit||0).toFixed(2)}</td><td>$${(t.stop_loss||0).toFixed(2)}</td></tr>`;
+   });
+   html+='</tbody></table>';
+  }
+  el.innerHTML=html||'<span>No shadow trades</span>';
+ }catch(e){console.error(e)}
+}
+
+function refresh(){loadStats();loadChart();loadTrades();loadSignalStats();loadTradeAnalysis();loadShadowTrades()}
 refresh();
 setInterval(refresh,30000);
 </script>

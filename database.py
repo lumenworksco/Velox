@@ -128,12 +128,33 @@ def init_db():
             weights TEXT NOT NULL
         );
 
+        -- V5: Shadow trades (paper-simulated trades for strategy evaluation)
+        CREATE TABLE IF NOT EXISTS shadow_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry_price REAL,
+            qty REAL,
+            entry_time TEXT,
+            take_profit REAL,
+            stop_loss REAL,
+            time_stop TEXT,
+            exit_price REAL,
+            exit_time TEXT,
+            exit_reason TEXT,
+            pnl REAL,
+            pnl_pct REAL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
         CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy);
         CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time);
         CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
         CREATE INDEX IF NOT EXISTS idx_signals_strategy ON signals(strategy);
         CREATE INDEX IF NOT EXISTS idx_signals_acted ON signals(acted_on);
+        CREATE INDEX IF NOT EXISTS idx_shadow_strategy ON shadow_trades(strategy);
+        CREATE INDEX IF NOT EXISTS idx_shadow_entry_time ON shadow_trades(entry_time);
     """)
     conn.commit()
 
@@ -505,3 +526,121 @@ def get_trades_paginated(limit: int = 100, offset: int = 0,
             (limit, offset),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+# =============================================================================
+# V5 ADDITIONS — Shadow Trades
+# =============================================================================
+
+def log_shadow_entry(symbol, strategy, side, entry_price, qty, entry_time,
+                     take_profit, stop_loss, time_stop=None):
+    """Record a shadow trade entry (no real order submitted)."""
+    conn = _get_conn()
+    conn.execute(
+        """INSERT INTO shadow_trades
+           (symbol, strategy, side, entry_price, qty, entry_time,
+            take_profit, stop_loss, time_stop)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (symbol, strategy, side, entry_price, qty,
+         entry_time.isoformat() if hasattr(entry_time, 'isoformat') else str(entry_time),
+         take_profit, stop_loss,
+         time_stop.isoformat() if time_stop and hasattr(time_stop, 'isoformat') else str(time_stop) if time_stop else None),
+    )
+    conn.commit()
+
+
+def get_open_shadow_trades():
+    """Get all shadow trades that haven't been closed yet."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT id, symbol, strategy, side, entry_price, qty, entry_time, "
+        "take_profit, stop_loss, time_stop "
+        "FROM shadow_trades WHERE exit_time IS NULL"
+    ).fetchall()
+    cols = ["id", "symbol", "strategy", "side", "entry_price", "qty",
+            "entry_time", "take_profit", "stop_loss", "time_stop"]
+    return [dict(zip(cols, row)) for row in rows]
+
+
+def close_shadow_trade(trade_id, exit_price, exit_time, exit_reason):
+    """Close a shadow trade with simulated exit."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT entry_price, qty, side FROM shadow_trades WHERE id = ?",
+        (trade_id,)
+    ).fetchone()
+    if not row:
+        return
+    entry_price, qty, side = row["entry_price"], row["qty"], row["side"]
+    if side == "buy":
+        pnl = (exit_price - entry_price) * qty
+        pnl_pct = (exit_price - entry_price) / entry_price if entry_price else 0
+    else:
+        pnl = (entry_price - exit_price) * qty
+        pnl_pct = (entry_price - exit_price) / entry_price if entry_price else 0
+    conn.execute(
+        """UPDATE shadow_trades
+           SET exit_price = ?, exit_time = ?, exit_reason = ?, pnl = ?, pnl_pct = ?
+           WHERE id = ?""",
+        (exit_price,
+         exit_time.isoformat() if hasattr(exit_time, 'isoformat') else str(exit_time),
+         exit_reason, round(pnl, 2), round(pnl_pct, 4), trade_id),
+    )
+    conn.commit()
+
+
+def get_shadow_performance(strategy=None, days=14):
+    """Get shadow trade performance stats."""
+    conn = _get_conn()
+    query = """SELECT strategy, COUNT(*) as trades,
+               SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+               SUM(pnl) as total_pnl, AVG(pnl_pct) as avg_pnl_pct
+               FROM shadow_trades WHERE exit_time IS NOT NULL
+               AND entry_time >= datetime('now', ?)"""
+    params = [f"-{days} days"]
+    if strategy:
+        query += " AND strategy = ?"
+        params.append(strategy)
+    query += " GROUP BY strategy"
+    rows = conn.execute(query, params).fetchall()
+    cols = ["strategy", "trades", "wins", "total_pnl", "avg_pnl_pct"]
+    return [dict(zip(cols, row)) for row in rows]
+
+
+# =============================================================================
+# V5 ADDITIONS — Trade Analysis
+# =============================================================================
+
+def get_exit_reason_breakdown(days=7):
+    """Return exit reason breakdown for recent trades."""
+    conn = _get_conn()
+    rows = conn.execute(
+        """SELECT exit_reason, COUNT(*) as count,
+           AVG(pnl) as avg_pnl, AVG(pnl_pct) as avg_pnl_pct
+           FROM trades
+           WHERE exit_time >= datetime('now', ?)
+           AND exit_reason IS NOT NULL
+           GROUP BY exit_reason
+           ORDER BY count DESC""",
+        (f"-{days} days",)
+    ).fetchall()
+    cols = ["exit_reason", "count", "avg_pnl", "avg_pnl_pct"]
+    return [dict(zip(cols, row)) for row in rows]
+
+
+def get_filter_block_summary(date=None):
+    """Return skip reason counts for signals."""
+    conn = _get_conn()
+    if date is None:
+        query = """SELECT skip_reason, COUNT(*) as count
+                   FROM signals WHERE acted_on = 0 AND skip_reason IS NOT NULL
+                   AND timestamp >= datetime('now', '-1 day')
+                   GROUP BY skip_reason ORDER BY count DESC"""
+        rows = conn.execute(query).fetchall()
+    else:
+        query = """SELECT skip_reason, COUNT(*) as count
+                   FROM signals WHERE acted_on = 0 AND skip_reason IS NOT NULL
+                   AND DATE(timestamp) = ?
+                   GROUP BY skip_reason ORDER BY count DESC"""
+        rows = conn.execute(query, (str(date),)).fetchall()
+    return {row["skip_reason"]: row["count"] for row in rows}
