@@ -1,4 +1,4 @@
-"""Rich terminal dashboard V3 — metrics, strategy breakdown, capital allocation, week P&L."""
+"""Rich terminal dashboard V5 — metrics, strategy breakdown, capital allocation, trade analysis."""
 
 import logging
 from datetime import datetime
@@ -78,7 +78,7 @@ def build_dashboard(
             pass
 
     # Header
-    header = f"  ALGO BOT V4 | {mode} MODE | Regime: {regime_text}{vix_str} | Up: {uptime}"
+    header = f"  VELOX V5 | {mode} MODE | Regime: {regime_text}{vix_str} | Up: {uptime}"
 
     # Portfolio section
     day_pnl_dollars = risk.day_pnl * risk.starting_equity if risk.starting_equity else 0
@@ -171,19 +171,27 @@ def build_dashboard(
     if not recent_lines:
         recent_lines = ["  (no trades yet)"]
 
-    # V3 features status line
-    v3_status_parts = []
+    # Features status line
+    feat_parts = []
     if config.WEBSOCKET_MONITORING:
-        v3_status_parts.append("WS")
+        feat_parts.append("WS")
     if config.USE_ML_FILTER:
-        v3_status_parts.append("ML")
+        feat_parts.append("ML")
     if config.ALLOW_SHORT:
-        v3_status_parts.append("SHORT")
+        feat_parts.append("SHORT")
     if config.GAP_GO_ENABLED:
-        v3_status_parts.append("GAP")
+        feat_parts.append("GAP")
     if config.USE_RS_FILTER:
-        v3_status_parts.append("RS")
-    v3_str = f" | V3: {'+'.join(v3_status_parts)}" if v3_status_parts else ""
+        feat_parts.append("RS")
+    if config.MTF_CONFIRMATION_ENABLED:
+        feat_parts.append("MTF")
+    if config.VIX_RISK_SCALING_ENABLED:
+        feat_parts.append("VIX")
+    if config.NEWS_FILTER_ENABLED:
+        feat_parts.append("NEWS")
+    if config.EMA_SCALP_ENABLED:
+        feat_parts.append("SCALP")
+    v3_str = f" | {'+'.join(feat_parts)}" if feat_parts else ""
 
     # Footer
     scan_time_str = last_scan_time.strftime("%H:%M:%S") if last_scan_time else "---"
@@ -249,7 +257,7 @@ def build_dashboard(
 
     content += f"{sep}\n{footer}"
 
-    return Panel(content, title="[bold cyan]ALGO TRADING BOT V4[/bold cyan]", border_style="cyan")
+    return Panel(content, title="[bold cyan]🤖 VELOX — Autonomous Trading System[/bold cyan]", border_style="cyan")
 
 
 def print_day_summary(summary: dict):
