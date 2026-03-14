@@ -87,6 +87,11 @@ try:
 except ImportError:
     AdaptiveExitManager = None
 
+try:
+    from walk_forward import WalkForwardValidator
+except ImportError:
+    WalkForwardValidator = None
+
 # --- Logging setup ---
 _file_handler = logging.FileHandler(config.LOG_FILE)
 _file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
@@ -644,7 +649,7 @@ def main():
     news_sentiment = None
     if config.NEWS_SENTIMENT_ENABLED and AlpacaNewsSentiment:
         try:
-            news_sentiment = AlpacaNewsSentiment(config.ALPACA_API_KEY, config.ALPACA_API_SECRET)
+            news_sentiment = AlpacaNewsSentiment()
             logger.info("News sentiment filter enabled")
         except Exception as e:
             logger.warning(f"News sentiment init failed: {e}")
@@ -658,6 +663,7 @@ def main():
             logger.warning(f"LLM scorer init failed: {e}")
 
     adaptive_exits = AdaptiveExitManager() if AdaptiveExitManager and config.ADAPTIVE_EXITS_ENABLED else None
+    walk_forward = WalkForwardValidator() if WalkForwardValidator and config.WALK_FORWARD_ENABLED else None
 
     # Regime detector (kept)
     regime_detector = MarketRegime()
@@ -843,6 +849,20 @@ def main():
                         kalman_pairs.select_pairs_weekly(current)
                     except Exception as e:
                         logger.error(f"Weekly pair selection failed: {e}")
+
+                    # Walk-forward validation (weekly)
+                    if walk_forward:
+                        try:
+                            logger.info("Sunday: running walk-forward validation...")
+                            wf_results = walk_forward.run_weekly_validation()
+                            for strat, result in wf_results.items():
+                                rec = result.get('recommendation', 'unknown')
+                                sharpe = result.get('sharpe', 0.0)
+                                logger.info(f"WF {strat}: Sharpe={sharpe:.2f} -> {rec}")
+                                if rec == 'demote':
+                                    logger.warning(f"Walk-forward: {strat} demoted (OOS Sharpe {sharpe:.2f} < {config.WALK_FORWARD_MIN_SHARPE})")
+                        except Exception as e:
+                            logger.error(f"Walk-forward validation failed: {e}")
 
                 # -------------------------------------------------------
                 # Update regime

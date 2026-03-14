@@ -287,6 +287,8 @@ WEBSOCKET_RECONNECT_SEC = 5
 CLOSE_UNKNOWN_POSITIONS = False  # Auto-close broker positions we didn't open
 
 # --- V7: MTF per-strategy control ---
+MTF_CONFIRMATION_ENABLED = True   # Master switch for MTF confirmation
+MTF_CACHE_SECONDS = 300           # Cache MTF results for 5 minutes
 MTF_ENABLED_FOR = {
     'STAT_MR':      False,   # Mean reversion = counter-trend by definition
     'VWAP':         False,   # Same as above
