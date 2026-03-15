@@ -798,7 +798,8 @@ def main():
     adaptive_allocator = None
     if config.ADAPTIVE_ALLOCATION_ENABLED and AdaptiveAllocator:
         try:
-            adaptive_allocator = AdaptiveAllocator()
+            strategies = list(config.STRATEGY_ALLOCATIONS.keys())
+            adaptive_allocator = AdaptiveAllocator(strategies, config.STRATEGY_ALLOCATIONS)
             logger.info("Adaptive allocator enabled")
         except Exception as e:
             logger.warning(f"Adaptive allocator init failed: {e}")
