@@ -279,7 +279,7 @@ class KalmanPairsTrader:
     def scan(self, now: datetime, regime: str = "UNKNOWN") -> list[Signal]:
         """Scan active pairs for entry signals.
 
-        Called every PAIRS_SCAN_INTERVAL_SEC (120s).
+        Called every SCAN_INTERVAL_SEC (120s).
 
         Entry: |z-score| > PAIRS_ZSCORE_ENTRY (2.0)
         Generates TWO linked signals (dollar-neutral pair):

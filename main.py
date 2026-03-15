@@ -1,7 +1,8 @@
-"""Entry point V7 — Velox V7 Autonomous Trading System.
+"""Velox V8 — Autonomous Algorithmic Trading System.
 
-Five-strategy portfolio with volatility-targeted sizing, daily P&L locks,
-beta neutralization, news sentiment, optional LLM scoring, and adaptive exits.
+Five-strategy portfolio with volatility-targeted sizing, Kelly criterion,
+daily P&L locks, beta neutralization, news sentiment, ATR trailing stops,
+portfolio heat tracking, and adaptive exits.
 
 Strategies: StatMR (50%), VWAP (20%), KalmanPairs (20%), ORB (5%), MicroMom (5%).
 """
@@ -12,9 +13,7 @@ import logging
 import sys
 import time as time_mod
 from datetime import datetime, time, timedelta
-from pathlib import Path
 
-from rich.console import Console
 from rich.live import Live
 
 import config
@@ -39,12 +38,10 @@ from risk import (
     RiskManager, TradeRecord,
     VolatilityTargetingRiskEngine, DailyPnLLock, BetaNeutralizer,
 )
-from risk.daily_pnl_lock import LockState
 from execution import (
     submit_bracket_order,
     close_position,
     close_partial_position,
-    cancel_all_open_orders,
     can_short,
 )
 from dashboard import (
@@ -53,7 +50,7 @@ from dashboard import (
     print_startup_info,
     console,
 )
-from earnings import load_earnings_cache, has_earnings_soon, get_excluded_count
+from earnings import load_earnings_cache, has_earnings_soon
 from correlation import load_correlation_cache, is_too_correlated
 from analytics.consistency_score import compute_consistency_score
 
@@ -937,9 +934,7 @@ def main():
                             logger.error(f"StatMR scan failed: {e}")
 
                         try:
-                            vwap_signals = vwap_strategy.scan(
-                                config.STANDARD_SYMBOLS, current, regime
-                            )
+                            vwap_signals = vwap_strategy.scan(current, regime)
                             signals.extend(vwap_signals)
                         except Exception as e:
                             logger.error(f"VWAP scan failed: {e}")

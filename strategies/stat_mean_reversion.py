@@ -19,6 +19,7 @@ from data import get_intraday_bars, get_daily_bars
 from strategies.base import Signal
 from analytics.ou_tools import fit_ou_params, compute_zscore
 from analytics.hurst import hurst_exponent
+from analytics.indicators import compute_vwap
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +79,8 @@ class StatMeanReversion:
                     if intraday is not None and not intraday.empty and len(intraday) >= 50:
                         bars = intraday
                         bar_duration_hours = 2 / 60  # 2-minute bars in hours
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Intraday bar fetch failed for {symbol}: {e}")
 
                 # Fallback to daily bars
                 if bars is None:
@@ -132,7 +133,7 @@ class StatMeanReversion:
     def scan(self, now: datetime, regime: str = "UNKNOWN") -> list[Signal]:
         """Scan universe for mean reversion entry signals.
 
-        Called every MR_SCAN_INTERVAL_SEC (120s).
+        Called every SCAN_INTERVAL_SEC (120s).
         Uses 2-min intraday bars to compute real-time z-scores.
 
         Entry conditions:
@@ -181,7 +182,7 @@ class StatMeanReversion:
                     continue
 
                 # VWAP computation
-                vwap = self._compute_vwap(bars)
+                vwap = compute_vwap(bars)
                 if vwap is None:
                     continue
 
@@ -364,13 +365,3 @@ class StatMeanReversion:
         rs = gain.iloc[-1] / loss.iloc[-1]
         return 100.0 - (100.0 / (1.0 + rs))
 
-    def _compute_vwap(self, bars: pd.DataFrame) -> float | None:
-        """Compute VWAP from intraday bars."""
-        if bars.empty or "volume" not in bars.columns:
-            return None
-        typical = (bars["high"] + bars["low"] + bars["close"]) / 3
-        cum_vol = bars["volume"].cumsum()
-        cum_vp = (typical * bars["volume"]).cumsum()
-        if cum_vol.iloc[-1] == 0:
-            return None
-        return cum_vp.iloc[-1] / cum_vol.iloc[-1]

@@ -21,17 +21,8 @@ from strategies.base import Signal
 logger = logging.getLogger(__name__)
 
 
-# Approximate betas for quick selection (same as beta_neutralizer)
-STOCK_BETAS = {
-    'NVDA': 1.6, 'AMD': 1.5, 'TSLA': 1.8, 'COIN': 2.0, 'SOFI': 1.6,
-    'PLTR': 1.5, 'HOOD': 1.8, 'AFRM': 1.7, 'SMCI': 2.0, 'SNOW': 1.4,
-    'DDOG': 1.3, 'NET': 1.4, 'SQ': 1.5, 'META': 1.3, 'NFLX': 1.2,
-    'GOOGL': 1.15, 'AMZN': 1.2, 'AAPL': 1.1, 'MSFT': 1.05,
-    'CRWD': 1.3, 'PANW': 1.2, 'ZS': 1.2, 'RBLX': 1.4,
-    'CELH': 1.3, 'AXON': 1.2, 'ENPH': 1.5, 'FSLR': 1.4,
-    'IONQ': 2.0, 'RGTI': 2.0, 'QUBT': 2.0, 'RKLB': 1.8,
-    'LYFT': 1.5, 'UBER': 1.3, 'ABNB': 1.4, 'DASH': 1.3,
-}
+# Beta table — sourced from config for tunability
+STOCK_BETAS = config.MICRO_BETA_TABLE
 
 
 class IntradayMicroMomentum:
@@ -69,8 +60,8 @@ class IntradayMicroMomentum:
 
         Returns True if event detected.
         """
-        # Cooldown: don't detect new events within 15 min of last
-        if self._event_time and (now - self._event_time).total_seconds() < 900:
+        # Cooldown: don't detect new events within cooldown period
+        if self._event_time and (now - self._event_time).total_seconds() < config.MICRO_EVENT_COOLDOWN_SEC:
             return self._event_active
 
         try:
@@ -138,8 +129,8 @@ class IntradayMicroMomentum:
         if self._trades_this_event >= config.MICRO_MAX_TRADES_PER_EVENT:
             return signals
 
-        # Event window: only trade within 5 min of event
-        if self._event_time and (now - self._event_time).total_seconds() > 300:
+        # Event window: only trade within event window
+        if self._event_time and (now - self._event_time).total_seconds() > config.MICRO_EVENT_WINDOW_SEC:
             self._event_active = False
             return signals
 

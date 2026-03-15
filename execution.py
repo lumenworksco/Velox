@@ -288,7 +288,7 @@ def close_gap_go_positions(open_trades: dict, now: datetime) -> list[str]:
 
 
 def check_sector_max_hold(open_trades: dict, now: datetime) -> list[str]:
-    """V4: Check sector rotation trades for max hold period."""
+    """Check sector rotation trades for max hold period (legacy)."""
     expired = []
     for symbol, trade in open_trades.items():
         if trade.strategy == "SECTOR_ROTATION" and trade.max_hold_date:
@@ -299,7 +299,7 @@ def check_sector_max_hold(open_trades: dict, now: datetime) -> list[str]:
 
 
 def check_pairs_max_hold(open_trades: dict, now: datetime) -> list[str]:
-    """V4: Check pairs trades for max hold period."""
+    """Check pairs trades for max hold period (legacy)."""
     expired = []
     for symbol, trade in open_trades.items():
         if trade.strategy == "PAIRS" and trade.max_hold_date:
@@ -310,7 +310,7 @@ def check_pairs_max_hold(open_trades: dict, now: datetime) -> list[str]:
 
 
 def close_partial_position(symbol: str, qty: int) -> bool:
-    """V4: Close a partial position (for scaled exits)."""
+    """Close a partial position (for scaled exits)."""
     client = get_trading_client()
     try:
         client.close_position(symbol, qty=str(qty))

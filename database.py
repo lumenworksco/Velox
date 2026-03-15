@@ -734,7 +734,7 @@ def get_filter_block_summary(date=None):
 
 
 # =============================================================================
-# V6: OU Parameters
+# --- OU Parameters ---
 # =============================================================================
 
 def save_ou_parameters(symbol: str, date: str, kappa: float, mu: float,
@@ -772,7 +772,7 @@ def get_mr_universe(date: str) -> list[dict]:
 
 
 # =============================================================================
-# V6: Kalman Pairs
+# --- Kalman Pairs ---
 # =============================================================================
 
 def save_kalman_pair(symbol1: str, symbol2: str, hedge_ratio: float,
@@ -832,7 +832,7 @@ def deactivate_all_kalman_pairs():
 
 
 # =============================================================================
-# V6: Consistency Log
+# --- Consistency Log ---
 # =============================================================================
 
 def save_consistency_log(date: str, consistency_score: float,
@@ -889,7 +889,7 @@ def get_signals_by_strategy(strategy: str, days: int = 7) -> list[dict]:
 
 
 # =============================================================================
-# V8: Kelly Criterion Parameters
+# --- Kelly Criterion Parameters ---
 # =============================================================================
 
 def save_kelly_params(strategy: str, win_rate: float, avg_win_loss: float,
@@ -907,7 +907,7 @@ def save_kelly_params(strategy: str, win_rate: float, avg_win_loss: float,
 
 
 # =============================================================================
-# V8: Monte Carlo Tail Risk
+# --- Monte Carlo Tail Risk ---
 # =============================================================================
 
 def save_monte_carlo_result(date: str, var_95: float, var_99: float,
@@ -926,7 +926,7 @@ def save_monte_carlo_result(date: str, var_95: float, var_99: float,
 
 
 # =============================================================================
-# V8: Execution Analytics
+# --- Execution Analytics ---
 # =============================================================================
 
 def save_execution_analytics(order_id: str, symbol: str, strategy: str, side: str,

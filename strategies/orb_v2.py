@@ -96,8 +96,8 @@ class ORBStrategyV2:
             if snap and hasattr(snap, "prev_daily_bar") and snap.prev_daily_bar:
                 prev_close = snap.prev_daily_bar.close
                 gap_pct = abs(first_open - prev_close) / prev_close
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Prev close lookup failed for {symbol}: {e}")
 
         valid = (
             gap_pct < config.ORB_MAX_GAP_PCT
@@ -167,10 +167,11 @@ class ORBStrategyV2:
                 vol_ratio = current_vol / avg_vol if avg_vol > 0 else 0
 
                 # --- LONG breakout ---
-                if price > orb_high * 1.001 and vol_ratio > config.ORB_VOLUME_RATIO:
+                breakout_buf = config.ORB_BREAKOUT_BUFFER
+                if price > orb_high * (1 + breakout_buf) and vol_ratio > config.ORB_VOLUME_RATIO:
                     entry = price
-                    tp = entry + 1.5 * orb_range
-                    sl = entry - 0.5 * orb_range
+                    tp = entry + config.ORB_TP_MULT * orb_range
+                    sl = entry - config.ORB_SL_MULT * orb_range
 
                     # Enforce minimum stop distance
                     min_stop_dist = entry * config.ORB_MIN_STOP_PCT
@@ -191,12 +192,12 @@ class ORBStrategyV2:
                 # --- SHORT breakdown ---
                 elif (
                     config.ALLOW_SHORT
-                    and price < orb_low * 0.999
+                    and price < orb_low * (1 - breakout_buf)
                     and vol_ratio > config.ORB_VOLUME_RATIO
                 ):
                     entry = price
-                    tp = entry - 1.5 * orb_range
-                    sl = entry + 0.5 * orb_range
+                    tp = entry - config.ORB_TP_MULT * orb_range
+                    sl = entry + config.ORB_SL_MULT * orb_range
 
                     # Enforce minimum stop distance
                     min_stop_dist = entry * config.ORB_MIN_STOP_PCT
@@ -240,7 +241,7 @@ class ORBStrategyV2:
                 continue
 
             elapsed = now - entry_time
-            if elapsed >= timedelta(hours=2):
+            if elapsed >= timedelta(hours=config.ORB_TIME_STOP_HOURS):
                 exits.append({
                     "symbol": trade.symbol,
                     "action": "full",

@@ -383,7 +383,8 @@ def quick_recent_backtest(strategy: str, days: int = 30) -> dict:
                     continue
                 data.columns = [c.lower() for c in data.columns]
                 all_data[symbol] = data
-            except Exception:
+            except Exception as e:
+                logger.debug(f"yfinance download failed for {symbol}: {e}")
                 continue
 
         if not all_data:

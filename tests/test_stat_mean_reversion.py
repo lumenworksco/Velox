@@ -400,13 +400,15 @@ class TestHelpers:
         assert rsi is None
 
     def test_compute_vwap(self, strategy):
-        """VWAP returns a reasonable price."""
+        """VWAP returns a reasonable price (now via analytics.indicators)."""
+        from analytics.indicators import compute_vwap
         bars = _make_intraday_bars(10, base_price=100.0)
-        vwap = strategy._compute_vwap(bars)
+        vwap = compute_vwap(bars)
         assert vwap is not None
         assert 90 < vwap < 110
 
     def test_compute_vwap_empty(self, strategy):
-        """VWAP returns None for empty bars."""
+        """VWAP returns None for empty bars (now via analytics.indicators)."""
+        from analytics.indicators import compute_vwap
         bars = pd.DataFrame()
-        assert strategy._compute_vwap(bars) is None
+        assert compute_vwap(bars) is None

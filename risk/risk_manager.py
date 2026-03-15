@@ -7,10 +7,11 @@ from datetime import datetime
 
 import config
 import database
+from analytics.metrics import compute_sharpe as _compute_sharpe_fn
 
 logger = logging.getLogger(__name__)
 
-# --- V4: VIX Risk Scaling ---
+# --- VIX Risk Scaling ---
 _vix_cache: tuple[float, float] | None = None  # (vix_value, fetch_timestamp)
 
 
@@ -180,9 +181,12 @@ class RiskManager:
     def calculate_position_size(self, entry_price: float, stop_price: float,
                                regime: str, strategy: str = "",
                                side: str = "buy") -> int:
-        """ATR-based position sizing: risk exactly 1% of portfolio per trade.
+        """Legacy base position sizing (used by RiskManager tests).
 
-        V3: Applies dynamic capital allocation weights per strategy and
+        For production sizing, use VolatilityTargetingRiskEngine.calculate_position_size()
+        which adds Kelly, vol-scalar, and PnL-lock adjustments.
+
+        Applies dynamic capital allocation weights per strategy and
         short selling multiplier for sell-side trades.
 
         Args:
@@ -300,7 +304,7 @@ class RiskManager:
 
     def partial_close(self, symbol: str, qty_to_close: int, exit_price: float,
                       now: datetime, exit_reason: str = "partial_tp"):
-        """V4: Close a portion of a position. Reduces qty, logs partial P&L."""
+        """Close a portion of a position. Reduces qty, logs partial P&L."""
         if symbol not in self.open_trades:
             return
 
@@ -416,7 +420,7 @@ class RiskManager:
         except Exception as e:
             logger.error(f"Failed to load positions from DB: {e}")
 
-    # --- V3: Dynamic Capital Allocation ---
+    # --- Dynamic Capital Allocation ---
 
     def update_strategy_weights(self):
         """Recalculate capital allocation weights based on rolling Sharpe.
@@ -482,15 +486,8 @@ class RiskManager:
 
     @staticmethod
     def _compute_sharpe(daily_returns: list[float], rf_annual: float = 0.045) -> float:
-        """Simple annualized Sharpe ratio."""
-        import numpy as np
-        if len(daily_returns) < 2:
-            return 0.0
-        arr = np.array(daily_returns)
-        excess = arr - rf_annual / 252
-        if np.std(excess) == 0:
-            return 0.0
-        return float(np.mean(excess) / np.std(excess) * np.sqrt(252))
+        """Annualized Sharpe ratio. Delegates to analytics.metrics.compute_sharpe."""
+        return _compute_sharpe_fn(daily_returns, risk_free_rate=rf_annual)
 
     # --- Legacy serialization (kept for migration compatibility) ---
 

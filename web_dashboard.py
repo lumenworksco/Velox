@@ -1,4 +1,4 @@
-"""V7: FastAPI web dashboard — portfolio history, trade log, signal analysis, risk state, strategy health."""
+"""FastAPI web dashboard — portfolio history, trade log, signal analysis, risk state, strategy health."""
 
 import logging
 import time as _time
@@ -9,10 +9,11 @@ from fastapi.responses import HTMLResponse
 
 import config
 import database
+from analytics.metrics import compute_sharpe as _shared_compute_sharpe
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Velox V7 Dashboard", docs_url=None, redoc_url=None)
+app = FastAPI(title="Velox V8 Dashboard", docs_url=None, redoc_url=None)
 
 _start_time = _time.time()
 
@@ -24,7 +25,8 @@ async def health():
     try:
         positions = database.load_open_positions()
         open_count = len(positions)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Health check position load failed: {e}")
         open_count = -1
 
     return {
@@ -32,7 +34,7 @@ async def health():
         "uptime_seconds": round(uptime_sec),
         "open_positions": open_count,
         "paper_mode": config.PAPER_MODE,
-        "version": "V6",
+        "version": "V8",
     }
 
 
@@ -41,7 +43,11 @@ async def health():
 @app.get("/api/portfolio_history")
 async def portfolio_history(days: int = Query(30, ge=1, le=365)):
     """Return daily portfolio snapshots."""
-    return database.get_daily_snapshots(days=days)
+    try:
+        return database.get_daily_snapshots(days=days)
+    except Exception as e:
+        logger.error(f"portfolio_history failed: {e}")
+        return {"error": str(e)}
 
 
 @app.get("/api/trades")
@@ -49,7 +55,11 @@ async def trades(limit: int = Query(100, ge=1, le=1000),
                  offset: int = Query(0, ge=0),
                  strategy: str = Query(None)):
     """Return recent trades, optionally filtered by strategy."""
-    return database.get_trades_paginated(limit=limit, offset=offset, strategy=strategy)
+    try:
+        return database.get_trades_paginated(limit=limit, offset=offset, strategy=strategy)
+    except Exception as e:
+        logger.error(f"trades endpoint failed: {e}")
+        return {"error": str(e)}
 
 
 @app.get("/api/stats")
@@ -58,7 +68,8 @@ async def stats():
     try:
         from analytics import compute_analytics
         analytics = compute_analytics()
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Analytics computation failed: {e}")
         analytics = {}
     return analytics
 
@@ -66,21 +77,33 @@ async def stats():
 @app.get("/api/signals")
 async def signals(date: str = Query(None)):
     """Return signals for a specific date, or today."""
-    if date is None:
-        date = datetime.now(config.ET).strftime("%Y-%m-%d")
-    return database.get_signals_by_date(date)
+    try:
+        if date is None:
+            date = datetime.now(config.ET).strftime("%Y-%m-%d")
+        return database.get_signals_by_date(date)
+    except Exception as e:
+        logger.error(f"signals endpoint failed: {e}")
+        return {"error": str(e)}
 
 
 @app.get("/api/positions")
 async def positions():
     """Return current open positions."""
-    return database.load_open_positions()
+    try:
+        return database.load_open_positions()
+    except Exception as e:
+        logger.error(f"positions endpoint failed: {e}")
+        return {"error": str(e)}
 
 
 @app.get("/api/signal_stats")
 async def signal_stats(days: int = Query(7, ge=1, le=90)):
     """Return signal skip reason breakdown."""
-    return database.get_signal_skip_reasons(days=days)
+    try:
+        return database.get_signal_skip_reasons(days=days)
+    except Exception as e:
+        logger.error(f"signal_stats endpoint failed: {e}")
+        return {"error": str(e)}
 
 
 @app.get("/api/shadow_trades")
@@ -96,7 +119,7 @@ async def shadow_trades(days: int = Query(14, ge=1, le=90)):
 
 @app.get("/api/consistency")
 async def consistency(days: int = Query(30, ge=1, le=90)):
-    """V6: Return consistency score history."""
+    """Return consistency score history."""
     try:
         return database.get_consistency_log(days=days)
     except Exception as e:
@@ -105,12 +128,12 @@ async def consistency(days: int = Query(30, ge=1, le=90)):
 
 @app.get("/api/risk-state")
 async def risk_state():
-    """V6: Return current risk engine state (vol scalar, PnL lock, beta)."""
+    """Return current risk engine state (vol scalar, PnL lock, beta)."""
     # This will be populated by main.py setting shared state
     return _v6_risk_state.copy()
 
 
-# V6: Shared risk state updated by main loop
+# Shared risk state updated by main loop
 _v6_risk_state = {
     "pnl_lock_state": "NORMAL",
     "vol_scalar": 1.0,
@@ -135,16 +158,13 @@ def update_risk_state(pnl_lock_state: str = "NORMAL", vol_scalar: float = 1.0,
 
 @app.get("/api/strategy_health")
 async def strategy_health():
-    """V7: Per-strategy health metrics for the last 7 and 30 days."""
-    import numpy as _np
+    """Per-strategy health metrics for the last 7 and 30 days."""
 
     def _compute_sharpe(pnls):
         if len(pnls) < 5:
             return None
-        arr = _np.array(pnls)
-        if arr.std() == 0:
-            return 0.0
-        return float(arr.mean() / arr.std() * _np.sqrt(252))
+        val = _shared_compute_sharpe(pnls)
+        return val if val != 0.0 else 0.0
 
     result = {}
     for strategy in ['STAT_MR', 'VWAP', 'KALMAN_PAIRS', 'ORB', 'MICRO_MOM']:
@@ -152,7 +172,8 @@ async def strategy_health():
             trades_7d = database.get_trades_by_strategy(strategy, days=7)
             trades_30d = database.get_trades_by_strategy(strategy, days=30)
             signals_7d = database.get_signals_by_strategy(strategy, days=7)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Strategy health data fetch failed for {strategy}: {e}")
             result[strategy] = {'status': 'error', 'trades_7d': 0}
             continue
 
@@ -185,7 +206,7 @@ async def strategy_health():
 
 @app.get("/api/filter_diagnostic")
 async def filter_diagnostic():
-    """V7: Breakdown of why signals are being blocked — critical for detecting over-filtering."""
+    """Breakdown of why signals are being blocked — critical for detecting over-filtering."""
     try:
         from datetime import timedelta
         from_date = (datetime.now() - timedelta(days=7)).isoformat()
@@ -225,7 +246,7 @@ async def dashboard():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Trading Bot V3</title>
+<title>Velox V8 Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -249,7 +270,7 @@ tr:hover{background:#161b22}
 </style>
 </head>
 <body>
-<h1>VELOX V7 — Autonomous Algorithmic Trading System</h1>
+<h1>VELOX V8 — Autonomous Algorithmic Trading System</h1>
 
 <div class="grid" id="stats-grid"></div>
 
@@ -291,7 +312,7 @@ tr:hover{background:#161b22}
 <div id="signal-stats"></div>
 </div>
 
-<div class="footer">Auto-refreshes every 30s | Velox V7</div>
+<div class="footer">Auto-refreshes every 30s | Velox V8</div>
 
 <script>
 let chart=null;

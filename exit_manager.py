@@ -1,9 +1,8 @@
-"""V4: Advanced exit mechanics — scaled TP, trailing stops, volatility exits."""
+"""Advanced exit mechanics — scaled TP, trailing stops, ATR trailing, volatility exits."""
 
 import logging
 from datetime import datetime
 
-import numpy as np
 import pandas_ta as ta
 
 import config
@@ -59,7 +58,8 @@ class ExitManager:
             if not snap or not snap.latest_trade:
                 return None
             current_price = float(snap.latest_trade.price)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Snapshot fetch failed for {symbol}: {e}")
             return None
 
         if current_price <= 0:

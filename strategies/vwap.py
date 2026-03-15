@@ -1,10 +1,10 @@
-"""VWAP Mean Reversion V2 strategy.
+"""VWAP Mean Reversion strategy — 20% of capital allocation.
 
-V7 upgrade: adds OU z-score confirmation and bid-ask spread filter
-on top of the existing VWAP band deviation logic.
+Combines VWAP band deviation with OU z-score confirmation and bid-ask
+spread filtering.
 
 Entry: VWAP deviation AND OU z-score both agree price is cheap/expensive
-Exit:  Either VWAP reversion OR OU reversion (whichever comes first)
+Exit:  Handled by ExitManager (time stops, trailing stops, scaled TP)
 """
 
 import logging
@@ -19,6 +19,7 @@ import config
 from data import get_intraday_bars, get_snapshot
 from strategies.base import Signal, VWAPState
 from analytics.ou_tools import fit_ou_params, compute_zscore
+from analytics.indicators import compute_vwap_bands
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,8 @@ logger = logging.getLogger(__name__)
 class VWAPStrategy:
     """VWAP Mean Reversion V2 — hybrid VWAP + OU z-score."""
 
-    def __init__(self):
+    def __init__(self, symbols: list[str] | None = None):
+        self.symbols: list[str] = symbols or config.STANDARD_SYMBOLS
         self.states: dict[str, VWAPState] = {}
         self.triggered: dict[str, datetime] = {}  # cooldown tracking
         self.daily_moves: dict[str, float] = {}
@@ -36,36 +38,14 @@ class VWAPStrategy:
         self.triggered.clear()
         self.daily_moves.clear()
 
-    def _compute_vwap(self, bars: pd.DataFrame) -> tuple[float, float, float] | None:
-        """Compute VWAP and bands from intraday bars."""
-        if bars.empty:
-            return None
-
-        typical_price = (bars["high"] + bars["low"] + bars["close"]) / 3
-        cum_vol = bars["volume"].cumsum()
-        cum_vp = (typical_price * bars["volume"]).cumsum()
-
-        if cum_vol.iloc[-1] == 0:
-            return None
-
-        vwap = cum_vp.iloc[-1] / cum_vol.iloc[-1]
-
-        cum_vp2 = (typical_price**2 * bars["volume"]).cumsum()
-        variance = cum_vp2.iloc[-1] / cum_vol.iloc[-1] - vwap**2
-        std_dev = np.sqrt(max(variance, 0))
-
-        upper = vwap + config.VWAP_BAND_STD * std_dev
-        lower = vwap - config.VWAP_BAND_STD * std_dev
-
-        return vwap, upper, lower
-
-    def scan(self, symbols: list[str], now: datetime, regime: str) -> list[Signal]:
-        """Scan for VWAP mean reversion signals with V7 OU z-score confirmation."""
+    def scan(self, now: datetime, regime: str, symbols: list[str] | None = None) -> list[Signal]:
+        """Scan for VWAP mean reversion signals with OU z-score confirmation."""
+        scan_symbols = symbols if symbols is not None else self.symbols
         signals = []
         today = now.date()
         market_open = datetime(today.year, today.month, today.day, 9, 30, tzinfo=config.ET)
 
-        for symbol in symbols:
+        for symbol in scan_symbols:
             # Cooldown: don't re-trigger within 5 minutes
             if symbol in self.triggered:
                 if (now - self.triggered[symbol]).total_seconds() < 300:
@@ -87,7 +67,7 @@ class VWAPStrategy:
                     continue
 
                 # Compute VWAP + bands
-                result = self._compute_vwap(bars)
+                result = compute_vwap_bands(bars, getattr(config, "VWAP_BAND_STD", 2.0))
                 if result is None:
                     continue
                 vwap, upper, lower = result
@@ -105,7 +85,8 @@ class VWAPStrategy:
                     ou = fit_ou_params(close)
                     if ou:
                         ou_zscore = compute_zscore(last_price, ou['mu'], ou['sigma'])
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"OU fit failed for {symbol}: {e}")
                     pass  # OU fit failure is non-fatal — proceed without
 
                 # V7: Bid-ask spread check (skip wide-spread stocks)
@@ -118,7 +99,8 @@ class VWAPStrategy:
                             spread_pct = (ask - bid) / last_price
                             if spread_pct > config.VWAP_MAX_SPREAD_PCT:
                                 continue
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Snapshot fetch failed for {symbol}: {e}")
                     pass  # Snapshot failure is non-fatal
 
                 prev_bar = bars.iloc[-2]
@@ -221,3 +203,12 @@ class VWAPStrategy:
                 logger.warning(f"VWAP scan error for {symbol}: {e}")
 
         return signals
+
+    def check_exits(self, open_trades: list, now: datetime) -> list[dict]:
+        """Check VWAP positions for exit signals.
+
+        VWAP exits are handled entirely by ExitManager (time stops, trailing
+        stops, scaled TP). This passthrough satisfies the common strategy
+        interface.
+        """
+        return []
