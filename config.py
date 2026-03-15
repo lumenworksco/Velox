@@ -382,6 +382,19 @@ OBV_CONFIDENCE_BOOST = 0.1
 OBV_CONFIDENCE_PENALTY = -0.1
 OBV_LOOKBACK = 20
 
+# --- V8: Sortino Ratio ---
+SORTINO_ENABLED = True
+WALK_FORWARD_MIN_SORTINO = 0.5  # Demote if BOTH Sharpe < 0.3 AND Sortino < 0.5
+
+# --- V8: Broker Abstraction ---
+BROKER_ABSTRACTION_ENABLED = True
+PAPER_BROKER_SPREAD_BPS = 5.0
+
+# --- V8: Multi-Timeframe Confluence ---
+MTF_CONFLUENCE_ENABLED = True
+MTF_MIN_CONFLUENCE_BREAKOUT = 0.66   # ORB, MICRO_MOM need trend alignment
+MTF_MAX_CONFLUENCE_MEANREV = 0.33    # STAT_MR, VWAP want dislocation
+
 # --- Runtime-mutable strategy parameters (can be updated by optimizer) ---
 _runtime_params: dict = {}
 
