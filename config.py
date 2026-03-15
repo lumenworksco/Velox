@@ -158,6 +158,13 @@ MR_MIN_RR_RATIO = 1.5
 VWAP_OU_ZSCORE_MIN   = 1.0        # OU z-score confirmation for entries
 VWAP_MAX_SPREAD_PCT  = 0.001      # Skip if bid-ask spread > 0.1%
 VWAP_VOLUME_RATIO    = 0.8        # Volume ratio vs 20-bar average
+MAX_INTRADAY_MOVE_PCT = 0.03      # Skip if stock moved > 3% today
+VWAP_BAND_STD        = 2.0        # Standard deviation multiplier for VWAP bands
+VWAP_RSI_OVERSOLD    = 30         # RSI below this = oversold (buy signal)
+VWAP_RSI_OVERBOUGHT  = 70         # RSI above this = overbought (short signal)
+VWAP_CONFIRMATION_BARS = 1        # Bars confirming bounce (1 = disabled)
+VWAP_STOP_EXTENSION  = 0.5        # Stop extension beyond band (in std devs)
+VWAP_MIN_STOP_PCT    = 0.005      # Minimum 0.5% stop distance
 
 # --- Kalman Pairs Trading ---
 PAIRS_ZSCORE_ENTRY = 2.0
@@ -250,6 +257,13 @@ BETA_SKIP_FIRST_MINUTES = 15
 REGIME_CHECK_INTERVAL_MIN = 30
 REGIME_EMA_PERIOD = 20
 BEARISH_SIZE_CUT = 0.40
+
+# --- HMM Regime Detection ---
+HMM_REGIME_ENABLED = True
+HMM_N_STATES = 5
+HMM_RETRAIN_DAY = "sunday"
+HMM_TRAINING_YEARS = 3
+HMM_MIN_PROBABILITY = 0.4       # Below this, treat as uncertain — conservative sizing
 
 # --- Portfolio Heat & Correlation ---
 PORTFOLIO_HEAT_ENABLED = True

@@ -268,7 +268,7 @@ def check_shadow_exits(now: datetime):
 
 
 # ---------------------------------------------------------------------------
-# Signal processing (V6 — simplified)
+# Signal processing
 # ---------------------------------------------------------------------------
 
 def process_signals(
@@ -281,10 +281,11 @@ def process_signals(
     ws_monitor=None,
     news_sentiment=None,
     llm_scorer=None,
+    regime_detector=None,
 ):
     """Process signals: check filters, risk, size, and submit orders.
 
-    V7 filters: position conflict, earnings, correlation, short pre-check,
+    Filters: position conflict, earnings, correlation, short pre-check,
     news sentiment (soft), LLM scoring (optional).
     """
 
@@ -307,7 +308,7 @@ def process_signals(
     # Process non-pair signals
     for signal in non_pair_signals:
         _process_single_signal(signal, risk, regime, now, vol_engine, pnl_lock, ws_monitor,
-                               news_sentiment, llm_scorer)
+                               news_sentiment, llm_scorer, regime_detector)
 
     # Process pairs atomically (both legs or neither)
     for pair_id, pair_signals in pair_groups.items():
@@ -328,7 +329,7 @@ def process_signals(
         if all_ok:
             for sig in pair_signals:
                 _process_single_signal(sig, risk, regime, now, vol_engine, pnl_lock, ws_monitor,
-                                       news_sentiment, llm_scorer)
+                                       news_sentiment, llm_scorer, regime_detector)
         else:
             for sig in pair_signals:
                 database.log_signal(now, sig.symbol, sig.strategy, sig.side, False, "pair_blocked")
@@ -344,6 +345,7 @@ def _process_single_signal(
     ws_monitor=None,
     news_sentiment=None,
     llm_scorer=None,
+    regime_detector=None,
 ):
     """Process a single signal through V7 filters and submit if valid."""
     skip_reason = ""
@@ -431,8 +433,16 @@ def _process_single_signal(
         pnl_lock_mult=lock_mult,
     )
 
-    # Apply news + LLM multipliers
-    qty = int(qty * news_mult * llm_mult)
+    # V9: HMM regime affinity multiplier (fail-open: 1.0 if unavailable)
+    regime_mult = 1.0
+    if regime_detector and getattr(config, "HMM_REGIME_ENABLED", False):
+        try:
+            regime_mult = regime_detector.get_regime_affinity(signal.strategy)
+        except Exception:
+            regime_mult = 1.0
+
+    # Apply news + LLM + regime multipliers
+    qty = int(qty * news_mult * llm_mult * regime_mult)
 
     if qty <= 0:
         skip_reason = "position_size_zero"
@@ -498,7 +508,7 @@ def _process_single_signal(
 
 
 # ---------------------------------------------------------------------------
-# V6 exit processing helper
+# Exit processing helper
 # ---------------------------------------------------------------------------
 
 def _handle_strategy_exits(exit_actions: list[dict], risk: RiskManager, now: datetime, ws_monitor=None):
@@ -597,7 +607,7 @@ def _get_current_prices(open_trades: dict) -> dict[str, float]:
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Velox V6 Trading Bot")
+    parser = argparse.ArgumentParser(description="Velox V8 Trading Bot")
     parser.add_argument("--backtest", action="store_true", help="Run backtesting engine")
     parser.add_argument("--walkforward", action="store_true", help="Run walk-forward test")
     parser.add_argument("--live", action="store_true", help="Alias for ALPACA_LIVE=true")
@@ -621,7 +631,7 @@ def main():
         walk_forward_test()
         return
 
-    console.print("[bold cyan]Starting Velox V6 Trading Bot...[/bold cyan]\n")
+    console.print("[bold cyan]Starting Velox V8 Trading Bot...[/bold cyan]\n")
 
     # Initialize database
     database.init_db()
@@ -630,7 +640,7 @@ def main():
     # Startup checks
     info = startup_checks()
 
-    # --- V7 strategy initialization ---
+    # --- Strategy initialization ---
     stat_mr = StatMeanReversion()
     kalman_pairs = KalmanPairsTrader()
     micro_mom = IntradayMicroMomentum()
@@ -720,7 +730,7 @@ def main():
     last_sunday_task = None
     latest_consistency_score = 0.0
 
-    # Feature flags (V6)
+    # Feature flags
     features = ["MR60%", "PAIRS25%", "MICRO15%"]
     if config.ALLOW_SHORT:
         features.append("Short")
@@ -732,12 +742,12 @@ def main():
         features.append("WS")
 
     features_str = ", ".join(features)
-    console.print(f"\n[bold green]Velox V7 is running. Press Ctrl+C to stop.[/bold green]")
+    console.print(f"\n[bold green]Velox V8 is running. Press Ctrl+C to stop.[/bold green]")
     console.print(f"[dim]Strategies: STAT_MR + KALMAN_PAIRS + MICRO_MOM[/dim]")
     console.print(f"[dim]Features: {features_str}[/dim]\n")
 
     # -----------------------------------------------------------------------
-    # V7 FIX: Initialize strategies at startup (don't wait for scheduled times)
+    # Initialize strategies at startup (don't wait for scheduled times)
     # -----------------------------------------------------------------------
     startup_now = now_et()
     if is_market_hours(startup_now.time()) or startup_now.time() >= config.MR_UNIVERSE_PREP_TIME:
@@ -966,6 +976,7 @@ def main():
                                 signals, risk, regime, current,
                                 vol_engine, pnl_lock, ws_monitor,
                                 news_sentiment, llm_scorer,
+                                regime_detector,
                             )
 
                         # 5. Check strategy exits
@@ -1551,7 +1562,7 @@ async def async_main():
     import asyncio as _asyncio
     from supervisor import TaskSupervisor
 
-    console.print("[bold cyan]Starting Velox V6 Trading Bot (ASYNC MODE)...[/bold cyan]\n")
+    console.print("[bold cyan]Starting Velox V8 Trading Bot (ASYNC MODE)...[/bold cyan]\n")
 
     # Initialize database
     database.init_db()
@@ -1560,12 +1571,12 @@ async def async_main():
     # Startup checks
     info = startup_checks()
 
-    # V6 strategy initialization
+    # Strategy initialization
     stat_mr = StatMeanReversion()
     kalman_pairs = KalmanPairsTrader()
     micro_mom = IntradayMicroMomentum()
 
-    # V6 risk engine
+    # Risk engine
     vol_engine = VolatilityTargetingRiskEngine()
     pnl_lock = DailyPnLLock()
     beta_neutral = BetaNeutralizer()
@@ -1611,7 +1622,7 @@ async def async_main():
     start_time = now_et()
     logging.getLogger().removeHandler(_stream_handler)
 
-    console.print(f"\n[bold green]Velox V6 (ASYNC) is running. Press Ctrl+C to stop.[/bold green]\n")
+    console.print(f"\n[bold green]Velox V8 (ASYNC) is running. Press Ctrl+C to stop.[/bold green]\n")
 
     supervisor = TaskSupervisor()
 
@@ -1687,8 +1698,8 @@ async def async_main():
 
 def run_diagnostic():
     """Run one diagnostic scan cycle and print what's blocking trades."""
-    print("\n=== VELOX V6 SIGNAL DIAGNOSTIC MODE ===\n")
-    print("Initializing V6 strategies and filters...\n")
+    print("\n=== VELOX V8 SIGNAL DIAGNOSTIC MODE ===\n")
+    print("Initializing strategies and filters...\n")
 
     from earnings import has_earnings_soon, load_earnings_cache
     from correlation import is_too_correlated, load_correlation_cache
@@ -1824,7 +1835,7 @@ def run_diagnostic():
 if __name__ == "__main__":
     import argparse as _argparse
 
-    _parser = _argparse.ArgumentParser(description="Velox V6 Trading Bot")
+    _parser = _argparse.ArgumentParser(description="Velox V8 Trading Bot")
     _parser.add_argument("--diagnose", action="store_true", help="Run one diagnostic scan cycle (read-only)")
     _args = _parser.parse_args()
 

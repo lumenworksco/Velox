@@ -58,7 +58,11 @@ class TestMarketRegimeUpdate:
         closes = list(range(100, 125))          # 100..124 — EMA ≈ 112, last=124
         df = _make_spy_bars(25, closes)
 
-        with patch("strategies.regime.get_daily_bars", return_value=df):
+        with patch("strategies.regime.get_daily_bars", return_value=df), \
+             patch("strategies.regime.config") as mock_config:
+            mock_config.HMM_REGIME_ENABLED = False
+            mock_config.REGIME_CHECK_INTERVAL_MIN = 30
+            mock_config.REGIME_EMA_PERIOD = 20
             regime = _make_regime()
             result = regime.update(datetime(2026, 3, 15, 10, 0, tzinfo=ET))
 
@@ -72,7 +76,11 @@ class TestMarketRegimeUpdate:
         closes = list(range(124, 99, -1))       # 124..100 — EMA ≈ 112, last=100
         df = _make_spy_bars(25, closes)
 
-        with patch("strategies.regime.get_daily_bars", return_value=df):
+        with patch("strategies.regime.get_daily_bars", return_value=df), \
+             patch("strategies.regime.config") as mock_config:
+            mock_config.HMM_REGIME_ENABLED = False
+            mock_config.REGIME_CHECK_INTERVAL_MIN = 30
+            mock_config.REGIME_EMA_PERIOD = 20
             regime = _make_regime()
             result = regime.update(datetime(2026, 3, 15, 10, 0, tzinfo=ET))
 
@@ -98,7 +106,11 @@ class TestMarketRegimeUpdate:
         df = _make_spy_bars(25, closes)
         now = datetime(2026, 3, 15, 10, 0, tzinfo=ET)
 
-        with patch("strategies.regime.get_daily_bars", return_value=df) as mock_fetch:
+        with patch("strategies.regime.get_daily_bars", return_value=df) as mock_fetch, \
+             patch("strategies.regime.config") as mock_config:
+            mock_config.HMM_REGIME_ENABLED = False
+            mock_config.REGIME_CHECK_INTERVAL_MIN = 30
+            mock_config.REGIME_EMA_PERIOD = 20
             regime = _make_regime()
             regime.update(now)
             # Call again 1 minute later — should use cache, no second fetch
@@ -113,7 +125,11 @@ class TestMarketRegimeUpdate:
         df = _make_spy_bars(25, closes)
         now = datetime(2026, 3, 15, 10, 0, tzinfo=ET)
 
-        with patch("strategies.regime.get_daily_bars", return_value=df) as mock_fetch:
+        with patch("strategies.regime.get_daily_bars", return_value=df) as mock_fetch, \
+             patch("strategies.regime.config") as mock_config:
+            mock_config.HMM_REGIME_ENABLED = False
+            mock_config.REGIME_CHECK_INTERVAL_MIN = 30
+            mock_config.REGIME_EMA_PERIOD = 20
             regime = _make_regime()
             regime.update(now)
             # Call again well after the interval
@@ -155,14 +171,22 @@ class TestMarketRegimeUpdate:
         now = datetime(2026, 3, 15, 10, 0, tzinfo=ET)
 
         # First successful update → BULLISH
-        with patch("strategies.regime.get_daily_bars", return_value=df):
+        with patch("strategies.regime.get_daily_bars", return_value=df), \
+             patch("strategies.regime.config") as mock_config:
+            mock_config.HMM_REGIME_ENABLED = False
+            mock_config.REGIME_CHECK_INTERVAL_MIN = 30
+            mock_config.REGIME_EMA_PERIOD = 20
             regime = _make_regime()
             regime.update(now)
 
         assert regime.regime == "BULLISH"
 
         # Second update fails — should retain BULLISH (not flip to UNKNOWN)
-        with patch("strategies.regime.get_daily_bars", side_effect=RuntimeError("timeout")):
+        with patch("strategies.regime.get_daily_bars", side_effect=RuntimeError("timeout")), \
+             patch("strategies.regime.config") as mock_config:
+            mock_config.HMM_REGIME_ENABLED = False
+            mock_config.REGIME_CHECK_INTERVAL_MIN = 30
+            mock_config.REGIME_EMA_PERIOD = 20
             regime.last_check = None   # Force cache expiry
             result = regime.update(now + timedelta(hours=1))
 
