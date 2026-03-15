@@ -209,6 +209,39 @@ def init_db():
             computed_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_kelly_strategy ON kelly_params(strategy);
+
+        -- V8: Monte Carlo tail risk results
+        CREATE TABLE IF NOT EXISTS monte_carlo_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            var_95 REAL,
+            var_99 REAL,
+            cvar_95 REAL,
+            cvar_99 REAL,
+            horizon_days INTEGER,
+            simulations INTEGER,
+            computed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_date ON monte_carlo_results(date);
+
+        -- V8: Execution analytics
+        CREATE TABLE IF NOT EXISTS execution_analytics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id TEXT,
+            symbol TEXT,
+            strategy TEXT,
+            side TEXT,
+            expected_price REAL,
+            filled_price REAL,
+            slippage_pct REAL,
+            submitted_at TEXT,
+            filled_at TEXT,
+            latency_ms INTEGER,
+            qty_requested INTEGER,
+            qty_filled INTEGER,
+            fill_rate REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_exec_strategy ON execution_analytics(strategy);
     """)
     conn.commit()
 
@@ -871,3 +904,66 @@ def save_kelly_params(strategy: str, win_rate: float, avg_win_loss: float,
          datetime.now(config.ET).isoformat()),
     )
     conn.commit()
+
+
+# =============================================================================
+# V8: Monte Carlo Tail Risk
+# =============================================================================
+
+def save_monte_carlo_result(date: str, var_95: float, var_99: float,
+                            cvar_95: float, cvar_99: float,
+                            horizon_days: int, simulations: int):
+    """Save Monte Carlo risk analysis results."""
+    conn = _get_conn()
+    conn.execute(
+        """INSERT INTO monte_carlo_results
+           (date, var_95, var_99, cvar_95, cvar_99, horizon_days, simulations, computed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (date, var_95, var_99, cvar_95, cvar_99, horizon_days, simulations,
+         datetime.now(config.ET).isoformat()),
+    )
+    conn.commit()
+
+
+# =============================================================================
+# V8: Execution Analytics
+# =============================================================================
+
+def save_execution_analytics(order_id: str, symbol: str, strategy: str, side: str,
+                             expected_price: float, filled_price: float,
+                             slippage_pct: float, submitted_at, filled_at,
+                             latency_ms: int, qty_requested: int,
+                             qty_filled: int, fill_rate: float):
+    """Save execution analytics record."""
+    conn = _get_conn()
+    conn.execute(
+        """INSERT INTO execution_analytics
+           (order_id, symbol, strategy, side, expected_price, filled_price,
+            slippage_pct, submitted_at, filled_at, latency_ms,
+            qty_requested, qty_filled, fill_rate)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (order_id, symbol, strategy, side, expected_price, filled_price,
+         slippage_pct,
+         submitted_at.isoformat() if hasattr(submitted_at, 'isoformat') else str(submitted_at),
+         filled_at.isoformat() if hasattr(filled_at, 'isoformat') else str(filled_at),
+         latency_ms, qty_requested, qty_filled, fill_rate),
+    )
+    conn.commit()
+
+
+def get_execution_analytics(strategy: str | None = None, days: int = 30) -> list[dict]:
+    """Get execution analytics records."""
+    conn = _get_conn()
+    if strategy:
+        rows = conn.execute(
+            """SELECT * FROM execution_analytics WHERE strategy = ?
+               AND submitted_at >= datetime('now', ?) ORDER BY submitted_at DESC""",
+            (strategy, f"-{days} days"),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT * FROM execution_analytics
+               WHERE submitted_at >= datetime('now', ?) ORDER BY submitted_at DESC""",
+            (f"-{days} days",),
+        ).fetchall()
+    return [dict(r) for r in rows]

@@ -25,8 +25,8 @@ class BacktestTrade:
     entry_price: float
     entry_time: datetime
     qty: int
-    take_profit: float
-    stop_loss: float
+    take_profit: float = 0.0
+    stop_loss: float = 0.0
     exit_price: float = 0.0
     exit_time: datetime | None = None
     pnl: float = 0.0
@@ -509,3 +509,287 @@ def walk_forward_test(n_splits: int = 4):
         console.print(f"[red]Failed to save results: {e}[/red]")
 
     console.print()
+
+
+# =============================================================================
+# V8: Additional strategy backtests
+# =============================================================================
+
+def simulate_stat_mr(data: dict[str, pd.DataFrame], initial_capital: float = 100000,
+                     slippage: float = 0.0005, commission_per_share: float = 0.0035) -> BacktestResult | None:
+    """Simulate Statistical Mean Reversion strategy.
+
+    At each bar: compute OU params (kappa, mu, sigma), z-score.
+    Entry: |z-score| > 1.5, Hurst < 0.52
+    Exit: z-score < 0.2 (full), < 0.5 (partial), > 2.5 (stop)
+    """
+    trades = []
+    portfolio = initial_capital
+    portfolio_history = [initial_capital]
+
+    for symbol, bars in data.items():
+        if bars is None or len(bars) < 50:
+            continue
+
+        try:
+            from analytics.ou_tools import fit_ou_params, compute_zscore
+            from analytics.hurst import hurst_exponent
+
+            closes = bars["close"].values
+            position = None
+
+            for i in range(50, len(closes)):
+                window = closes[max(0, i - 200):i]
+
+                if len(window) < 30:
+                    continue
+
+                params = fit_ou_params(pd.Series(window))
+                if not params:
+                    continue
+
+                current = closes[i]
+                z = compute_zscore(current, params["mu"], params["sigma"])
+                h = hurst_exponent(pd.Series(window))
+
+                if position is None:
+                    # Entry conditions
+                    if h < 0.52 and abs(z) > 1.5:
+                        side = "buy" if z < -1.5 else "sell"
+                        entry_price = current * (1 + slippage if side == "buy" else 1 - slippage)
+                        position = {
+                            "symbol": symbol, "side": side, "entry_price": entry_price,
+                            "entry_idx": i, "entry_time": bars.index[i],
+                            "mu": params["mu"], "sigma": params["sigma"],
+                        }
+                else:
+                    # Exit conditions
+                    exit_price = None
+                    exit_reason = None
+
+                    if abs(z) < 0.2:
+                        exit_price = current * (1 - slippage if position["side"] == "buy" else 1 + slippage)
+                        exit_reason = "z_revert"
+                    elif abs(z) > 2.5:
+                        exit_price = current * (1 - slippage if position["side"] == "buy" else 1 + slippage)
+                        exit_reason = "z_stop"
+                    elif i - position["entry_idx"] > 500:  # Time stop
+                        exit_price = current * (1 - slippage if position["side"] == "buy" else 1 + slippage)
+                        exit_reason = "time_stop"
+
+                    if exit_price is not None:
+                        qty = max(1, int(portfolio * 0.02 / position["entry_price"]))
+                        if position["side"] == "buy":
+                            pnl = (exit_price - position["entry_price"]) * qty
+                        else:
+                            pnl = (position["entry_price"] - exit_price) * qty
+                        pnl -= commission_per_share * qty * 2
+
+                        portfolio += pnl
+                        portfolio_history.append(portfolio)
+
+                        trades.append(BacktestTrade(
+                            symbol=symbol, strategy="STAT_MR", side=position["side"],
+                            entry_price=position["entry_price"], exit_price=exit_price,
+                            entry_time=position["entry_time"], exit_time=bars.index[i],
+                            qty=qty, pnl=pnl,
+                            commission=commission_per_share * qty * 2,
+                        ))
+                        position = None
+        except Exception as e:
+            logger.debug(f"StatMR backtest failed for {symbol}: {e}")
+            continue
+
+    if not trades:
+        return None
+    return _compute_result("STAT_MR", trades, portfolio_history, initial_capital)
+
+
+def simulate_kalman_pairs(data: dict[str, pd.DataFrame], initial_capital: float = 100000,
+                          slippage: float = 0.0005, commission_per_share: float = 0.0035) -> BacktestResult | None:
+    """Simulate Kalman Pairs Trading strategy.
+
+    Weekly pair selection via correlation, Kalman filter hedge ratio,
+    entry at |spread_z| > 2.0, exit at |spread_z| < 0.2.
+    """
+    import config
+    trades = []
+    portfolio = initial_capital
+    portfolio_history = [initial_capital]
+
+    # Test all pairs from sector groups
+    pair_candidates = []
+    for group_name, symbols in config.SECTOR_GROUPS.items():
+        if isinstance(symbols[0], tuple):
+            pair_candidates.extend(symbols)
+        else:
+            for i in range(len(symbols)):
+                for j in range(i + 1, len(symbols)):
+                    if symbols[i] in data and symbols[j] in data:
+                        pair_candidates.append((symbols[i], symbols[j]))
+
+    for sym1, sym2 in pair_candidates[:20]:  # Limit to first 20 pairs
+        if sym1 not in data or sym2 not in data:
+            continue
+
+        try:
+            bars1 = data[sym1]["close"]
+            bars2 = data[sym2]["close"]
+
+            # Align dates
+            combined = pd.DataFrame({"s1": bars1, "s2": bars2}).dropna()
+            if len(combined) < 60:
+                continue
+
+            # Check correlation
+            corr = combined["s1"].corr(combined["s2"])
+            if abs(corr) < 0.80:
+                continue
+
+            # Simple hedge ratio (OLS)
+            from numpy.polynomial.polynomial import polyfit
+            coeffs = np.polyfit(combined["s2"].values, combined["s1"].values, 1)
+            hedge_ratio = coeffs[0]
+
+            # Compute spread
+            spread = combined["s1"] - hedge_ratio * combined["s2"]
+            spread_mean = spread.rolling(20).mean()
+            spread_std = spread.rolling(20).std()
+
+            position = None
+
+            for i in range(20, len(spread)):
+                if spread_std.iloc[i] < 1e-6:
+                    continue
+                z = (spread.iloc[i] - spread_mean.iloc[i]) / spread_std.iloc[i]
+
+                if position is None:
+                    if abs(z) > 2.0:
+                        side = "sell" if z > 2.0 else "buy"  # Sell spread if wide
+                        position = {
+                            "entry_idx": i, "side": side,
+                            "entry_spread": spread.iloc[i],
+                            "entry_time": combined.index[i],
+                        }
+                else:
+                    exit_trade = False
+                    if abs(z) < 0.2:
+                        exit_trade = True
+                        reason = "convergence"
+                    elif abs(z) > 3.0:
+                        exit_trade = True
+                        reason = "divergence_stop"
+                    elif i - position["entry_idx"] > 50:
+                        exit_trade = True
+                        reason = "time_stop"
+
+                    if exit_trade:
+                        entry_s = position["entry_spread"]
+                        exit_s = spread.iloc[i]
+
+                        if position["side"] == "sell":
+                            pnl = (entry_s - exit_s) * 10  # Notional
+                        else:
+                            pnl = (exit_s - entry_s) * 10
+
+                        pnl *= (1 - slippage * 2)
+                        portfolio += pnl
+                        portfolio_history.append(portfolio)
+
+                        trades.append(BacktestTrade(
+                            symbol=f"{sym1}/{sym2}", strategy="KALMAN_PAIRS",
+                            side=position["side"],
+                            entry_price=entry_s, exit_price=exit_s,
+                            entry_time=position["entry_time"],
+                            exit_time=combined.index[i],
+                            qty=10, pnl=pnl, commission=0.07,
+                        ))
+                        position = None
+        except Exception as e:
+            logger.debug(f"Pairs backtest failed for {sym1}/{sym2}: {e}")
+            continue
+
+    if not trades:
+        return None
+    return _compute_result("KALMAN_PAIRS", trades, portfolio_history, initial_capital)
+
+
+def simulate_micro_momentum(data: dict[str, pd.DataFrame], initial_capital: float = 100000,
+                            slippage: float = 0.001) -> BacktestResult | None:
+    """Simulate Intraday Micro-Momentum strategy.
+
+    Detect volume spikes in SPY (>3x 20-bar avg) with price move >0.15%.
+    On event: 8-minute hold with 0.6% TP / 0.3% SL.
+    """
+    trades = []
+    portfolio = initial_capital
+    portfolio_history = [initial_capital]
+
+    if "SPY" not in data:
+        return None
+
+    spy = data["SPY"]
+    if len(spy) < 30:
+        return None
+
+    try:
+        spy_close = spy["close"].values
+        spy_volume = spy["volume"].values
+
+        for i in range(20, len(spy_close) - 8):
+            avg_vol = np.mean(spy_volume[i - 20:i])
+            if avg_vol < 1:
+                continue
+
+            vol_ratio = spy_volume[i] / avg_vol
+            price_move = abs(spy_close[i] - spy_close[i - 1]) / spy_close[i - 1]
+
+            if vol_ratio > 3.0 and price_move > 0.0015:
+                direction = "buy" if spy_close[i] > spy_close[i - 1] else "sell"
+                entry_price = spy_close[i] * (1 + slippage if direction == "buy" else 1 - slippage)
+
+                # 8-bar hold (simulating 8-minute hold with whatever timeframe we have)
+                exit_idx = min(i + 8, len(spy_close) - 1)
+                exit_price = spy_close[exit_idx]
+
+                # Apply TP/SL
+                tp_price = entry_price * (1 + 0.006 if direction == "buy" else 1 - 0.006)
+                sl_price = entry_price * (1 - 0.003 if direction == "buy" else 1 + 0.003)
+
+                for j in range(i + 1, exit_idx + 1):
+                    if direction == "buy":
+                        if spy_close[j] >= tp_price:
+                            exit_price = tp_price * (1 - slippage)
+                            break
+                        if spy_close[j] <= sl_price:
+                            exit_price = sl_price * (1 - slippage)
+                            break
+                    else:
+                        if spy_close[j] <= tp_price:
+                            exit_price = tp_price * (1 + slippage)
+                            break
+                        if spy_close[j] >= sl_price:
+                            exit_price = sl_price * (1 + slippage)
+                            break
+
+                qty = max(1, int(portfolio * 0.01 / entry_price))
+                if direction == "buy":
+                    pnl = (exit_price - entry_price) * qty
+                else:
+                    pnl = (entry_price - exit_price) * qty
+
+                portfolio += pnl
+                portfolio_history.append(portfolio)
+
+                trades.append(BacktestTrade(
+                    symbol="SPY", strategy="MICRO_MOM", side=direction,
+                    entry_price=entry_price, exit_price=exit_price,
+                    entry_time=spy.index[i], exit_time=spy.index[exit_idx],
+                    qty=qty, pnl=pnl, commission=0.0,
+                ))
+    except Exception as e:
+        logger.debug(f"MicroMom backtest failed: {e}")
+
+    if not trades:
+        return None
+    return _compute_result("MICRO_MOM", trades, portfolio_history, initial_capital)

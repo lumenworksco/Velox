@@ -395,6 +395,23 @@ MTF_CONFLUENCE_ENABLED = True
 MTF_MIN_CONFLUENCE_BREAKOUT = 0.66   # ORB, MICRO_MOM need trend alignment
 MTF_MAX_CONFLUENCE_MEANREV = 0.33    # STAT_MR, VWAP want dislocation
 
+# --- V8: Monte Carlo Tail Risk ---
+MONTE_CARLO_ENABLED = True
+MONTE_CARLO_SIMULATIONS = 10000
+MONTE_CARLO_HORIZON_DAYS = 21
+MONTE_CARLO_CVAR_LIMIT = -0.08  # De-risk if cvar_99 exceeds -8%
+MONTE_CARLO_DELEVERAGE_PCT = 0.20  # Reduce VOL_TARGET by 20%
+
+# --- V8: Data Quality Checks ---
+DATA_QUALITY_ENABLED = True
+DATA_QUALITY_MAX_STALENESS_SEC = 300
+DATA_QUALITY_MAX_SINGLE_MOVE = 0.15
+DATA_QUALITY_MIN_BARS = 50
+
+# --- V8: Execution Analytics ---
+EXECUTION_ANALYTICS_ENABLED = True
+EXECUTION_SLIPPAGE_ALERT_PCT = 0.001  # Alert if avg slippage > 0.1%
+
 # --- Runtime-mutable strategy parameters (can be updated by optimizer) ---
 _runtime_params: dict = {}
 
