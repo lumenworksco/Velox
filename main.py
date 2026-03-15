@@ -1043,6 +1043,7 @@ def main():
                             logger.error(f"Parameter optimization failed: {e}")
 
                     # Walk-forward validation (weekly)
+                    if walk_forward:
                         try:
                             logger.info("Sunday: running walk-forward validation...")
                             wf_results = walk_forward.run_weekly_validation()
