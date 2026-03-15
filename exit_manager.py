@@ -83,9 +83,16 @@ class ExitManager:
             if action:
                 return action
 
-        # --- 2. TRAILING STOP (swing positions only) ---
+        # --- 2. TRAILING STOP ---
+        # Legacy: fixed trailing for swing strategies
         if trade.strategy in ("MOMENTUM", "SECTOR_ROTATION", "PAIRS"):
             action = self._check_trailing_stop(trade, current_price, risk_manager, now)
+            if action:
+                return action
+
+        # V8: ATR-based trailing for all strategies
+        if config.ATR_TRAILING_ENABLED and trade.entry_atr > 0:
+            action = self._check_atr_trailing_stop(trade, current_price, risk_manager, now)
             if action:
                 return action
 
@@ -172,6 +179,55 @@ class ExitManager:
                 if current_price >= trade.stop_loss:
                     risk_manager.close_trade(trade.symbol, current_price, now, "trailing_stop")
                     return {"symbol": trade.symbol, "action": "trailing_stop", "qty": trade.qty}
+
+        return None
+
+    def _check_atr_trailing_stop(self, trade, current_price: float, risk_manager, now: datetime) -> dict | None:
+        """V8: ATR-based trailing stop for all strategies.
+
+        - Trailing stop = highest_price - (entry_atr x ATR_TRAIL_MULT) for longs
+        - Trailing stop = lowest_price + (entry_atr x ATR_TRAIL_MULT) for shorts
+        - Only activates after position is in profit by 0.5x ATR
+        - Trail only ratchets in profitable direction (never widens)
+        """
+        atr_mult = config.ATR_TRAIL_MULT.get(trade.strategy)
+        if atr_mult is None:
+            return None
+
+        trail_distance = trade.entry_atr * atr_mult
+        activation_distance = trade.entry_atr * config.ATR_TRAIL_ACTIVATION
+
+        if trade.side == "buy":
+            # Check activation: must be in profit by at least 0.5x ATR
+            if current_price < trade.entry_price + activation_distance:
+                return None
+
+            # Compute trailing stop from highest price
+            atr_trail_stop = trade.highest_price_seen - trail_distance
+
+            # Only ratchet up, never down — and must be better than current SL
+            if atr_trail_stop > trade.stop_loss:
+                trade.stop_loss = atr_trail_stop
+
+            if current_price <= trade.stop_loss:
+                risk_manager.close_trade(trade.symbol, current_price, now, "atr_trailing_stop")
+                return {"symbol": trade.symbol, "action": "atr_trailing_stop", "qty": trade.qty}
+
+        elif trade.side == "sell":
+            # Check activation: must be in profit by at least 0.5x ATR
+            if current_price > trade.entry_price - activation_distance:
+                return None
+
+            # For shorts, highest_price_seen tracks the LOWEST price
+            atr_trail_stop = trade.highest_price_seen + trail_distance
+
+            # Only ratchet down (for shorts), must be better (lower) than current SL
+            if atr_trail_stop < trade.stop_loss:
+                trade.stop_loss = atr_trail_stop
+
+            if current_price >= trade.stop_loss:
+                risk_manager.close_trade(trade.symbol, current_price, now, "atr_trailing_stop")
+                return {"symbol": trade.symbol, "action": "atr_trailing_stop", "qty": trade.qty}
 
         return None
 

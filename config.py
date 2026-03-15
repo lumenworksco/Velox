@@ -335,6 +335,33 @@ ADAPTIVE_EXITS_ENABLED = True
 CORRELATION_THRESHOLD  = 0.92     # Raised from 0.88 — less blocking
 RS_SCORE_MIN_LONG      = 0.10     # Lowered from 0.2 — more signals
 
+# =============================================================================
+# V8 ADDITIONS — Profit Optimization Upgrade
+# =============================================================================
+
+# --- V8: Kelly Criterion Position Sizing ---
+KELLY_ENABLED = True
+KELLY_MIN_TRADES = 30
+KELLY_LOOKBACK = 100
+KELLY_FRACTION_MULT = 0.5  # half-Kelly
+KELLY_MIN_RISK = 0.003
+KELLY_MAX_RISK = 0.02
+
+# --- V8: ATR Trailing Stops ---
+ATR_TRAILING_ENABLED = True
+ATR_TRAIL_MULT = {
+    "STAT_MR": 1.5,       # Tighter — mean reversion targets are smaller
+    "VWAP": 1.5,           # Tighter — intraday mean reversion
+    "KALMAN_PAIRS": 2.0,   # Wider — pairs need room for spread noise
+    "ORB": 2.5,            # Wider — breakouts need room to run
+    "MICRO_MOM": 1.0,      # Tight — 8-min holds, quick exits
+}
+ATR_TRAIL_ACTIVATION = 0.5  # Activate after 0.5x ATR in profit
+
+# --- V8: Data Caching ---
+DATA_CACHE_ENABLED = True
+DATA_CACHE_MAX_SIZE = 500
+
 # --- Runtime-mutable strategy parameters (can be updated by optimizer) ---
 _runtime_params: dict = {}
 

@@ -196,6 +196,19 @@ def init_db():
             vol_scalar_avg REAL,
             beta_avg REAL
         );
+
+        -- V8: Kelly criterion parameters
+        CREATE TABLE IF NOT EXISTS kelly_params (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy TEXT NOT NULL,
+            win_rate REAL,
+            avg_win_loss REAL,
+            kelly_f REAL,
+            half_kelly_f REAL,
+            sample_size INTEGER,
+            computed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_kelly_strategy ON kelly_params(strategy);
     """)
     conn.commit()
 
@@ -840,3 +853,21 @@ def get_signals_by_strategy(strategy: str, days: int = 7) -> list[dict]:
         (strategy, cutoff),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# =============================================================================
+# V8: Kelly Criterion Parameters
+# =============================================================================
+
+def save_kelly_params(strategy: str, win_rate: float, avg_win_loss: float,
+                      kelly_f: float, half_kelly_f: float, sample_size: int):
+    """Save Kelly criterion parameters for a strategy."""
+    conn = _get_conn()
+    conn.execute(
+        """INSERT INTO kelly_params
+           (strategy, win_rate, avg_win_loss, kelly_f, half_kelly_f, sample_size, computed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (strategy, win_rate, avg_win_loss, kelly_f, half_kelly_f, sample_size,
+         datetime.now(config.ET).isoformat()),
+    )
+    conn.commit()

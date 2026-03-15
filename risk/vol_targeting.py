@@ -25,6 +25,11 @@ class VolatilityTargetingRiskEngine:
         self.target_vol = config.VOL_TARGET_DAILY
         self.max_vol = config.VOL_TARGET_MAX
         self._last_scalar = 1.0
+        self._kelly_engine = None
+
+    def set_kelly_engine(self, kelly_engine):
+        """Set the Kelly engine for dynamic risk sizing."""
+        self._kelly_engine = kelly_engine
 
     def compute_vol_scalar(
         self,
@@ -94,8 +99,12 @@ class VolatilityTargetingRiskEngine:
         if equity <= 0 or entry_price <= 0:
             return 0
 
-        # 1. Base risk per trade
-        risk_dollars = equity * config.RISK_PER_TRADE_PCT
+        # 1. Base risk per trade (Kelly or flat)
+        if self._kelly_engine is not None:
+            risk_pct = self._kelly_engine.get_fraction(strategy)
+        else:
+            risk_pct = config.RISK_PER_TRADE_PCT
+        risk_dollars = equity * risk_pct
 
         # 2. Risk per share (distance to stop)
         risk_per_share = abs(entry_price - stop_price)

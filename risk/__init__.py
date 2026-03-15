@@ -5,6 +5,9 @@ from risk.vol_targeting import VolatilityTargetingRiskEngine
 from risk.daily_pnl_lock import DailyPnLLock, LockState
 from risk.beta_neutralizer import BetaNeutralizer
 
+# V8 risk modules
+from risk.kelly import KellyEngine
+
 # Backward compatibility: re-export RiskManager, TradeRecord, VIX functions
 from risk.risk_manager import (
     RiskManager,
@@ -19,6 +22,8 @@ __all__ = [
     "DailyPnLLock",
     "LockState",
     "BetaNeutralizer",
+    # V8
+    "KellyEngine",
     # V1-V5 backward compat
     "RiskManager",
     "TradeRecord",
