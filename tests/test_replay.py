@@ -6,11 +6,21 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 ET = ZoneInfo("America/New_York")
+
+
+def _make_bars_df(rows: list[dict]) -> pd.DataFrame:
+    """Build a DataFrame mimicking Alpaca minute bars."""
+    df = pd.DataFrame(rows)
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df.set_index("timestamp", inplace=True)
+    return df
 
 
 # ============================================================
@@ -100,20 +110,26 @@ class TestMarketReplay:
     def test_replay_day_with_mock_bars(self):
         """Replay with mocked bar data generates signals and trades."""
         replay = self._make_replay()
-        mock_bars = {
-            "AAPL": [{
-                "time": "2026-03-10T10:00:00-04:00",
-                "open": 150.0,
-                "high": 152.0,
-                "low": 149.0,
-                "close": 151.0,
-                "volume": 500000,
-            }]
-        }
+        # Build proper minute-bar DataFrames spanning the ORB window and beyond
+        rows = []
+        base = datetime(2026, 3, 10, 9, 30, tzinfo=ET)
+        price = 150.0
+        for i in range(390):  # 6.5 hours of 1-min bars
+            t = base + pd.Timedelta(minutes=i)
+            # Create a slow uptrend for ORB breakout
+            p = price + i * 0.01
+            rows.append({
+                "timestamp": t,
+                "open": p - 0.05,
+                "high": p + 0.10,
+                "low": p - 0.10,
+                "close": p,
+                "volume": 50000.0,
+            })
+        mock_bars = {"AAPL": _make_bars_df(rows)}
         with patch.object(replay, "_load_bars", return_value=mock_bars):
             result = replay.replay_day("2026-03-10")
         assert result.date == "2026-03-10"
-        # Should have generated at least one signal from the bar data
         assert isinstance(result.signals, list)
         assert isinstance(result.trades, list)
 
@@ -146,15 +162,13 @@ class TestMarketReplay:
     def test_replay_fail_open_on_signal_error(self):
         """Signal generation errors don't crash the replay."""
         replay = self._make_replay()
-        mock_bars = {
-            "AAPL": [{
-                "time": "2026-03-10T10:00:00-04:00",
-                "close": 150.0,
-            }]
-        }
+        # Provide valid DataFrame bars so the scan loop runs
+        rows = [{"timestamp": datetime(2026, 3, 10, 10, 0, tzinfo=ET),
+                 "open": 150.0, "high": 152.0, "low": 149.0,
+                 "close": 151.0, "volume": 500000.0}]
+        mock_bars = {"AAPL": _make_bars_df(rows)}
         with patch.object(replay, "_load_bars", return_value=mock_bars), \
              patch.object(replay, "_generate_signals", side_effect=Exception("boom")):
-            # Should not raise
             result = replay.replay_day("2026-03-10")
         assert result.date == "2026-03-10"
 
@@ -191,7 +205,6 @@ class TestMarketReplay:
         with patch.object(replay, "replay_day", side_effect=Exception("crash")):
             comparison = replay.compare_configs("2026-03-10", {}, {})
         assert comparison.date == "2026-03-10"
-        # deltas should be 0
         assert comparison.delta_pnl == 0.0
 
 
@@ -262,10 +275,8 @@ class TestReplayHelpers:
         replay = self._make_replay()
         times = replay._generate_scan_times("2026-03-10")
         assert len(times) > 0
-        # First should be 9:30
         assert times[0].hour == 9
         assert times[0].minute == 30
-        # Last should be <= 16:00
         assert times[-1].hour <= 16
 
     def test_generate_scan_times_invalid_date(self):
@@ -308,6 +319,7 @@ class TestReplayHelpers:
         assert "exit_time" in d
 
     def test_check_exits_take_profit_buy(self):
+        """TP hit when bar high >= take_profit."""
         from replay import MarketReplay, _SimTrade
         replay = MarketReplay()
         trade = _SimTrade(
@@ -316,7 +328,11 @@ class TestReplayHelpers:
             entry_time=datetime(2026, 3, 10, 10, 0, tzinfo=ET),
         )
         open_trades = {"AAPL": trade}
-        bars = {"AAPL": [{"time": "2026-03-10T10:30:00-04:00", "close": 106.0}]}
+        bars = {"AAPL": _make_bars_df([{
+            "timestamp": datetime(2026, 3, 10, 10, 30, tzinfo=ET),
+            "open": 104.0, "high": 106.0, "low": 103.0,
+            "close": 105.5, "volume": 100000.0,
+        }])}
         sim_time = datetime(2026, 3, 10, 10, 30, tzinfo=ET)
 
         closed = replay._check_exits(sim_time, open_trades, bars)
@@ -324,6 +340,7 @@ class TestReplayHelpers:
         assert closed[0].exit_reason == "take_profit"
 
     def test_check_exits_stop_loss_buy(self):
+        """SL hit when bar low <= stop_loss."""
         from replay import MarketReplay, _SimTrade
         replay = MarketReplay()
         trade = _SimTrade(
@@ -332,7 +349,11 @@ class TestReplayHelpers:
             entry_time=datetime(2026, 3, 10, 10, 0, tzinfo=ET),
         )
         open_trades = {"AAPL": trade}
-        bars = {"AAPL": [{"time": "2026-03-10T10:30:00-04:00", "close": 94.0}]}
+        bars = {"AAPL": _make_bars_df([{
+            "timestamp": datetime(2026, 3, 10, 10, 30, tzinfo=ET),
+            "open": 96.0, "high": 97.0, "low": 94.0,
+            "close": 94.5, "volume": 100000.0,
+        }])}
         sim_time = datetime(2026, 3, 10, 10, 30, tzinfo=ET)
 
         closed = replay._check_exits(sim_time, open_trades, bars)
@@ -340,6 +361,7 @@ class TestReplayHelpers:
         assert closed[0].exit_reason == "stop_loss"
 
     def test_check_exits_no_trigger(self):
+        """No exit when price stays between SL and TP."""
         from replay import MarketReplay, _SimTrade
         replay = MarketReplay()
         trade = _SimTrade(
@@ -348,8 +370,88 @@ class TestReplayHelpers:
             entry_time=datetime(2026, 3, 10, 10, 0, tzinfo=ET),
         )
         open_trades = {"AAPL": trade}
-        bars = {"AAPL": [{"time": "2026-03-10T10:30:00-04:00", "close": 101.0}]}
+        bars = {"AAPL": _make_bars_df([{
+            "timestamp": datetime(2026, 3, 10, 10, 30, tzinfo=ET),
+            "open": 100.5, "high": 102.0, "low": 99.0,
+            "close": 101.0, "volume": 100000.0,
+        }])}
         sim_time = datetime(2026, 3, 10, 10, 30, tzinfo=ET)
 
         closed = replay._check_exits(sim_time, open_trades, bars)
         assert len(closed) == 0
+
+    def test_compute_vwap(self):
+        """VWAP computation returns (vwap, upper, lower)."""
+        from replay import MarketReplay
+        df = _make_bars_df([
+            {"timestamp": datetime(2026, 3, 10, 10, 0, tzinfo=ET),
+             "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 10000.0},
+            {"timestamp": datetime(2026, 3, 10, 10, 1, tzinfo=ET),
+             "open": 100.5, "high": 102.0, "low": 100.0, "close": 101.0, "volume": 15000.0},
+            {"timestamp": datetime(2026, 3, 10, 10, 2, tzinfo=ET),
+             "open": 101.0, "high": 101.5, "low": 99.5, "close": 100.0, "volume": 12000.0},
+        ])
+        result = MarketReplay._compute_vwap(df)
+        assert result is not None
+        vwap, upper, lower = result
+        assert lower < vwap < upper
+        assert vwap > 0
+
+    def test_compute_vwap_empty(self):
+        from replay import MarketReplay
+        assert MarketReplay._compute_vwap(pd.DataFrame()) is None
+
+    def test_get_bar_at_time(self):
+        """Returns (high, low, close) for nearest bar."""
+        from replay import MarketReplay
+        replay = MarketReplay()
+        bars = {"AAPL": _make_bars_df([
+            {"timestamp": datetime(2026, 3, 10, 10, 0, tzinfo=ET),
+             "open": 100.0, "high": 102.0, "low": 99.0, "close": 101.0, "volume": 50000.0},
+        ])}
+        result = replay._get_bar_at_time(
+            "AAPL", datetime(2026, 3, 10, 10, 0, tzinfo=ET), bars
+        )
+        assert result is not None
+        high, low, close = result
+        assert high == 102.0
+        assert low == 99.0
+        assert close == 101.0
+
+    def test_get_bar_at_time_no_symbol(self):
+        from replay import MarketReplay
+        replay = MarketReplay()
+        assert replay._get_bar_at_time("AAPL", datetime(2026, 3, 10, 10, 0, tzinfo=ET), {}) is None
+
+    def test_bars_up_to(self):
+        """Filters bars to only those before sim_time."""
+        from replay import MarketReplay
+        replay = MarketReplay()
+        df = _make_bars_df([
+            {"timestamp": datetime(2026, 3, 10, 10, 0, tzinfo=ET),
+             "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 10000.0},
+            {"timestamp": datetime(2026, 3, 10, 11, 0, tzinfo=ET),
+             "open": 101.0, "high": 102.0, "low": 100.0, "close": 101.5, "volume": 15000.0},
+            {"timestamp": datetime(2026, 3, 10, 12, 0, tzinfo=ET),
+             "open": 102.0, "high": 103.0, "low": 101.0, "close": 102.5, "volume": 12000.0},
+        ])
+        result = replay._bars_up_to(df, datetime(2026, 3, 10, 11, 0, tzinfo=ET))
+        assert len(result) <= 2  # 10:00 and 11:00, not 12:00
+
+    def test_orb_ranges(self):
+        """ORB range computed from 9:30-10:00 bars."""
+        from replay import MarketReplay
+        replay = MarketReplay()
+        rows = []
+        for i in range(30):  # 9:30 - 9:59
+            rows.append({
+                "timestamp": datetime(2026, 3, 10, 9, 30 + i, tzinfo=ET),
+                "open": 100.0, "high": 102.0 + i * 0.01,
+                "low": 98.0 - i * 0.01, "close": 100.0 + i * 0.01,
+                "volume": 50000.0,
+            })
+        bars = {"AAPL": _make_bars_df(rows)}
+        orb = replay._compute_orb_ranges(bars)
+        assert "AAPL" in orb
+        assert orb["AAPL"]["high"] > orb["AAPL"]["low"]
+        assert orb["AAPL"]["volume"] > 0
