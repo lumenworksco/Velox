@@ -140,6 +140,12 @@ class VWAPStrategy:
                     else:
                         target = vwap_target
 
+                    # Skip if risk/reward is worse than 1:1
+                    reward = abs(target - entry)
+                    risk = abs(entry - stop_loss)
+                    if risk > 0 and reward / risk < getattr(config, 'MR_MIN_RR_RATIO', 1.0):
+                        continue
+
                     signals.append(Signal(
                         symbol=symbol,
                         strategy="VWAP",
@@ -184,6 +190,12 @@ class VWAPStrategy:
                         target = max(vwap_target, ou_target)
                     else:
                         target = vwap_target
+
+                    # Skip if risk/reward is worse than 1:1
+                    reward = abs(entry - target)
+                    risk = abs(stop_loss - entry)
+                    if risk > 0 and reward / risk < getattr(config, 'MR_MIN_RR_RATIO', 1.0):
+                        continue
 
                     signals.append(Signal(
                         symbol=symbol,

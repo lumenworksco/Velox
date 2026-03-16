@@ -165,7 +165,7 @@ VWAP_RSI_OVERSOLD    = 30         # RSI below this = oversold (buy signal)
 VWAP_RSI_OVERBOUGHT  = 70         # RSI above this = overbought (short signal)
 VWAP_CONFIRMATION_BARS = 1        # Bars confirming bounce (1 = disabled)
 VWAP_STOP_EXTENSION  = 0.5        # Stop extension beyond band (in std devs)
-VWAP_MIN_STOP_PCT    = 0.005      # Minimum 0.5% stop distance
+VWAP_MIN_STOP_PCT    = 0.01       # Minimum 1.0% stop distance (was 0.5%)
 
 # --- Kalman Pairs Trading ---
 PAIRS_ZSCORE_ENTRY = 2.0
@@ -183,7 +183,7 @@ ORB_ENABLED          = True
 ORB_VOLUME_RATIO     = 1.3        # Volume confirmation ratio
 ORB_MAX_GAP_PCT      = 0.04       # Skip if gap > 4%
 ORB_MAX_RANGE_PCT    = 0.035      # Skip if range > 3.5%
-ORB_MIN_STOP_PCT     = 0.003      # Minimum 0.3% stop distance
+ORB_MIN_STOP_PCT     = 0.008      # Minimum 0.8% stop distance (was 0.3%)
 ORB_SCAN_SYMBOLS     = 15         # Top N by morning volume
 ORB_ACTIVE_UNTIL     = time(11, 30)
 ORB_BREAKOUT_BUFFER  = 0.001      # 0.1% confirmation buffer above/below ORB range
@@ -194,10 +194,10 @@ ORB_TIME_STOP_HOURS  = 2          # Close after 2 hours
 # --- Micro Momentum ---
 MICRO_SPY_VOL_SPIKE_MULT = 3.0
 MICRO_SPY_MIN_MOVE_PCT = 0.0015
-MICRO_MAX_HOLD_MINUTES = 8
-MICRO_STOP_PCT = 0.003
-MICRO_TARGET_PCT = 0.006
-MICRO_MAX_TRADES_PER_EVENT = 3
+MICRO_MAX_HOLD_MINUTES = 15          # Was 8 — give trades room to work
+MICRO_STOP_PCT = 0.01                # Was 0.003 — 1% stop survives noise on beta=2 stocks
+MICRO_TARGET_PCT = 0.02              # Was 0.006 — 2% target keeps 2:1 R/R
+MICRO_MAX_TRADES_PER_EVENT = 2       # Was 3 — fewer, higher-conviction trades
 MICRO_MAX_DAILY_GAIN_DISABLE = 0.015
 MICRO_TOP_BETA_STOCKS = 5
 MICRO_EVENT_COOLDOWN_SEC = 900    # 15-min cooldown between events
