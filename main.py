@@ -22,7 +22,8 @@ import database
 import analytics as analytics_mod
 from data import (
     verify_connectivity, verify_data_feed, get_account, get_clock,
-    get_positions, get_snapshot, get_snapshots, get_filled_exit_price,
+    get_positions, get_snapshot, get_snapshots,
+    get_filled_exit_price, get_filled_exit_info,
 )
 from strategies.base import Signal
 from strategies.regime import MarketRegime
@@ -251,9 +252,8 @@ def sync_positions_with_broker(risk: RiskManager, now: datetime, ws_monitor=None
 
             trade = risk.open_trades[symbol]
 
-            # V9: First try to get the actual broker fill price (TP/SL leg)
-            # This is far more accurate than a market snapshot
-            exit_price = get_filled_exit_price(symbol, side=trade.side)
+            # V9: Get actual fill price AND exit reason from broker orders
+            exit_price, broker_reason = get_filled_exit_info(symbol, side=trade.side)
             if exit_price is None:
                 # Fallback to snapshot price
                 try:
@@ -261,9 +261,10 @@ def sync_positions_with_broker(risk: RiskManager, now: datetime, ws_monitor=None
                     exit_price = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
                 except Exception:
                     exit_price = trade.entry_price
+                broker_reason = "broker_sync"
 
-            risk.close_trade(symbol, exit_price, now, exit_reason="broker_sync")
-            logger.info(f"Position {symbol} confirmed gone from broker — closed at ${exit_price:.2f} (entry ${trade.entry_price:.2f})")
+            risk.close_trade(symbol, exit_price, now, exit_reason=broker_reason)
+            logger.info(f"Position {symbol} confirmed gone from broker — {broker_reason} at ${exit_price:.2f} (entry ${trade.entry_price:.2f})")
             _broker_miss_counts.pop(symbol, None)
 
             if ws_monitor:
@@ -648,12 +649,6 @@ def _handle_strategy_exits(exit_actions: list[dict], risk: RiskManager, now: dat
         trade = risk.open_trades[symbol]
         reason = action.get("reason", "strategy_exit")
 
-        try:
-            snap = get_snapshot(symbol)
-            exit_price = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
-        except Exception:
-            exit_price = trade.entry_price
-
         if action.get("action") == "partial":
             partial_qty = action.get("qty", max(1, trade.qty // 2))
             try:
@@ -662,20 +657,32 @@ def _handle_strategy_exits(exit_actions: list[dict], risk: RiskManager, now: dat
             except Exception as e:
                 logger.error(f"Partial close failed for {symbol}: {e}")
         else:
-            # Full close
+            # Full close — send close order to broker
             try:
                 close_position(symbol, reason=reason)
             except Exception as e:
                 logger.error(f"Close failed for {symbol}: {e}")
                 continue
+
+            # Wait briefly for fill, then get actual fill price
+            import time as _time
+            _time.sleep(0.5)
+            exit_price = get_filled_exit_price(symbol, side=trade.side)
+            if exit_price is None:
+                try:
+                    snap = get_snapshot(symbol)
+                    exit_price = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
+                except Exception:
+                    exit_price = trade.entry_price
+
             risk.close_trade(symbol, exit_price, now, exit_reason=reason)
             if ws_monitor:
                 ws_monitor.unsubscribe(symbol)
             if notifications and config.TELEGRAM_ENABLED:
                 try:
                     notifications.notify_trade_closed(trade)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error(f"Failed to send close notification for {symbol}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -683,22 +690,48 @@ def _handle_strategy_exits(exit_actions: list[dict], risk: RiskManager, now: dat
 # ---------------------------------------------------------------------------
 
 def _handle_ws_close(symbol: str, reason: str, risk: RiskManager, ws_monitor):
-    """Callback for WebSocket-triggered position closes."""
-    if symbol in risk.open_trades:
-        trade = risk.open_trades[symbol]
-        try:
-            close_position(symbol)
-        except Exception as e:
-            logger.error(f"WS close failed for {symbol}: {e}")
-            return
-        risk.close_trade(symbol, trade.entry_price, now_et(), exit_reason=reason)
-        ws_monitor.unsubscribe(symbol)
+    """Callback for WebSocket-triggered position closes.
 
-        if notifications and config.TELEGRAM_ENABLED:
-            try:
-                notifications.notify_trade_closed(trade)
-            except Exception:
-                pass
+    FIXED in V9: Don't close positions for SL/TP hits detected by WS —
+    the broker's bracket order legs already handle those. Only close for
+    reasons the broker doesn't know about (time stops, hard stops, etc.).
+    Also use actual fill price instead of entry_price for accurate P&L.
+    """
+    if symbol not in risk.open_trades:
+        return
+
+    trade = risk.open_trades[symbol]
+
+    # Bracket order SL/TP is handled by the broker — don't double-close.
+    # The broker_sync will pick up the close with accurate fill price.
+    if reason in ("stop_loss_ws", "take_profit_ws"):
+        logger.info(f"WS: {symbol} {reason} detected — deferring to broker bracket order")
+        return
+
+    # For non-bracket exits (hard stops, etc.), close the position ourselves
+    try:
+        close_position(symbol, reason=reason)
+    except Exception as e:
+        logger.error(f"WS close failed for {symbol}: {e}")
+        return
+
+    # Get actual fill price
+    exit_price = get_filled_exit_price(symbol, side=trade.side)
+    if exit_price is None:
+        try:
+            snap = get_snapshot(symbol)
+            exit_price = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
+        except Exception:
+            exit_price = trade.entry_price
+
+    risk.close_trade(symbol, exit_price, now_et(), exit_reason=reason)
+    ws_monitor.unsubscribe(symbol)
+
+    if notifications and config.TELEGRAM_ENABLED:
+        try:
+            notifications.notify_trade_closed(trade)
+        except Exception as e:
+            logger.error(f"Failed to send close notification for {symbol}: {e}")
 
 
 # ---------------------------------------------------------------------------

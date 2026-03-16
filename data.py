@@ -121,22 +121,22 @@ def get_intraday_bars(symbol: str, timeframe: TimeFrame, start: datetime, end: d
     return get_bars(symbol, timeframe, start=start, end=end)
 
 
-def get_filled_exit_price(symbol: str, side: str = "buy") -> float | None:
-    """Look up the actual fill price for a recently closed position.
+def get_filled_exit_info(symbol: str, side: str = "buy") -> tuple[float | None, str | None]:
+    """Look up the actual fill price and exit reason for a recently closed position.
 
     When a bracket order's TP or SL leg fires at the broker, the position
     disappears. This function checks closed orders for the symbol to find
-    the actual fill price, which is more accurate than a market snapshot.
+    the actual fill price and whether it was a stop or limit order.
 
     Args:
         symbol: The stock symbol
-        side: The side of the EXIT order ("sell" for long exits, "buy" for short exits)
+        side: The side of the ENTRY ("buy" for long, "sell" for short)
     Returns:
-        The average fill price, or None if not found
+        Tuple of (fill_price, exit_reason) or (None, None) if not found.
+        exit_reason is "stop_loss", "take_profit", or "market_close".
     """
     try:
         client = get_trading_client()
-        # Get recently closed orders for this symbol
         request = GetOrdersRequest(
             status=QueryOrderStatus.CLOSED,
             symbols=[symbol],
@@ -144,17 +144,33 @@ def get_filled_exit_price(symbol: str, side: str = "buy") -> float | None:
         )
         orders = client.get_orders(request)
 
-        # Find the most recent filled sell order (stop loss or take profit leg)
         exit_side = "sell" if side == "buy" else "buy"
         for order in orders:
             if (order.symbol == symbol
                     and order.side == exit_side
                     and order.status == "filled"
                     and order.filled_avg_price is not None):
-                return float(order.filled_avg_price)
+                price = float(order.filled_avg_price)
+                # Determine exit reason from order type
+                order_type = str(getattr(order, "order_type", "")).lower()
+                if "stop" in order_type:
+                    reason = "stop_loss"
+                elif "limit" in order_type:
+                    reason = "take_profit"
+                elif "market" in order_type:
+                    reason = "market_close"
+                else:
+                    reason = "broker_exit"
+                return price, reason
     except Exception as e:
-        logger.warning(f"Failed to look up fill price for {symbol}: {e}")
-    return None
+        logger.warning(f"Failed to look up fill info for {symbol}: {e}")
+    return None, None
+
+
+def get_filled_exit_price(symbol: str, side: str = "buy") -> float | None:
+    """Convenience wrapper — returns just the fill price."""
+    price, _ = get_filled_exit_info(symbol, side)
+    return price
 
 
 def get_snapshot(symbol: str):
