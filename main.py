@@ -1252,6 +1252,19 @@ def main():
                             except Exception:
                                 pass  # Keep original order on failure
 
+                        # Log scan results for diagnostics
+                        n_mr = len(mr_signals) if 'mr_signals' in dir() else 0
+                        n_vwap = len(vwap_signals) if 'vwap_signals' in dir() else 0
+                        n_pair = len(pair_signals) if 'pair_signals' in dir() else 0
+                        n_orb = len(orb_signals) if 'orb_signals' in dir() and orb_signals else 0
+                        n_micro = len(micro_signals) if 'micro_signals' in dir() else 0
+                        n_pead = len(pead_signals) if 'pead_signals' in dir() and pead_signals else 0
+                        logger.info(
+                            f"Scan complete: {len(signals)} signals "
+                            f"(MR={n_mr} VWAP={n_vwap} PAIRS={n_pair} ORB={n_orb} MICRO={n_micro} PEAD={n_pead}) "
+                            f"regime={regime}"
+                        )
+
                         # 4. Process signals
                         if signals:
                             process_signals(
@@ -1330,7 +1343,7 @@ def main():
                         if cross_asset_monitor:
                             if (current - last_cross_asset_update).total_seconds() >= config.CROSS_ASSET_UPDATE_INTERVAL:
                                 try:
-                                    cross_asset_monitor.update()
+                                    cross_asset_monitor.update(current)
                                     last_cross_asset_update = current
                                 except Exception as e:
                                     logger.error(f"Cross-asset update failed: {e}")

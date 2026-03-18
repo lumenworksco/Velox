@@ -187,10 +187,11 @@ class StatMeanReversion:
                     continue
 
                 # === LONG entry: price below mean ===
-                if (zscore < -config.MR_ZSCORE_ENTRY
+                # In BEARISH regime, require deeper z-score (stronger mean reversion signal)
+                mr_entry_z = config.MR_ZSCORE_ENTRY if regime != "BEARISH" else config.MR_ZSCORE_ENTRY * 1.5
+                if (zscore < -mr_entry_z
                         and rsi < config.MR_RSI_OVERSOLD
-                        and price < vwap
-                        and regime != "BEARISH"):
+                        and price < vwap):
 
                     # Target: revert to z=MR_ZSCORE_EXIT_FULL (near mean)
                     target_price = mu + config.MR_ZSCORE_EXIT_FULL * sigma
