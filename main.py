@@ -25,6 +25,14 @@ from data import (
     get_positions, get_snapshot, get_snapshots,
     get_filled_exit_price, get_filled_exit_info,
 )
+# V10: Decomposed engine modules
+from engine.broker_sync import sync_positions_with_broker, check_shadow_exits
+from engine.signal_processor import process_signals
+from engine.exit_processor import (
+    handle_strategy_exits, handle_ws_close, get_current_prices,
+)
+from engine.scanner import scan_all_strategies, check_all_exits, run_beta_neutralization
+from engine.daily_tasks import daily_reset, weekly_tasks, eod_close, eod_summary
 from strategies.base import Signal
 from strategies.regime import MarketRegime
 from strategies.stat_mean_reversion import StatMeanReversion
@@ -166,8 +174,34 @@ def now_et() -> datetime:
     return datetime.now(config.ET)
 
 
+_market_open_cache: tuple[float, bool] | None = None  # (timestamp, is_open)
+
 def is_market_hours(t: time) -> bool:
-    return config.MARKET_OPEN <= t <= config.MARKET_CLOSE
+    """Check if market is open, using Alpaca clock API for holiday detection."""
+    global _market_open_cache
+    import time as _time
+
+    # V10 BUG-025: Check actual market status (holidays, early close) via API
+    # Cache for 60 seconds to avoid API spam
+    now_ts = _time.time()
+    if _market_open_cache and (now_ts - _market_open_cache[0]) < 60:
+        return _market_open_cache[1]
+
+    # Wall-clock check first (fast path for obviously closed times)
+    if not (config.MARKET_OPEN <= t <= config.MARKET_CLOSE):
+        _market_open_cache = (now_ts, False)
+        return False
+
+    # API check for holidays and early closes
+    try:
+        clock = get_clock()
+        is_open = clock.is_open
+        _market_open_cache = (now_ts, is_open)
+        return is_open
+    except Exception:
+        # Fallback to wall-clock if API fails
+        _market_open_cache = (now_ts, True)
+        return True
 
 
 def is_trading_hours(t: time) -> bool:
@@ -219,544 +253,11 @@ def startup_checks() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Position / broker sync
+# V10: Functions extracted to engine/ package:
+#   sync_positions_with_broker, check_shadow_exits -> engine.broker_sync
+#   process_signals, _process_single_signal -> engine.signal_processor
+#   handle_strategy_exits, handle_ws_close, get_current_prices -> engine.exit_processor
 # ---------------------------------------------------------------------------
-
-_broker_miss_counts: dict[str, int] = {}  # Track consecutive misses before closing
-
-def sync_positions_with_broker(risk: RiskManager, now: datetime, ws_monitor=None):
-    """Sync open trades with actual broker positions.
-
-    FIXED in V7: When a position disappears from broker, fetch the last
-    known market price for accurate P&L instead of using entry_price (which
-    produced 0 P&L for all broker_sync exits).
-
-    FIXED in V9: Require 2 consecutive misses before closing a position
-    (prevents false closes from transient API issues). Also re-adopts
-    broker positions that we previously traded but lost track of.
-    """
-    try:
-        broker_positions = {p.symbol: p for p in get_positions()}
-    except Exception as e:
-        logger.error(f"Failed to fetch positions: {e}")
-        return
-
-    # Close our DB records for positions the broker no longer has
-    # Require 2 consecutive misses to avoid transient API issues
-    for symbol in list(risk.open_trades.keys()):
-        if symbol not in broker_positions:
-            _broker_miss_counts[symbol] = _broker_miss_counts.get(symbol, 0) + 1
-            if _broker_miss_counts[symbol] < 2:
-                logger.info(f"Position {symbol} missing from broker (miss {_broker_miss_counts[symbol]}/2) — will confirm next sync")
-                continue
-
-            trade = risk.open_trades[symbol]
-
-            # V9: Get actual fill price AND exit reason from broker orders
-            exit_price, broker_reason = get_filled_exit_info(symbol, side=trade.side)
-            if exit_price is None:
-                # Fallback to snapshot price
-                try:
-                    snap = get_snapshot(symbol)
-                    exit_price = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
-                except Exception:
-                    exit_price = trade.entry_price
-                broker_reason = "broker_sync"
-
-            risk.close_trade(symbol, exit_price, now, exit_reason=broker_reason)
-            logger.info(f"Position {symbol} confirmed gone from broker — {broker_reason} at ${exit_price:.2f} (entry ${trade.entry_price:.2f})")
-            _broker_miss_counts.pop(symbol, None)
-
-            if ws_monitor:
-                ws_monitor.unsubscribe(symbol)
-            if notifications and config.TELEGRAM_ENABLED:
-                try:
-                    notifications.notify_trade_closed(trade)
-                except Exception as e:
-                    logger.error(f"Failed to send close notification for {symbol}: {e}")
-        else:
-            # Position found at broker — clear any miss count
-            _broker_miss_counts.pop(symbol, None)
-
-    # Re-adopt broker positions we previously traded but lost track of
-    our_symbols = set(risk.open_trades.keys())
-    for symbol in broker_positions:
-        if symbol not in our_symbols and symbol != "SPY":  # SPY may be beta hedge
-            bp = broker_positions[symbol]
-            qty = int(float(bp.qty))
-            avg_price = float(bp.avg_entry_price)
-
-            # Check if we recently traded this symbol (last broker_sync close)
-            recent = database.get_recent_trades(days=1)
-            was_ours = any(
-                t["symbol"] == symbol and t.get("exit_reason") == "broker_sync"
-                for t in recent
-            )
-
-            if was_ours:
-                # Re-adopt: this position was ours but got falsely closed
-                side = "buy" if qty > 0 else "sell"
-                trade = TradeRecord(
-                    symbol=symbol,
-                    strategy="re-adopted",
-                    side=side,
-                    entry_price=avg_price,
-                    entry_time=now,
-                    qty=abs(qty),
-                    take_profit=avg_price * (1.02 if side == "buy" else 0.98),
-                    stop_loss=avg_price * (0.98 if side == "buy" else 1.02),
-                    order_id="",
-                    hold_type="day",
-                )
-                risk.open_trades[symbol] = trade
-                logger.warning(f"Re-adopted broker position: {symbol} qty={qty} @ ${avg_price:.2f} (was falsely broker_sync'd)")
-                if ws_monitor:
-                    ws_monitor.subscribe(symbol)
-            else:
-                logger.warning(f"Unknown broker position: {symbol} qty={qty} — not in our records")
-                if getattr(config, "CLOSE_UNKNOWN_POSITIONS", False):
-                    try:
-                        close_position(symbol, reason="unknown_position_cleanup")
-                        logger.info(f"Auto-closed unknown position: {symbol}")
-                    except Exception as e:
-                        logger.error(f"Failed to auto-close unknown position {symbol}: {e}")
-
-    try:
-        account = get_account()
-        risk.update_equity(float(account.equity), float(account.cash))
-    except Exception as e:
-        logger.error(f"Failed to update account: {e}")
-
-
-def check_shadow_exits(now: datetime):
-    """Check shadow trades for TP/SL/time_stop hits and close them."""
-    try:
-        open_shadows = database.get_open_shadow_trades()
-    except Exception as e:
-        logger.warning(f"Failed to fetch shadow trades: {e}")
-        return
-
-    for shadow in open_shadows:
-        try:
-            snap = get_snapshot(shadow["symbol"])
-            if not snap or not snap.latest_trade:
-                continue
-            price = float(snap.latest_trade.price)
-            side = shadow["side"]
-            tp = shadow["take_profit"]
-            sl = shadow["stop_loss"]
-            exit_reason = None
-
-            if side == "buy":
-                if price >= tp:
-                    exit_reason = "take_profit"
-                elif price <= sl:
-                    exit_reason = "stop_loss"
-            else:
-                if price <= tp:
-                    exit_reason = "take_profit"
-                elif price >= sl:
-                    exit_reason = "stop_loss"
-
-            if exit_reason:
-                database.close_shadow_trade(
-                    shadow["id"], price, now.isoformat(), exit_reason
-                )
-                logger.info(
-                    f"[SHADOW] Closed {shadow['symbol']} ({shadow['strategy']}) "
-                    f"@ {price:.2f} reason={exit_reason}"
-                )
-        except Exception as e:
-            logger.warning(f"Shadow exit check failed for {shadow.get('symbol', '?')}: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Signal processing
-# ---------------------------------------------------------------------------
-
-def process_signals(
-    signals: list[Signal],
-    risk: RiskManager,
-    regime: str,
-    now: datetime,
-    vol_engine: VolatilityTargetingRiskEngine,
-    pnl_lock: DailyPnLLock,
-    ws_monitor=None,
-    news_sentiment=None,
-    llm_scorer=None,
-    regime_detector=None,
-):
-    """Process signals: check filters, risk, size, and submit orders.
-
-    Filters: position conflict, earnings, correlation, short pre-check,
-    news sentiment (soft), LLM scoring (optional).
-    """
-
-    # PnL lock check
-    if not pnl_lock.is_trading_allowed():
-        logger.info("PnL lock LOSS_HALT active -- skipping all signals")
-        for signal in signals:
-            database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, "pnl_halt")
-        return
-
-    # Group pairs signals by pair_id for atomic processing
-    pair_groups: dict[str, list[Signal]] = {}
-    non_pair_signals: list[Signal] = []
-    for signal in signals:
-        if signal.pair_id:
-            pair_groups.setdefault(signal.pair_id, []).append(signal)
-        else:
-            non_pair_signals.append(signal)
-
-    # Process non-pair signals
-    for signal in non_pair_signals:
-        _process_single_signal(signal, risk, regime, now, vol_engine, pnl_lock, ws_monitor,
-                               news_sentiment, llm_scorer, regime_detector)
-
-    # Process pairs atomically (both legs or neither)
-    for pair_id, pair_signals in pair_groups.items():
-        if len(pair_signals) != 2:
-            logger.warning(f"Pair {pair_id} has {len(pair_signals)} signals, skipping")
-            continue
-
-        all_ok = True
-        for sig in pair_signals:
-            if sig.symbol in risk.open_trades:
-                all_ok = False
-                break
-            allowed, reason = risk.can_open_trade(strategy=sig.strategy)
-            if not allowed:
-                all_ok = False
-                break
-
-        if all_ok:
-            for sig in pair_signals:
-                _process_single_signal(sig, risk, regime, now, vol_engine, pnl_lock, ws_monitor,
-                                       news_sentiment, llm_scorer, regime_detector)
-        else:
-            for sig in pair_signals:
-                database.log_signal(now, sig.symbol, sig.strategy, sig.side, False, "pair_blocked")
-
-
-def _process_single_signal(
-    signal: Signal,
-    risk: RiskManager,
-    regime: str,
-    now: datetime,
-    vol_engine: VolatilityTargetingRiskEngine,
-    pnl_lock: DailyPnLLock,
-    ws_monitor=None,
-    news_sentiment=None,
-    llm_scorer=None,
-    regime_detector=None,
-):
-    """Process a single signal through V7 filters and submit if valid."""
-    skip_reason = ""
-
-    # 1. Position conflict
-    if signal.symbol in risk.open_trades:
-        skip_reason = "already_in_position"
-        database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
-        return
-
-    # 2. Earnings filter
-    if has_earnings_soon(signal.symbol):
-        skip_reason = "earnings_soon"
-        logger.info(f"Signal skipped for {signal.symbol}: earnings soon")
-        database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
-        return
-
-    # 3. Correlation filter (skip for KALMAN_PAIRS — they're inherently correlated)
-    if signal.strategy != "KALMAN_PAIRS":
-        open_symbols = list(risk.open_trades.keys())
-        if open_symbols and is_too_correlated(signal.symbol, open_symbols):
-            skip_reason = "high_correlation"
-            database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
-            return
-
-    # 4. Short selling pre-check
-    if signal.side == "sell":
-        if not config.ALLOW_SHORT:
-            skip_reason = "shorting_disabled"
-            database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
-            return
-        shortable, short_reason = can_short(signal.symbol, 1, signal.entry_price)
-        if not shortable:
-            skip_reason = f"short_blocked_{short_reason}"
-            database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
-            return
-
-    # 5. Check risk limits
-    allowed, reason = risk.can_open_trade(strategy=signal.strategy)
-    if not allowed:
-        skip_reason = reason
-        logger.info(f"Trade blocked for {signal.symbol}: {reason}")
-        database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
-        return
-
-    # 5b. V7: News sentiment size adjustment (soft filter)
-    news_mult = 1.0
-    if news_sentiment:
-        try:
-            news_mult, news_reason = news_sentiment.get_sentiment_size_mult(signal.symbol)
-            if news_mult == 0.0:
-                database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, news_reason)
-                return
-        except Exception:
-            news_mult = 1.0
-
-    # 5c. V7: LLM signal scoring (optional, fail-open)
-    llm_mult = 1.0
-    if llm_scorer and config.LLM_SCORING_ENABLED:
-        try:
-            context = {
-                'spy_day_return': risk.day_pnl,
-                'vix_level': getattr(vol_engine, '_last_vix', 20.0),
-            }
-            scored = llm_scorer.score_signal(signal, context)
-            if scored.score < config.LLM_SCORE_THRESHOLD:
-                database.log_signal(now, signal.symbol, signal.strategy, signal.side, False,
-                                   f'llm_low_score_{scored.score:.2f}')
-                return
-            if config.LLM_SCORE_SIZE_MULT:
-                llm_mult = scored.size_mult
-        except Exception:
-            llm_mult = 1.0
-
-    # 6. Position sizing via vol-targeting engine
-    vol_scalar = vol_engine.last_scalar
-    lock_mult = pnl_lock.get_size_multiplier()
-    qty = vol_engine.calculate_position_size(
-        equity=risk.current_equity,
-        entry_price=signal.entry_price,
-        stop_price=signal.stop_loss,
-        vol_scalar=vol_scalar,
-        strategy=signal.strategy,
-        side=signal.side,
-        pnl_lock_mult=lock_mult,
-    )
-
-    # V9: HMM regime affinity multiplier (fail-open: 1.0 if unavailable)
-    regime_mult = 1.0
-    if regime_detector and getattr(config, "HMM_REGIME_ENABLED", False):
-        try:
-            regime_mult = regime_detector.get_regime_affinity(signal.strategy)
-        except Exception:
-            regime_mult = 1.0
-
-    # V9: Intraday seasonality multiplier (fail-open: 1.0)
-    seasonality_mult = 1.0
-    if getattr(config, "INTRADAY_SEASONALITY_ENABLED", False) and IntradaySeasonality:
-        try:
-            _seasonality = IntradaySeasonality()
-            seasonality_mult = _seasonality.get_window_score(signal.strategy, now)
-        except Exception:
-            seasonality_mult = 1.0
-
-    # V9: Cross-asset bias multiplier (fail-open: 1.0)
-    cross_asset_mult = 1.0
-    if getattr(config, "CROSS_ASSET_ENABLED", False) and hasattr(_process_single_signal, '_cross_asset_monitor'):
-        try:
-            monitor = _process_single_signal._cross_asset_monitor
-            if monitor:
-                bias = monitor.get_equity_bias()
-                # Reduce sizing if flight-to-safety detected
-                if bias < -0.5:
-                    cross_asset_mult = getattr(config, "CROSS_ASSET_FLIGHT_REDUCTION", 0.30)
-        except Exception:
-            cross_asset_mult = 1.0
-
-    # Apply news + LLM + regime + seasonality + cross-asset multipliers
-    qty = int(qty * news_mult * llm_mult * regime_mult * seasonality_mult * cross_asset_mult)
-
-    if qty <= 0:
-        skip_reason = "position_size_zero"
-        logger.info(f"Position size 0 for {signal.symbol}, skipping")
-        database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
-        return
-
-    # 7. Submit bracket order
-    order_id = submit_bracket_order(signal, qty)
-    if order_id is None:
-        skip_reason = "order_failed"
-        logger.error(f"Failed to submit order for {signal.symbol}, skipping (no naked entry)")
-        database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
-        return
-
-    # 8. Register the trade with V6 time stops / max hold
-    time_stop = None
-    max_hold_date = None
-    hold_type = getattr(signal, "hold_type", "day")
-
-    if signal.strategy == "STAT_MR":
-        # No fixed time stop — z-score exits handle it
-        pass
-    elif signal.strategy == "KALMAN_PAIRS":
-        max_hold_date = now + timedelta(days=config.PAIRS_MAX_HOLD_DAYS)
-    elif signal.strategy == "MICRO_MOM":
-        time_stop = now + timedelta(minutes=config.MICRO_MAX_HOLD_MINUTES)
-    elif signal.strategy == "BETA_HEDGE":
-        hold_type = "day"
-        # No time stop — held until EOD or beta re-balances
-
-    trade = TradeRecord(
-        symbol=signal.symbol,
-        strategy=signal.strategy,
-        side=signal.side,
-        entry_price=signal.entry_price,
-        entry_time=now,
-        qty=qty,
-        take_profit=signal.take_profit,
-        stop_loss=signal.stop_loss,
-        order_id=order_id,
-        time_stop=time_stop,
-        hold_type=hold_type,
-        max_hold_date=max_hold_date,
-        pair_id=getattr(signal, "pair_id", ""),
-        highest_price_seen=signal.entry_price,
-    )
-    risk.register_trade(trade)
-
-    # Subscribe to WebSocket monitoring
-    if ws_monitor:
-        ws_monitor.subscribe(signal.symbol)
-
-    # Notification
-    if notifications and config.TELEGRAM_ENABLED:
-        try:
-            notifications.notify_trade_opened(trade)
-        except Exception as e:
-            logger.warning(f"Notification failed: {e}")
-
-    # Log signal as acted on
-    database.log_signal(now, signal.symbol, signal.strategy, signal.side, True, "")
-
-
-# ---------------------------------------------------------------------------
-# Exit processing helper
-# ---------------------------------------------------------------------------
-
-def _handle_strategy_exits(exit_actions: list[dict], risk: RiskManager, now: datetime, ws_monitor=None):
-    """Process exit actions returned by strategy check_exits() methods.
-
-    Each action dict: {symbol, action, reason, ...}
-    action = "full" -> close_position, "partial" -> close_partial_position
-    """
-    for action in exit_actions:
-        symbol = action["symbol"]
-        if symbol not in risk.open_trades:
-            continue
-        trade = risk.open_trades[symbol]
-        reason = action.get("reason", "strategy_exit")
-
-        if action.get("action") == "partial":
-            partial_qty = action.get("qty", max(1, trade.qty // 2))
-            try:
-                close_partial_position(symbol, partial_qty)
-                logger.info(f"Partial exit {symbol}: {partial_qty} shares, reason={reason}")
-            except Exception as e:
-                logger.error(f"Partial close failed for {symbol}: {e}")
-        else:
-            # Full close — send close order to broker
-            try:
-                close_position(symbol, reason=reason)
-            except Exception as e:
-                logger.error(f"Close failed for {symbol}: {e}")
-                continue
-
-            # Wait briefly for fill, then get actual fill price
-            import time as _time
-            _time.sleep(0.5)
-            exit_price = get_filled_exit_price(symbol, side=trade.side)
-            if exit_price is None:
-                try:
-                    snap = get_snapshot(symbol)
-                    exit_price = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
-                except Exception:
-                    exit_price = trade.entry_price
-
-            risk.close_trade(symbol, exit_price, now, exit_reason=reason)
-            if ws_monitor:
-                ws_monitor.unsubscribe(symbol)
-            if notifications and config.TELEGRAM_ENABLED:
-                try:
-                    notifications.notify_trade_closed(trade)
-                except Exception as e:
-                    logger.error(f"Failed to send close notification for {symbol}: {e}")
-
-
-# ---------------------------------------------------------------------------
-# WebSocket close callback
-# ---------------------------------------------------------------------------
-
-def _handle_ws_close(symbol: str, reason: str, risk: RiskManager, ws_monitor):
-    """Callback for WebSocket-triggered position closes.
-
-    FIXED in V9: Don't close positions for SL/TP hits detected by WS —
-    the broker's bracket order legs already handle those. Only close for
-    reasons the broker doesn't know about (time stops, hard stops, etc.).
-    Also use actual fill price instead of entry_price for accurate P&L.
-    """
-    if symbol not in risk.open_trades:
-        return
-
-    trade = risk.open_trades[symbol]
-
-    # Bracket order SL/TP is handled by the broker — don't double-close.
-    # The broker_sync will pick up the close with accurate fill price.
-    if reason in ("stop_loss_ws", "take_profit_ws"):
-        logger.info(f"WS: {symbol} {reason} detected — deferring to broker bracket order")
-        return
-
-    # For non-bracket exits (hard stops, etc.), close the position ourselves
-    try:
-        close_position(symbol, reason=reason)
-    except Exception as e:
-        logger.error(f"WS close failed for {symbol}: {e}")
-        return
-
-    # Get actual fill price
-    exit_price = get_filled_exit_price(symbol, side=trade.side)
-    if exit_price is None:
-        try:
-            snap = get_snapshot(symbol)
-            exit_price = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
-        except Exception:
-            exit_price = trade.entry_price
-
-    risk.close_trade(symbol, exit_price, now_et(), exit_reason=reason)
-    ws_monitor.unsubscribe(symbol)
-
-    if notifications and config.TELEGRAM_ENABLED:
-        try:
-            notifications.notify_trade_closed(trade)
-        except Exception as e:
-            logger.error(f"Failed to send close notification for {symbol}: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Fetch current prices for open positions
-# ---------------------------------------------------------------------------
-
-def _get_current_prices(open_trades: dict) -> dict[str, float]:
-    """Fetch current prices for open trades (for beta calculation etc.)."""
-    symbols = list(open_trades.keys())
-    if not symbols:
-        return {}
-    prices: dict[str, float] = {}
-    try:
-        snapshots = get_snapshots(symbols)
-        for sym, snap in snapshots.items():
-            if snap and snap.latest_trade:
-                prices[sym] = float(snap.latest_trade.price)
-    except Exception as e:
-        logger.warning(f"Price fetch failed: {e}")
-    # Fallback to entry price for any missing
-    for sym, trade in open_trades.items():
-        if sym not in prices:
-            prices[sym] = trade.entry_price
-    return prices
-
 
 # ===========================================================================
 # MAIN (synchronous mode)
@@ -788,7 +289,7 @@ def main():
         walk_forward_test()
         return
 
-    console.print("[bold cyan]Starting Velox V9 Trading Bot...[/bold cyan]\n")
+    console.print("[bold cyan]Starting Velox V10 Trading Bot...[/bold cyan]\n")
 
     # Initialize database
     database.init_db()
@@ -797,171 +298,62 @@ def main():
     # Startup checks
     info = startup_checks()
 
-    # --- Strategy initialization ---
-    stat_mr = StatMeanReversion()
-    kalman_pairs = KalmanPairsTrader()
-    micro_mom = IntradayMicroMomentum()
-    vwap_strategy = VWAPStrategy()
-    orb_strategy = ORBStrategyV2() if ORBStrategyV2 and config.ORB_ENABLED else None
+    # V10: Consolidated initialization via engine/startup.py
+    from engine.startup import (
+        initialize_strategies, initialize_risk_engines,
+        initialize_optional_modules, initialize_v10_components,
+        initialize_risk_manager, initialize_websocket, initialize_dashboard,
+    )
 
-    # V7 risk engine
-    vol_engine = VolatilityTargetingRiskEngine()
-    pnl_lock = DailyPnLLock()
-    beta_neutral = BetaNeutralizer()
+    strats = initialize_strategies()
+    stat_mr = strats["stat_mr"]
+    kalman_pairs = strats["kalman_pairs"]
+    micro_mom = strats["micro_mom"]
+    vwap_strategy = strats["vwap_strategy"]
+    orb_strategy = strats["orb_strategy"]
+    pead_strategy = strats.get("pead_strategy")
 
-    # V7 optional modules
-    news_sentiment = None
-    if config.NEWS_SENTIMENT_ENABLED and AlpacaNewsSentiment:
-        try:
-            news_sentiment = AlpacaNewsSentiment()
-            logger.info("News sentiment filter enabled")
-        except Exception as e:
-            logger.warning(f"News sentiment init failed: {e}")
+    engines = initialize_risk_engines()
+    vol_engine = engines["vol_engine"]
+    pnl_lock = engines["pnl_lock"]
+    beta_neutral = engines["beta_neutral"]
+    regime_detector = engines["regime_detector"]
 
-    llm_scorer = None
-    if config.LLM_SCORING_ENABLED and LLMSignalScorer:
-        try:
-            llm_scorer = LLMSignalScorer()
-            logger.info("LLM signal scoring enabled")
-        except Exception as e:
-            logger.warning(f"LLM scorer init failed: {e}")
-
-    adaptive_exits = AdaptiveExitManager() if AdaptiveExitManager and config.ADAPTIVE_EXITS_ENABLED else None
-    walk_forward = WalkForwardValidator() if WalkForwardValidator and config.WALK_FORWARD_ENABLED else None
-
-    # Regime detector
-    regime_detector = MarketRegime()
-
-    # V9 modules (all fail-open)
-    pead_strategy = None
-    if config.PEAD_ENABLED and PEADStrategy:
-        try:
-            pead_strategy = PEADStrategy()
-            logger.info("PEAD strategy enabled")
-        except Exception as e:
-            logger.warning(f"PEAD init failed: {e}")
-
-    overnight_manager = None
-    if config.OVERNIGHT_HOLD_ENABLED and OvernightManager:
-        try:
-            overnight_manager = OvernightManager()
-            logger.info("Overnight hold manager enabled")
-        except Exception as e:
-            logger.warning(f"Overnight manager init failed: {e}")
-
-    cross_asset_monitor = None
-    if config.CROSS_ASSET_ENABLED and CrossAssetMonitor:
-        try:
-            cross_asset_monitor = CrossAssetMonitor()
-            # Make accessible to _process_single_signal
-            _process_single_signal._cross_asset_monitor = cross_asset_monitor
-            logger.info("Cross-asset monitor enabled")
-        except Exception as e:
-            logger.warning(f"Cross-asset monitor init failed: {e}")
-
-    signal_ranker = None
-    if config.SIGNAL_RANKING_ENABLED and SignalRanker:
-        try:
-            signal_ranker = SignalRanker()
-            logger.info("Signal ranker enabled")
-        except Exception as e:
-            logger.warning(f"Signal ranker init failed: {e}")
-
-    alpha_decay_monitor = None
-    if config.ALPHA_DECAY_ENABLED and AlphaDecayMonitor:
-        try:
-            alpha_decay_monitor = AlphaDecayMonitor()
-            logger.info("Alpha decay monitor enabled")
-        except Exception as e:
-            logger.warning(f"Alpha decay monitor init failed: {e}")
-
-    adaptive_allocator = None
-    if config.ADAPTIVE_ALLOCATION_ENABLED and AdaptiveAllocator:
-        try:
-            strategies = list(config.STRATEGY_ALLOCATIONS.keys())
-            adaptive_allocator = AdaptiveAllocator(strategies, config.STRATEGY_ALLOCATIONS)
-            logger.info("Adaptive allocator enabled")
-        except Exception as e:
-            logger.warning(f"Adaptive allocator init failed: {e}")
-
-    param_optimizer = None
-    if config.PARAM_OPTIMIZER_ENABLED and BayesianOptimizer:
-        try:
-            param_optimizer = BayesianOptimizer()
-            logger.info("Parameter optimizer enabled")
-        except Exception as e:
-            logger.warning(f"Parameter optimizer init failed: {e}")
-
-    watchdog = None
-    if config.WATCHDOG_ENABLED and Watchdog:
-        try:
-            watchdog = Watchdog()
-            logger.info("Watchdog enabled")
-        except Exception as e:
-            logger.warning(f"Watchdog init failed: {e}")
-
-    reconciler = None
-    if getattr(config, "RECONCILIATION_ENABLED", False) and PositionReconciler:
-        try:
-            reconciler = PositionReconciler()
-            logger.info("Position reconciler enabled")
-        except Exception as e:
-            logger.warning(f"Position reconciler init failed: {e}")
-
-    audit_trail = None
-    if config.STRUCTURED_LOGGING_ENABLED and AuditTrail:
-        try:
-            audit_trail = AuditTrail()
-            logger.info("Structured audit trail enabled")
-        except Exception as e:
-            logger.warning(f"Audit trail init failed: {e}")
+    mods = initialize_optional_modules()
+    news_sentiment = mods["news_sentiment"]
+    llm_scorer = mods["llm_scorer"]
+    walk_forward = mods.get("walk_forward")
+    overnight_manager = mods.get("overnight_manager")
+    cross_asset_monitor = mods.get("cross_asset_monitor")
+    signal_ranker = mods.get("signal_ranker")
+    alpha_decay_monitor = mods.get("alpha_decay_monitor")
+    adaptive_allocator = mods.get("adaptive_allocator")
+    param_optimizer = mods.get("param_optimizer")
+    watchdog = mods.get("watchdog")
+    reconciler = mods.get("reconciler")
 
     last_cross_asset_update = now_et()
     last_watchdog_check = now_et()
     last_reconciliation = now_et()
 
-    # Risk manager
-    risk = RiskManager()
-    risk.reset_daily(info["equity"], info["cash"])
-    risk.load_from_db()
+    risk = initialize_risk_manager(info["equity"], info["cash"])
 
-    # WebSocket position monitor
-    ws_monitor = None
-    if config.WEBSOCKET_MONITORING and PositionMonitor:
-        ws_monitor = PositionMonitor(risk)
-        ws_monitor.set_close_callback(
-            lambda symbol, reason: _handle_ws_close(symbol, reason, risk, ws_monitor)
-        )
-        for symbol in risk.open_trades:
-            ws_monitor.subscribe(symbol)
-        ws_monitor.start()
-        console.print("[green]WebSocket position monitor started.[/green]")
+    v10 = initialize_v10_components()
+    order_manager = v10["order_manager"]
+    tiered_cb = v10["tiered_cb"]
+    kill_switch = v10["kill_switch"]
+    var_monitor = v10["var_monitor"]
+    corr_limiter = v10["corr_limiter"]
 
-    # Web dashboard
-    if config.WEB_DASHBOARD_ENABLED:
-        try:
-            from web_dashboard import start_web_dashboard
-            start_web_dashboard()
-            console.print(f"[green]Web dashboard: http://localhost:{config.WEB_DASHBOARD_PORT}[/green]")
-        except Exception as e:
-            console.print(f"[yellow]Web dashboard failed to start: {e}[/yellow]")
-
-    # Notifications setup
-    if notifications and config.TELEGRAM_ENABLED:
-        console.print("[green]Notifications enabled.[/green]")
+    ws_monitor = initialize_websocket(risk)
+    initialize_dashboard(order_manager, kill_switch, tiered_cb)
 
     # Load filters
-    console.print("Loading earnings calendar...")
     try:
         load_earnings_cache(config.SYMBOLS)
-    except Exception as e:
-        console.print(f"[yellow]Earnings filter load failed: {e} (continuing without)[/yellow]")
-
-    console.print("Loading correlation data...")
-    try:
         load_correlation_cache(config.SYMBOLS)
     except Exception as e:
-        console.print(f"[yellow]Correlation filter load failed: {e} (continuing without)[/yellow]")
+        logger.warning(f"Filter cache load failed: {e}")
 
     # --- Loop state ---
     start_time = now_et()
@@ -1059,83 +451,24 @@ def main():
                 # Daily reset
                 # -------------------------------------------------------
                 if current.date() != last_day:
-                    logger.info("New trading day -- resetting state")
-                    stat_mr.reset_daily()
-                    micro_mom.reset_daily()
-                    vwap_strategy.reset_daily()
-                    pnl_lock.reset_daily()
-                    beta_neutral.reset_daily()
-                    # kalman_pairs.reset_daily() -- does nothing (pairs persist weekly)
-                    if orb_strategy:
-                        orb_strategy.reset_daily()
-                        orb_strategy._ranges_recorded_today = False
-                    if news_sentiment:
-                        news_sentiment.clear_daily_cache()
-                    if llm_scorer:
-                        llm_scorer.reset_daily()
-                    # V9 daily resets
-                    if pead_strategy:
-                        try:
-                            pead_strategy.reset_daily()
-                        except Exception:
-                            pass
-                    if overnight_manager:
-                        try:
-                            overnight_manager.reset_daily()
-                        except Exception:
-                            pass
+                    daily_reset(
+                        risk, stat_mr, kalman_pairs, micro_mom, vwap_strategy,
+                        pnl_lock, beta_neutral,
+                        orb_strategy=orb_strategy, pead_strategy=pead_strategy,
+                        overnight_manager=overnight_manager, news_sentiment=news_sentiment,
+                        llm_scorer=llm_scorer, tiered_cb=tiered_cb,
+                    )
                     universe_prepared_today = False
-
-                    try:
-                        account = get_account()
-                        risk.reset_daily(float(account.equity), float(account.cash))
-                    except Exception as e:
-                        logger.error(f"Failed to reset daily: {e}")
                     last_day = current.date()
                     eod_summary_printed = False
 
-                    # Refresh daily caches
-                    try:
-                        load_earnings_cache(config.SYMBOLS)
-                        load_correlation_cache(config.SYMBOLS)
-                    except Exception as e:
-                        logger.error(f"Failed to refresh daily caches: {e}")
-
                 # -------------------------------------------------------
-                # Sunday tasks — weekly pair selection
+                # Sunday tasks — weekly pair selection, optimization, validation
                 # -------------------------------------------------------
                 if (current.weekday() == 6 and current_time >= time(0, 0)
                         and last_sunday_task != current.date()):
                     last_sunday_task = current.date()
-                    try:
-                        logger.info("Sunday: selecting cointegrated pairs...")
-                        kalman_pairs.select_pairs_weekly(current)
-                    except Exception as e:
-                        logger.error(f"Weekly pair selection failed: {e}")
-
-                    # V9: Parameter optimization (weekly, Sunday)
-                    if param_optimizer:
-                        try:
-                            logger.info("Sunday: running parameter optimization...")
-                            opt_results = param_optimizer.optimize_all()
-                            for strat, result in opt_results.items():
-                                logger.info(f"Optimizer {strat}: improved={result.get('improved', False)}")
-                        except Exception as e:
-                            logger.error(f"Parameter optimization failed: {e}")
-
-                    # Walk-forward validation (weekly)
-                    if walk_forward:
-                        try:
-                            logger.info("Sunday: running walk-forward validation...")
-                            wf_results = walk_forward.run_weekly_validation()
-                            for strat, result in wf_results.items():
-                                rec = result.get('recommendation', 'unknown')
-                                sharpe = result.get('sharpe', 0.0)
-                                logger.info(f"WF {strat}: Sharpe={sharpe:.2f} -> {rec}")
-                                if rec == 'demote':
-                                    logger.warning(f"Walk-forward: {strat} demoted (OOS Sharpe {sharpe:.2f} < {config.WALK_FORWARD_MIN_SHARPE})")
-                        except Exception as e:
-                            logger.error(f"Walk-forward validation failed: {e}")
+                    weekly_tasks(current, kalman_pairs, param_optimizer, walk_forward)
 
                 # -------------------------------------------------------
                 # Update regime
@@ -1149,11 +482,25 @@ def main():
 
                     # 9:00 AM tasks: universe prep + Monday pair selection
                     if not universe_prepared_today and current_time >= config.MR_UNIVERSE_PREP_TIME:
+                        # V10: Dynamic universe selection based on regime
+                        scan_symbols = config.STANDARD_SYMBOLS
                         try:
-                            stat_mr.prepare_universe(config.STANDARD_SYMBOLS, current)
+                            from strategies.dynamic_universe import DynamicUniverse
+                            _dyn_universe = DynamicUniverse()
+                            selection = _dyn_universe.select(regime=regime)
+                            if selection.symbols:
+                                scan_symbols = selection.symbols
+                                logger.info(
+                                    f"Dynamic universe: {len(scan_symbols)} symbols "
+                                    f"(+{len(selection.added)} -{len(selection.removed)}) regime={regime}"
+                                )
+                        except Exception as e:
+                            logger.debug(f"Dynamic universe failed (using static): {e}")
+
+                        try:
+                            stat_mr.prepare_universe(scan_symbols, current)
                             universe_prepared_today = True
                             logger.info(f"MR universe prepared: {len(stat_mr.universe)} symbols")
-                            # Save OU params to database for diagnostics
                             for sym, ou in stat_mr.ou_params.items():
                                 try:
                                     database.save_ou_parameters(sym, ou)
@@ -1194,75 +541,47 @@ def main():
                         # 1. Update PnL lock state
                         pnl_lock.update(risk.day_pnl)
 
-                        # 2. Detect micro momentum events
-                        try:
-                            micro_mom.detect_event(current)
-                        except Exception as e:
-                            logger.error(f"Micro event detection failed: {e}")
+                        # V10: Tiered circuit breaker (replaces single-threshold)
+                        skip_scan = False
+                        if tiered_cb:
+                            day_pnl_pct = risk.day_pnl / max(risk.current_equity, 1)
+                            tier = tiered_cb.update(day_pnl_pct, current)
+                            if tiered_cb.should_close_all and kill_switch:
+                                kill_switch.activate("tiered_cb_black", risk_manager=risk, order_manager=order_manager)
+                                skip_scan = True
+                            elif tiered_cb.should_close_day_trades:
+                                # Red tier: close day-hold positions
+                                for sym in list(risk.open_trades.keys()):
+                                    t = risk.open_trades[sym]
+                                    if t.hold_type == "day":
+                                        try:
+                                            from execution import close_position as _close_pos
+                                            _close_pos(sym, reason="circuit_breaker_red")
+                                            risk.close_trade(sym, t.entry_price, current, exit_reason="circuit_breaker_red")
+                                        except Exception:
+                                            pass
+                                skip_scan = True
+                            elif not tiered_cb.allow_new_entries:
+                                skip_scan = True
+                        elif risk.check_circuit_breaker():
+                            # Fallback to legacy single-threshold
+                            skip_scan = True
 
-                        # 3. Scan all five strategies
-                        signals: list[Signal] = []
+                        if skip_scan:
+                            if notifications and config.TELEGRAM_ENABLED:
+                                try:
+                                    tier_name = tiered_cb.current_tier.name if tiered_cb else "ACTIVE"
+                                    notifications.notify_circuit_breaker(risk.day_pnl)
+                                except Exception:
+                                    pass
+                            logger.warning(f"Circuit breaker {tier_name if tiered_cb else 'ACTIVE'} — skipping scan cycle (day P&L: {risk.day_pnl:.2f})")
+                            last_scan = current
+                            continue
 
-                        try:
-                            mr_signals = stat_mr.scan(current, regime)
-                            signals.extend(mr_signals)
-                        except Exception as e:
-                            logger.error(f"StatMR scan failed: {e}")
-
-                        try:
-                            vwap_signals = vwap_strategy.scan(current, regime)
-                            signals.extend(vwap_signals)
-                        except Exception as e:
-                            logger.error(f"VWAP scan failed: {e}")
-
-                        try:
-                            pair_signals = kalman_pairs.scan(current, regime)
-                            signals.extend(pair_signals)
-                        except Exception as e:
-                            logger.error(f"KalmanPairs scan failed: {e}")
-
-                        if orb_strategy:
-                            try:
-                                orb_signals = orb_strategy.scan(current, regime)
-                                signals.extend(orb_signals)
-                            except Exception as e:
-                                logger.error(f"ORB scan failed: {e}")
-
-                        try:
-                            micro_signals = micro_mom.scan(
-                                current, day_pnl_pct=risk.day_pnl, regime=regime
-                            )
-                            signals.extend(micro_signals)
-                        except Exception as e:
-                            logger.error(f"MicroMom scan failed: {e}")
-
-                        # V9: PEAD scan (daily at 9 AM — handled internally)
-                        if pead_strategy:
-                            try:
-                                pead_signals = pead_strategy.scan(current)
-                                signals.extend(pead_signals)
-                            except Exception as e:
-                                logger.error(f"PEAD scan failed: {e}")
-
-                        # V9: Signal ranking (sort by expected value)
-                        if signal_ranker and signals:
-                            try:
-                                ranked = signal_ranker.rank(signals, regime=regime)
-                                signals = ranked
-                            except Exception:
-                                pass  # Keep original order on failure
-
-                        # Log scan results for diagnostics
-                        n_mr = len(mr_signals) if 'mr_signals' in dir() else 0
-                        n_vwap = len(vwap_signals) if 'vwap_signals' in dir() else 0
-                        n_pair = len(pair_signals) if 'pair_signals' in dir() else 0
-                        n_orb = len(orb_signals) if 'orb_signals' in dir() and orb_signals else 0
-                        n_micro = len(micro_signals) if 'micro_signals' in dir() else 0
-                        n_pead = len(pead_signals) if 'pead_signals' in dir() and pead_signals else 0
-                        logger.info(
-                            f"Scan complete: {len(signals)} signals "
-                            f"(MR={n_mr} VWAP={n_vwap} PAIRS={n_pair} ORB={n_orb} MICRO={n_micro} PEAD={n_pead}) "
-                            f"regime={regime}"
+                        # 2-3. Scan all strategies + detect events
+                        signals = scan_all_strategies(
+                            current, regime, stat_mr, kalman_pairs, micro_mom,
+                            vwap_strategy, orb_strategy, pead_strategy, signal_ranker,
                         )
 
                         # 4. Process signals
@@ -1271,73 +590,21 @@ def main():
                                 signals, risk, regime, current,
                                 vol_engine, pnl_lock, ws_monitor,
                                 news_sentiment, llm_scorer,
-                                regime_detector,
+                                regime_detector, cross_asset_monitor,
+                                var_monitor, corr_limiter,
                             )
 
                         # 5. Check strategy exits
-                        try:
-                            mr_exits = stat_mr.check_exits(risk.open_trades, current)
-                            if mr_exits:
-                                _handle_strategy_exits(mr_exits, risk, current, ws_monitor)
-                        except Exception as e:
-                            logger.error(f"StatMR exit check failed: {e}")
+                        check_all_exits(
+                            current, risk, stat_mr, kalman_pairs, micro_mom,
+                            orb_strategy, pead_strategy, ws_monitor,
+                        )
 
-                        try:
-                            pair_exits = kalman_pairs.check_exits(risk.open_trades, current)
-                            if pair_exits:
-                                _handle_strategy_exits(pair_exits, risk, current, ws_monitor)
-                        except Exception as e:
-                            logger.error(f"KalmanPairs exit check failed: {e}")
-
-                        try:
-                            micro_exits = micro_mom.check_exits(risk.open_trades, current)
-                            if micro_exits:
-                                _handle_strategy_exits(micro_exits, risk, current, ws_monitor)
-                        except Exception as e:
-                            logger.error(f"MicroMom exit check failed: {e}")
-
-                        if orb_strategy:
-                            try:
-                                orb_exits = orb_strategy.check_exits(risk.open_trades, current)
-                                if orb_exits:
-                                    _handle_strategy_exits(orb_exits, risk, current, ws_monitor)
-                            except Exception as e:
-                                logger.error(f"ORB exit check failed: {e}")
-
-                        # 6. Beta neutralization (every BETA_CHECK_INTERVAL_MIN)
-                        if beta_neutral.should_check_now(current):
-                            if not beta_neutral.should_skip(current):
-                                try:
-                                    prices = _get_current_prices(risk.open_trades)
-                                    beta = beta_neutral.compute_portfolio_beta(risk.open_trades, prices)
-                                    if beta_neutral.needs_hedge():
-                                        spy_price = prices.get("SPY")
-                                        if not spy_price:
-                                            try:
-                                                snap = get_snapshot("SPY")
-                                                spy_price = float(snap.latest_trade.price) if snap and snap.latest_trade else None
-                                            except Exception:
-                                                spy_price = None
-                                        if spy_price:
-                                            hedge_signal = beta_neutral.compute_hedge_signal(
-                                                risk.current_equity, spy_price
-                                            )
-                                            if hedge_signal:
-                                                process_signals(
-                                                    [hedge_signal], risk, regime, current,
-                                                    vol_engine, pnl_lock, ws_monitor,
-                                                )
-                                except Exception as e:
-                                    logger.error(f"Beta neutralization failed: {e}")
-
-                        # V9: PEAD exit checks
-                        if pead_strategy:
-                            try:
-                                pead_exits = pead_strategy.check_exits(risk.open_trades, current)
-                                if pead_exits:
-                                    _handle_strategy_exits(pead_exits, risk, current, ws_monitor)
-                            except Exception as e:
-                                logger.error(f"PEAD exit check failed: {e}")
+                        # 6. Beta neutralization
+                        run_beta_neutralization(
+                            current, risk, beta_neutral, vol_engine, pnl_lock,
+                            ws_monitor, regime,
+                        )
 
                         # V9: Cross-asset monitor update (every 15 min)
                         if cross_asset_monitor:
@@ -1372,52 +639,19 @@ def main():
                         # Check shadow exits
                         check_shadow_exits(current)
 
-                    # V9: Overnight hold selection at 3:45 PM
-                    if overnight_manager and current_time >= config.ORB_EXIT_TIME:
-                        try:
-                            holds = overnight_manager.select_overnight_holds(
-                                risk.open_trades, regime
-                            )
-                            if holds:
-                                logger.info(f"Overnight holds selected: {[h.symbol for h in holds]}")
-                        except Exception as e:
-                            logger.error(f"Overnight hold selection failed: {e}")
-
-                    # EOD close for day-hold positions at ORB_EXIT_TIME
+                    # EOD: close day-hold positions + respect overnight holds (BUG-034, BUG-039)
                     if current_time >= config.ORB_EXIT_TIME:
-                        for symbol in list(risk.open_trades.keys()):
-                            trade = risk.open_trades[symbol]
-                            if trade.hold_type == "day" and trade.strategy in ("MICRO_MOM", "BETA_HEDGE", "ORB", "VWAP"):
-                                try:
-                                    close_position(symbol, reason="eod_close")
-                                    try:
-                                        snap = get_snapshot(symbol)
-                                        ep = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
-                                    except Exception:
-                                        ep = trade.entry_price
-                                    risk.close_trade(symbol, ep, current, exit_reason="eod_close")
-                                    if ws_monitor:
-                                        ws_monitor.unsubscribe(symbol)
-                                except Exception as e:
-                                    logger.error(f"EOD close failed for {symbol}: {e}")
+                        eod_close(current, risk, ws_monitor, overnight_manager, regime)
 
                     # Sync with broker
-                    if not (ws_monitor and ws_monitor.is_connected):
-                        sync_positions_with_broker(risk, current, ws_monitor)
-                    else:
-                        try:
-                            account = get_account()
-                            risk.update_equity(float(account.equity), float(account.cash))
-                        except Exception as e:
-                            logger.error(f"Failed to update account: {e}")
-
-                    # Check circuit breaker
-                    if risk.check_circuit_breaker():
-                        if notifications and config.TELEGRAM_ENABLED:
-                            try:
-                                notifications.notify_circuit_breaker(risk.day_pnl)
-                            except Exception:
-                                pass
+                    # V10 BUG-026: Always sync with broker regardless of WebSocket state
+                    # WebSocket handles real-time updates; sync handles drift correction
+                    sync_positions_with_broker(risk, current, ws_monitor)
+                    try:
+                        account = get_account()
+                        risk.update_equity(float(account.equity), float(account.cash))
+                    except Exception as e:
+                        logger.error(f"Failed to update account: {e}")
 
                     last_scan = current
 
@@ -1524,6 +758,22 @@ def main():
                                     pass
                     except Exception as e:
                         logger.error(f"Failed to compute analytics: {e}")
+
+                    # V10: Update VaR monitor
+                    if var_monitor:
+                        try:
+                            pnl_series_var = database.get_daily_pnl_series(days=60)
+                            if pnl_series_var and len(pnl_series_var) >= 10:
+                                var_result = var_monitor.update(pnl_series_var, risk.current_equity)
+                                # Log if VaR budget is running low
+                                if var_monitor.risk_budget_remaining < 0.3:
+                                    logger.warning(
+                                        f"VaR budget low: {var_monitor.risk_budget_remaining:.0%} remaining "
+                                        f"(VaR95=${var_result.var_95:.0f}, {var_result.var_95_pct:.2%})"
+                                    )
+                        except Exception as e:
+                            logger.debug(f"VaR update failed: {e}")
+
                     last_analytics_update = current
 
                 # -------------------------------------------------------
@@ -1714,21 +964,21 @@ async def _async_exit_checker(
                 try:
                     mr_exits = stat_mr.check_exits(risk.open_trades, current)
                     if mr_exits:
-                        _handle_strategy_exits(mr_exits, risk, current, ws_monitor)
+                        handle_strategy_exits(mr_exits, risk, current, ws_monitor)
                 except Exception as e:
                     logger.error(f"[async] StatMR exit check failed: {e}")
 
                 try:
                     pair_exits = kalman_pairs.check_exits(risk.open_trades, current)
                     if pair_exits:
-                        _handle_strategy_exits(pair_exits, risk, current, ws_monitor)
+                        handle_strategy_exits(pair_exits, risk, current, ws_monitor)
                 except Exception as e:
                     logger.error(f"[async] KalmanPairs exit check failed: {e}")
 
                 try:
                     micro_exits = micro_mom.check_exits(risk.open_trades, current)
                     if micro_exits:
-                        _handle_strategy_exits(micro_exits, risk, current, ws_monitor)
+                        handle_strategy_exits(micro_exits, risk, current, ws_monitor)
                 except Exception as e:
                     logger.error(f"[async] MicroMom exit check failed: {e}")
 
@@ -1736,7 +986,7 @@ async def _async_exit_checker(
                 if beta_neutral.should_check_now(current):
                     if not beta_neutral.should_skip(current):
                         try:
-                            prices = _get_current_prices(risk.open_trades)
+                            prices = get_current_prices(risk.open_trades)
                             beta_neutral.compute_portfolio_beta(risk.open_trades, prices)
                             if beta_neutral.needs_hedge():
                                 spy_price = prices.get("SPY")
@@ -2005,7 +1255,7 @@ async def async_main():
     if config.WEBSOCKET_MONITORING and PositionMonitor:
         ws_monitor = PositionMonitor(risk)
         ws_monitor.set_close_callback(
-            lambda symbol, reason: _handle_ws_close(symbol, reason, risk, ws_monitor)
+            lambda symbol, reason: handle_ws_close(symbol, reason, risk, ws_monitor)
         )
         for symbol in risk.open_trades:
             ws_monitor.subscribe(symbol)
@@ -2142,8 +1392,8 @@ def run_diagnostic():
         print(f"  Correlation cache: {e}")
 
     # Detect regime
-    from strategies.regime import detect_regime
-    regime = detect_regime(now)
+    regime_detector = MarketRegime()
+    regime = regime_detector.update(now)
     print(f"Market regime: {regime}\n")
 
     # Track rejections

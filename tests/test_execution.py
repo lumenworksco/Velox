@@ -102,48 +102,10 @@ class TestClosePartialPosition:
 
 
 class TestMaxHoldChecks:
-    def test_sector_max_hold(self, mock_trading_client):
-        """check_sector_max_hold returns expired sector trades."""
-        with patch("execution.get_trading_client", return_value=mock_trading_client):
-            from execution import check_sector_max_hold
-
-            now = datetime(2026, 3, 23, 10, 0, tzinfo=ET)
-            trade = _make_trade(
-                symbol="XLK", strategy="SECTOR_ROTATION",
-                entry_time=datetime(2026, 3, 10, 10, 0, tzinfo=ET),
-            )
-            trade.max_hold_date = datetime(2026, 3, 20, 10, 0, tzinfo=ET)
-
-            expired = check_sector_max_hold({"XLK": trade}, now)
-            assert "XLK" in expired
-
-    def test_sector_max_hold_not_expired(self, mock_trading_client):
-        """check_sector_max_hold skips non-expired trades."""
-        with patch("execution.get_trading_client", return_value=mock_trading_client):
-            from execution import check_sector_max_hold
-
-            now = datetime(2026, 3, 15, 10, 0, tzinfo=ET)
-            trade = _make_trade(symbol="XLK", strategy="SECTOR_ROTATION")
-            trade.max_hold_date = datetime(2026, 3, 20, 10, 0, tzinfo=ET)
-
-            expired = check_sector_max_hold({"XLK": trade}, now)
-            assert expired == []
-
-    def test_pairs_max_hold(self, mock_trading_client):
-        """check_pairs_max_hold returns expired pairs trades."""
-        with patch("execution.get_trading_client", return_value=mock_trading_client):
-            from execution import check_pairs_max_hold
-
-            now = datetime(2026, 3, 30, 10, 0, tzinfo=ET)
-            trade = _make_trade(
-                symbol="AAPL", strategy="PAIRS",
-                pair_id="pair-001",
-                entry_time=datetime(2026, 3, 10, 10, 0, tzinfo=ET),
-            )
-            trade.max_hold_date = datetime(2026, 3, 25, 10, 0, tzinfo=ET)
-
-            expired = check_pairs_max_hold({"AAPL": trade}, now)
-            assert "AAPL" in expired
+    # V10: Removed tests for deleted legacy functions:
+    # - test_sector_max_hold (SECTOR_ROTATION strategy removed)
+    # - test_sector_max_hold_not_expired
+    # - test_pairs_max_hold (legacy PAIRS strategy replaced by KALMAN_PAIRS)
 
     def test_orb_close(self, mock_trading_client):
         """close_orb_positions closes ORB trades only."""

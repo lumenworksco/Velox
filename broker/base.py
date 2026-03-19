@@ -1,13 +1,15 @@
-"""V8: Abstract broker interface.
+"""V10: Abstract broker interface.
 
-Abstracts the broker behind a common interface so paper trading can have
-realistic slippage modeling and future broker swaps are easy.
+Abstracts the broker behind a common interface for multi-broker support:
+- Alpaca (current, via data.py + execution.py)
+- Paper/Simulated (broker/paper_broker.py)
+- Interactive Brokers (future, Phase 5)
 """
 
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +22,8 @@ class OrderResult:
     filled_price: float = 0.0
     filled_qty: int = 0
     message: str = ""
+    submitted_at: datetime | None = None
+    filled_at: datetime | None = None
 
 
 @dataclass
@@ -28,6 +32,8 @@ class AccountInfo:
     equity: float = 0.0
     cash: float = 0.0
     buying_power: float = 0.0
+    day_trade_count: int = 0
+    pattern_day_trader: bool = False
 
 
 @dataclass
@@ -35,9 +41,21 @@ class Position:
     """Open position info."""
     symbol: str = ""
     qty: int = 0
+    avg_entry_price: float = 0.0
     market_value: float = 0.0
     unrealized_pl: float = 0.0
     side: str = "long"
+
+
+@dataclass
+class Snapshot:
+    """Market data snapshot for a symbol."""
+    symbol: str = ""
+    last_price: float = 0.0
+    bid: float = 0.0
+    ask: float = 0.0
+    volume: int = 0
+    timestamp: datetime | None = None
 
 
 class Broker(ABC):
@@ -82,3 +100,20 @@ class Broker(ABC):
     def close_all_positions(self) -> list[OrderResult]:
         """Close all open positions."""
         ...
+
+    def get_snapshot(self, symbol: str) -> Snapshot | None:
+        """Get a market data snapshot. Optional."""
+        return None
+
+    def get_filled_exit_info(self, symbol: str, side: str = "buy") -> tuple[float | None, str]:
+        """Get fill price and reason for a recently closed position. Optional."""
+        return None, ""
+
+    @property
+    def name(self) -> str:
+        return self.__class__.__name__
+
+
+class BrokerError(Exception):
+    """Error from broker operations."""
+    pass

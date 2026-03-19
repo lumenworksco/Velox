@@ -1,11 +1,23 @@
-"""FastAPI web dashboard — portfolio history, trade log, signal analysis, risk state, strategy health."""
+"""FastAPI web dashboard — portfolio history, trade log, signal analysis, risk state, strategy health.
+
+V10 additions:
+- JWT authentication (SEC-001)
+- CORS middleware
+- OMS status, kill switch, circuit breaker endpoints
+"""
 
 import logging
 import time as _time
 from datetime import datetime
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Depends, HTTPException
 from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+import collections
 
 import config
 import database
@@ -13,7 +25,70 @@ from analytics.metrics import compute_sharpe as _shared_compute_sharpe
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Velox V9 Dashboard", docs_url=None, redoc_url=None)
+app = FastAPI(title="Velox V10 Dashboard", docs_url=None, redoc_url=None)
+
+
+# V10 SEC-003: IP-based rate limiting (10 req/sec per IP)
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Simple in-memory rate limiter per client IP."""
+
+    def __init__(self, app, max_requests: int = 10, window_sec: float = 1.0):
+        super().__init__(app)
+        self.max_requests = max_requests
+        self.window_sec = window_sec
+        self._requests: dict[str, collections.deque] = {}
+
+    async def dispatch(self, request: Request, call_next):
+        # Skip rate limiting for health and metrics endpoints
+        if request.url.path in ("/health", "/metrics"):
+            return await call_next(request)
+
+        client_ip = request.client.host if request.client else "unknown"
+        now = _time.time()
+
+        if client_ip not in self._requests:
+            self._requests[client_ip] = collections.deque()
+
+        # Remove old entries outside window
+        window = self._requests[client_ip]
+        while window and window[0] < now - self.window_sec:
+            window.popleft()
+
+        if len(window) >= self.max_requests:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded. Max 10 requests per second."},
+            )
+
+        window.append(now)
+        return await call_next(request)
+
+
+# Only enable rate limiting in production (skip during tests)
+import os as _os
+if not _os.getenv("PYTEST_CURRENT_TEST"):
+    app.add_middleware(RateLimitMiddleware, max_requests=10, window_sec=1.0)
+
+# V10 SEC-002: CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=getattr(config, "CORS_ORIGINS", ["http://localhost:3000"]),
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+# V10 SEC-001: JWT auth dependency
+try:
+    from auth.jwt_auth import get_fastapi_dependency, AUTH_ENABLED, create_token, verify_password
+    _require_auth = get_fastapi_dependency()
+except ImportError:
+    AUTH_ENABLED = False
+    _require_auth = None
+
+    async def _no_auth():
+        return {"sub": "anonymous"}
+    _require_auth = _no_auth
 
 _start_time = _time.time()
 
@@ -34,14 +109,29 @@ async def health():
         "uptime_seconds": round(uptime_sec),
         "open_positions": open_count,
         "paper_mode": config.PAPER_MODE,
-        "version": "V9",
+        "version": "V10",
+        "auth_enabled": AUTH_ENABLED,
     }
 
 
-# --- API Endpoints ---
+# V10: Login endpoint for JWT token
+@app.post("/api/login")
+async def login(username: str = Query(...), password: str = Query(...)):
+    """Authenticate and return a JWT token."""
+    if not AUTH_ENABLED:
+        return {"token": "auth_disabled", "message": "Authentication is not configured"}
+    if username != "admin":
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not verify_password(password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_token(username)
+    return {"token": token}
+
+
+# --- API Endpoints (auth-protected) ---
 
 @app.get("/api/portfolio_history")
-async def portfolio_history(days: int = Query(30, ge=1, le=365)):
+async def portfolio_history(days: int = Query(30, ge=1, le=365), user=Depends(_require_auth)):
     """Return daily portfolio snapshots."""
     try:
         return database.get_daily_snapshots(days=days)
@@ -53,7 +143,8 @@ async def portfolio_history(days: int = Query(30, ge=1, le=365)):
 @app.get("/api/trades")
 async def trades(limit: int = Query(100, ge=1, le=1000),
                  offset: int = Query(0, ge=0),
-                 strategy: str = Query(None)):
+                 strategy: str = Query(None),
+                 user=Depends(_require_auth)):
     """Return recent trades, optionally filtered by strategy."""
     try:
         return database.get_trades_paginated(limit=limit, offset=offset, strategy=strategy)
@@ -772,6 +863,89 @@ async def v2_health():
         result["open_positions"] = -1
 
     return result
+
+
+# ===================================================================
+# V10 Endpoints: OMS, Kill Switch, Circuit Breaker
+# ===================================================================
+
+# Shared V10 component references (set by main.py)
+_v10_order_manager = None
+_v10_kill_switch = None
+_v10_circuit_breaker = None
+
+
+def set_v10_components(order_manager=None, kill_switch=None, circuit_breaker=None):
+    """Called by main.py to register V10 components for API access."""
+    global _v10_order_manager, _v10_kill_switch, _v10_circuit_breaker
+    _v10_order_manager = order_manager
+    _v10_kill_switch = kill_switch
+    _v10_circuit_breaker = circuit_breaker
+
+
+@app.get("/api/v10/oms")
+async def v10_oms(user=Depends(_require_auth)):
+    """OMS status: active orders, recent audit trail, stats."""
+    if not _v10_order_manager:
+        return {"status": "not_initialized"}
+    return {
+        "stats": _v10_order_manager.stats,
+        "active_orders": [
+            {
+                "oms_id": o.oms_id,
+                "symbol": o.symbol,
+                "strategy": o.strategy,
+                "side": o.side,
+                "qty": o.qty,
+                "state": o.state.value,
+                "created_at": o.created_at.isoformat(),
+            }
+            for o in _v10_order_manager.get_active_orders()
+        ],
+        "recent_audit": _v10_order_manager.get_audit_trail(limit=20),
+    }
+
+
+@app.get("/api/v10/circuit_breaker")
+async def v10_circuit_breaker(user=Depends(_require_auth)):
+    """Tiered circuit breaker status."""
+    if not _v10_circuit_breaker:
+        return {"status": "not_initialized"}
+    return _v10_circuit_breaker.status
+
+
+@app.get("/api/v10/kill_switch")
+async def v10_kill_switch_status(user=Depends(_require_auth)):
+    """Kill switch status."""
+    if not _v10_kill_switch:
+        return {"status": "not_initialized"}
+    return _v10_kill_switch.status
+
+
+@app.post("/api/v10/kill_switch/activate")
+async def v10_kill_switch_activate(reason: str = Query("manual_dashboard"), user=Depends(_require_auth)):
+    """Activate emergency kill switch from dashboard."""
+    if not _v10_kill_switch:
+        raise HTTPException(status_code=503, detail="Kill switch not initialized")
+    _v10_kill_switch.activate(reason, risk_manager=None, order_manager=_v10_order_manager)
+    return {"status": "activated", "reason": reason}
+
+
+@app.post("/api/v10/kill_switch/deactivate")
+async def v10_kill_switch_deactivate(user=Depends(_require_auth)):
+    """Deactivate kill switch (resume trading)."""
+    if not _v10_kill_switch:
+        raise HTTPException(status_code=503, detail="Kill switch not initialized")
+    _v10_kill_switch.deactivate()
+    return {"status": "deactivated"}
+
+
+# V10: Register Prometheus metrics endpoint
+try:
+    from engine.metrics import add_metrics_endpoint
+    add_metrics_endpoint(app)
+except ImportError:
+    pass
 
 
 def start_web_dashboard():

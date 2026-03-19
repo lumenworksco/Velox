@@ -155,14 +155,15 @@ class MarketRegime:
         try:
             df = get_daily_bars("SPY", days=config.REGIME_EMA_PERIOD + 5)
             if df.empty or len(df) < config.REGIME_EMA_PERIOD:
-                logger.warning("Not enough SPY data for regime check, defaulting to BULLISH")
-                self.regime = "BULLISH"
+                # V10 BUG-018: Default to UNKNOWN (conservative) instead of BULLISH
+                logger.warning("Not enough SPY data for regime check, defaulting to UNKNOWN")
+                self.regime = "UNKNOWN"
                 self.last_check = now
                 return self.regime
 
             ema = ta.ema(df["close"], length=config.REGIME_EMA_PERIOD)
             if ema is None or ema.empty:
-                self.regime = "BULLISH"
+                self.regime = "UNKNOWN"
                 self.last_check = now
                 return self.regime
 
@@ -175,8 +176,7 @@ class MarketRegime:
 
         except Exception as e:
             logger.error(f"Regime check failed: {e}")
-            if self.regime == "UNKNOWN":
-                self.regime = "BULLISH"
+            # V10: Keep UNKNOWN on exception (don't default to BULLISH)
 
         return self.regime
 

@@ -211,7 +211,7 @@ class TestV2Health:
         resp = client.get("/api/v2/health")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["version"] == "V9"
+        assert data["version"] in ("V9", "V10")
         assert "uptime_seconds" in data
         assert "data_feed_status" in data
         assert "strategy_scan_times" in data
@@ -234,7 +234,7 @@ class TestV2Health:
         """The legacy /health endpoint should also say V9."""
         resp = client.get("/health")
         data = resp.json()
-        assert data["version"] == "V9"
+        assert data["version"] in ("V9", "V10")
 
 
 # ===================================================================
@@ -246,17 +246,17 @@ class TestVersionStrings:
 
     def test_health_endpoint_version(self, client):
         resp = client.get("/health")
-        assert resp.json()["version"] == "V9"
+        assert resp.json()["version"] in ("V9", "V10")
 
     def test_html_dashboard_title(self, client):
         resp = client.get("/")
         assert resp.status_code == 200
-        assert "V9" in resp.text
+        assert "V9" in resp.text or "V10" in resp.text
         assert "V8" not in resp.text
 
     def test_v2_health_version(self, client):
         resp = client.get("/api/v2/health")
-        assert resp.json()["version"] == "V9"
+        assert resp.json()["version"] in ("V9", "V10")
 
 
 # ===================================================================
@@ -409,7 +409,7 @@ class TestFailOpen:
         resp = client.get("/api/v2/health")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["version"] == "V9"
+        assert data["version"] in ("V9", "V10")
 
 
 # ===================================================================

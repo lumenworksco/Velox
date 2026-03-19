@@ -74,8 +74,8 @@ class IntradayMicroMomentum:
             volume = bars["volume"]
             close = bars["close"]
 
-            # Volume spike check
-            avg_vol = volume.rolling(20).mean().iloc[-1]
+            # V10 BUG-032: Exclude current bar from rolling average to avoid self-inflation
+            avg_vol = volume.iloc[:-1].rolling(20).mean().iloc[-1]
             if avg_vol <= 0:
                 return False
 

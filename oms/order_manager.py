@@ -1,0 +1,152 @@
+"""V10 OMS — Central order registry and lifecycle manager."""
+
+import logging
+import threading
+from datetime import datetime
+
+from oms.order import Order, OrderState
+
+logger = logging.getLogger(__name__)
+
+
+class OrderManager:
+    """Central registry for all orders. Thread-safe.
+
+    Provides:
+    - Order creation with idempotency keys (prevents duplicate orders)
+    - Order state tracking through full lifecycle
+    - Active/historical order queries
+    - Audit trail of all state transitions
+    """
+
+    def __init__(self):
+        self._orders: dict[str, Order] = {}       # oms_id -> Order
+        self._by_broker_id: dict[str, str] = {}   # broker_order_id -> oms_id
+        self._by_symbol: dict[str, list[str]] = {} # symbol -> [oms_id, ...]
+        self._idempotency: dict[str, str] = {}    # idempotency_key -> oms_id
+        self._lock = threading.Lock()
+        self._audit: list[dict] = []               # State transition log
+
+    def create_order(self, symbol: str, strategy: str, side: str,
+                     order_type: str, qty: int, limit_price: float = 0.0,
+                     take_profit: float = 0.0, stop_loss: float = 0.0,
+                     pair_id: str = "", idempotency_key: str = "") -> Order:
+        """Create and register a new order."""
+        with self._lock:
+            # Check idempotency
+            if idempotency_key and idempotency_key in self._idempotency:
+                existing_id = self._idempotency[idempotency_key]
+                logger.info(f"Duplicate order blocked (idempotency_key={idempotency_key})")
+                return self._orders[existing_id]
+
+            order = Order(
+                symbol=symbol,
+                strategy=strategy,
+                side=side,
+                order_type=order_type,
+                qty=qty,
+                limit_price=limit_price,
+                take_profit=take_profit,
+                stop_loss=stop_loss,
+                pair_id=pair_id,
+                idempotency_key=idempotency_key,
+            )
+
+            self._orders[order.oms_id] = order
+            self._by_symbol.setdefault(symbol, []).append(order.oms_id)
+            if idempotency_key:
+                self._idempotency[idempotency_key] = order.oms_id
+
+            self._log_transition(order, None, OrderState.PENDING)
+            logger.info(f"OMS: Created order {order.oms_id} {side} {qty} {symbol} ({strategy})")
+            return order
+
+    def update_state(self, oms_id: str, new_state: OrderState,
+                     broker_order_id: str = "", filled_qty: int = 0,
+                     filled_avg_price: float = 0.0) -> bool:
+        """Update order state. Returns True if transition was valid."""
+        with self._lock:
+            order = self._orders.get(oms_id)
+            if not order:
+                logger.warning(f"OMS: Unknown order {oms_id}")
+                return False
+
+            old_state = order.state
+            if not order.transition(new_state):
+                return False
+
+            if broker_order_id:
+                order.broker_order_id = broker_order_id
+                self._by_broker_id[broker_order_id] = oms_id
+            if filled_qty:
+                order.filled_qty = filled_qty
+            if filled_avg_price:
+                order.filled_avg_price = filled_avg_price
+
+            self._log_transition(order, old_state, new_state)
+            return True
+
+    def get_order(self, oms_id: str) -> Order | None:
+        """Get order by OMS ID."""
+        return self._orders.get(oms_id)
+
+    def get_by_broker_id(self, broker_order_id: str) -> Order | None:
+        """Get order by broker order ID."""
+        oms_id = self._by_broker_id.get(broker_order_id)
+        return self._orders.get(oms_id) if oms_id else None
+
+    def get_active_orders(self, symbol: str = None) -> list[Order]:
+        """Get all active (non-terminal) orders, optionally filtered by symbol."""
+        with self._lock:
+            if symbol:
+                oms_ids = self._by_symbol.get(symbol, [])
+                return [self._orders[oid] for oid in oms_ids if self._orders[oid].is_active]
+            return [o for o in self._orders.values() if o.is_active]
+
+    def get_all_orders(self, limit: int = 100) -> list[Order]:
+        """Get most recent orders."""
+        orders = sorted(self._orders.values(), key=lambda o: o.created_at, reverse=True)
+        return orders[:limit]
+
+    def cancel_all(self) -> list[str]:
+        """Cancel all active orders. Returns list of cancelled OMS IDs."""
+        cancelled = []
+        with self._lock:
+            for order in list(self._orders.values()):
+                if order.is_active:
+                    old_state = order.state
+                    if order.transition(OrderState.CANCELLED):
+                        self._log_transition(order, old_state, OrderState.CANCELLED)
+                        cancelled.append(order.oms_id)
+        return cancelled
+
+    def _log_transition(self, order: Order, old_state: OrderState | None, new_state: OrderState):
+        """Log a state transition for audit trail."""
+        self._audit.append({
+            "timestamp": datetime.now().isoformat(),
+            "oms_id": order.oms_id,
+            "symbol": order.symbol,
+            "strategy": order.strategy,
+            "old_state": old_state.value if old_state else "NEW",
+            "new_state": new_state.value,
+        })
+
+    def get_audit_trail(self, limit: int = 50) -> list[dict]:
+        """Get recent audit trail entries."""
+        return self._audit[-limit:]
+
+    @property
+    def stats(self) -> dict:
+        """Get OMS statistics."""
+        with self._lock:
+            active = sum(1 for o in self._orders.values() if o.is_active)
+            filled = sum(1 for o in self._orders.values() if o.state == OrderState.FILLED)
+            cancelled = sum(1 for o in self._orders.values() if o.state == OrderState.CANCELLED)
+            rejected = sum(1 for o in self._orders.values() if o.state == OrderState.REJECTED)
+            return {
+                "total": len(self._orders),
+                "active": active,
+                "filled": filled,
+                "cancelled": cancelled,
+                "rejected": rejected,
+            }

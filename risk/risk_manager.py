@@ -77,7 +77,8 @@ class TradeRecord:
     max_hold_date: datetime | None = None  # V2: for momentum max hold
     pair_id: str = ""                # V4: links two legs of a pairs trade
     partial_exits: int = 0           # V4: count of partial exits taken
-    highest_price_seen: float = 0.0  # V4: for trailing stop tracking
+    highest_price_seen: float = 0.0  # V4: for trailing stop tracking (longs)
+    lowest_price_seen: float = 0.0   # V10: for trailing stop tracking (shorts)
     entry_atr: float = 0.0           # V4: ATR at time of entry
 
 
@@ -309,9 +310,15 @@ class RiskManager:
             return
 
         trade = self.open_trades[symbol]
+
+        # V10 BUG-002: Clamp and assert cumulative closes never exceed original qty
         qty_to_close = min(qty_to_close, trade.qty)
         if qty_to_close <= 0:
+            logger.warning(f"Partial close {symbol}: qty_to_close={qty_to_close} <= 0, skipping")
             return
+        assert qty_to_close <= trade.qty, (
+            f"Partial close {symbol}: qty_to_close={qty_to_close} > remaining={trade.qty}"
+        )
 
         # Calculate P&L on closed portion
         if trade.side == "buy":
@@ -414,6 +421,7 @@ class RiskManager:
                     pair_id=row.get("pair_id", ""),
                     partial_exits=int(row.get("partial_exits", 0)),
                     highest_price_seen=float(row.get("highest_price_seen", 0.0)),
+                    lowest_price_seen=float(row.get("lowest_price_seen", 0.0)),
                     entry_atr=float(row.get("entry_atr", 0.0)),
                 )
             logger.info(f"Restored {len(self.open_trades)} open trades from database")

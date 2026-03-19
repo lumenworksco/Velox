@@ -62,7 +62,8 @@ class TestRecordOpeningRange:
         assert orb["low"] == 99.0
         assert orb["valid"] == True
         assert orb["established"] == True
-        assert orb["range_pct"] == pytest.approx((101.5 - 99.0) / 100.25, rel=0.01)
+        # V10 BUG-033: range_pct now uses orb_low as divisor (standard)
+        assert orb["range_pct"] == pytest.approx((101.5 - 99.0) / 99.0, rel=0.01)
 
     @patch("strategies.orb_v2.get_snapshot")
     def test_record_opening_range_gap_filter(self, mock_snap):

@@ -188,7 +188,7 @@ class StatMeanReversion:
 
                 # === LONG entry: price below mean ===
                 # In BEARISH regime, require deeper z-score (stronger mean reversion signal)
-                mr_entry_z = config.MR_ZSCORE_ENTRY if regime != "BEARISH" else config.MR_ZSCORE_ENTRY * 1.5
+                mr_entry_z = config.MR_ZSCORE_ENTRY if regime != "BEARISH" else config.MR_ZSCORE_ENTRY * 1.2
                 if (zscore < -mr_entry_z
                         and rsi < config.MR_RSI_OVERSOLD
                         and price < vwap):
@@ -295,8 +295,9 @@ class StatMeanReversion:
 
                 # Time stop: 2x half_life
                 if hasattr(trade, 'entry_time') and trade.entry_time:
-                    # half_life is in bar units (daily); convert to minutes for intraday
-                    half_life_minutes = ou['half_life'] * 2 * 60  # 2x half-life in minutes
+                    # V10: half_life is in bar units; convert to trading minutes
+                    # A trading day = 390 minutes (6.5 hours), so 1 daily bar = 390 min
+                    half_life_minutes = ou['half_life'] * 2 * 390  # 2x half-life in minutes
                     max_hold = max(30, min(half_life_minutes, 240))  # 30 min to 4 hours
                     elapsed = (now - trade.entry_time).total_seconds() / 60
                     if elapsed > max_hold:
@@ -308,14 +309,15 @@ class StatMeanReversion:
                         continue
 
                 if trade.side == "buy":
-                    # Long: entered at negative z-score, want z to revert toward 0
+                    # Long: entered at negative z-score, want z to revert toward 0 and beyond
                     if -config.MR_ZSCORE_EXIT_FULL <= zscore <= config.MR_ZSCORE_EXIT_FULL:
                         exits.append({
                             "symbol": symbol,
                             "action": "full",
                             "reason": f"MR reverted z={zscore:.2f}",
                         })
-                    elif zscore >= -config.MR_ZSCORE_EXIT_PARTIAL:
+                    elif zscore >= config.MR_ZSCORE_EXIT_PARTIAL:
+                        # V10: partial when z crosses ABOVE +partial threshold (mean overshoot)
                         exits.append({
                             "symbol": symbol,
                             "action": "partial",
@@ -329,14 +331,15 @@ class StatMeanReversion:
                         })
 
                 elif trade.side == "sell":
-                    # Short: entered at positive z-score, want z to revert toward 0
+                    # Short: entered at positive z-score, want z to revert toward 0 and beyond
                     if -config.MR_ZSCORE_EXIT_FULL <= zscore <= config.MR_ZSCORE_EXIT_FULL:
                         exits.append({
                             "symbol": symbol,
                             "action": "full",
                             "reason": f"MR reverted z={zscore:.2f}",
                         })
-                    elif zscore <= config.MR_ZSCORE_EXIT_PARTIAL:
+                    elif zscore <= -config.MR_ZSCORE_EXIT_PARTIAL:
+                        # V10: partial when z crosses BELOW -partial threshold (mean overshoot)
                         exits.append({
                             "symbol": symbol,
                             "action": "partial",
@@ -355,9 +358,18 @@ class StatMeanReversion:
         return exits
 
     def _compute_rsi(self, close: pd.Series, period: int = 7) -> float | None:
-        """Compute RSI over the given period."""
+        """Compute RSI using pandas_ta (V10: replaced hand-rolled version)."""
         if len(close) < period + 1:
             return None
+        try:
+            import pandas_ta as ta
+            rsi_series = ta.rsi(close, length=period)
+            if rsi_series is not None and len(rsi_series) > 0:
+                val = rsi_series.iloc[-1]
+                return float(val) if not pd.isna(val) else None
+        except Exception:
+            pass
+        # Fallback: hand-rolled RSI if pandas_ta fails
         delta = close.diff()
         gain = delta.where(delta > 0, 0.0).rolling(period).mean()
         loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()

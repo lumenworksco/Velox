@@ -15,6 +15,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.par
 def _make_trade(symbol="AAPL", strategy="STAT_MR", side="buy",
                 entry_price=100.0, qty=10, take_profit=105.0,
                 stop_loss=95.0, entry_atr=2.0, highest_price_seen=0.0,
+                lowest_price_seen=0.0,
                 partial_exits=0, hold_type="day", pair_id="",
                 entry_time=None, status="open", pnl=0.0,
                 exit_price=None, exit_reason=""):
@@ -24,6 +25,7 @@ def _make_trade(symbol="AAPL", strategy="STAT_MR", side="buy",
         entry_price=entry_price, qty=qty, take_profit=take_profit,
         stop_loss=stop_loss, entry_atr=entry_atr,
         highest_price_seen=highest_price_seen or entry_price,
+        lowest_price_seen=lowest_price_seen,
         partial_exits=partial_exits, hold_type=hold_type, pair_id=pair_id,
         entry_time=entry_time or datetime(2026, 3, 13, 10, 5, tzinfo=ET),
         status=status, pnl=pnl, exit_price=exit_price, exit_reason=exit_reason,
@@ -109,7 +111,7 @@ class TestATRTrailingStop:
 
         # Entry=100, ATR=2, lowest=95, trail = 95 + (2*1.5) = 98
         trade = _make_trade(side="sell", entry_price=100.0, entry_atr=2.0,
-                          highest_price_seen=95.0, stop_loss=105.0)
+                          lowest_price_seen=95.0, stop_loss=105.0)
 
         with override_config(ATR_TRAILING_ENABLED=True,
                            ATR_TRAIL_MULT={"STAT_MR": 1.5},

@@ -137,16 +137,16 @@ class TestMarketRegimeUpdate:
 
         assert mock_fetch.call_count == 2
 
-    def test_returns_bullish_on_empty_dataframe(self):
-        """Empty DataFrame falls back to BULLISH (safe default)."""
+    def test_returns_unknown_on_empty_dataframe(self):
+        """V10: Empty DataFrame falls back to UNKNOWN (conservative default)."""
         with patch("strategies.regime.get_daily_bars", return_value=pd.DataFrame()):
             regime = _make_regime()
             result = regime.update(datetime(2026, 3, 15, 10, 0, tzinfo=ET))
 
-        assert result == "BULLISH"
+        assert result == "UNKNOWN"
 
-    def test_returns_bullish_on_insufficient_bars(self):
-        """Fewer bars than EMA period falls back to BULLISH."""
+    def test_returns_unknown_on_insufficient_bars(self):
+        """V10: Fewer bars than EMA period falls back to UNKNOWN."""
         # Only 5 bars, but EMA period is 20
         df = _make_spy_bars(5, [500.0] * 5)
 
@@ -154,15 +154,15 @@ class TestMarketRegimeUpdate:
             regime = _make_regime()
             result = regime.update(datetime(2026, 3, 15, 10, 0, tzinfo=ET))
 
-        assert result == "BULLISH"
+        assert result == "UNKNOWN"
 
-    def test_returns_bullish_on_data_fetch_exception(self):
-        """If get_daily_bars raises, the regime defaults to BULLISH (unknown → bullish)."""
+    def test_returns_unknown_on_data_fetch_exception(self):
+        """V10: If get_daily_bars raises, regime stays UNKNOWN (conservative)."""
         with patch("strategies.regime.get_daily_bars", side_effect=RuntimeError("network error")):
             regime = _make_regime()
             result = regime.update(datetime(2026, 3, 15, 10, 0, tzinfo=ET))
 
-        assert result == "BULLISH"
+        assert result == "UNKNOWN"
 
     def test_preserves_previous_regime_on_exception(self):
         """If regime was previously set and then an error occurs, it is preserved."""

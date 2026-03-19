@@ -65,11 +65,12 @@ class ExitManager:
         if current_price <= 0:
             return None
 
-        # Update highest price seen (for trailing stops)
+        # Update price extremes for trailing stops
         if trade.side == "buy" and current_price > trade.highest_price_seen:
             trade.highest_price_seen = current_price
-        elif trade.side == "sell" and (trade.highest_price_seen == 0 or current_price < trade.highest_price_seen):
-            trade.highest_price_seen = current_price
+        elif trade.side == "sell":
+            if trade.lowest_price_seen == 0 or current_price < trade.lowest_price_seen:
+                trade.lowest_price_seen = current_price
 
         # Calculate current P&L
         if trade.side == "buy":
@@ -171,8 +172,8 @@ class ExitManager:
                     return {"symbol": trade.symbol, "action": "trailing_stop", "qty": trade.qty}
 
         elif trade.side == "sell":
-            if trade.highest_price_seen > 0 and trade.highest_price_seen < trade.entry_price:
-                trailing_stop = trade.highest_price_seen * (1 + config.TRAILING_STOP_PCT)
+            if trade.lowest_price_seen > 0 and trade.lowest_price_seen < trade.entry_price:
+                trailing_stop = trade.lowest_price_seen * (1 + config.TRAILING_STOP_PCT)
                 if trailing_stop < trade.stop_loss:
                     trade.stop_loss = trailing_stop
 
@@ -218,8 +219,10 @@ class ExitManager:
             if current_price > trade.entry_price - activation_distance:
                 return None
 
-            # For shorts, highest_price_seen tracks the LOWEST price
-            atr_trail_stop = trade.highest_price_seen + trail_distance
+            # For shorts, use lowest_price_seen as reference
+            if trade.lowest_price_seen <= 0:
+                return None
+            atr_trail_stop = trade.lowest_price_seen + trail_distance
 
             # Only ratchet down (for shorts), must be better (lower) than current SL
             if atr_trail_stop < trade.stop_loss:
@@ -295,11 +298,12 @@ class ExitManager:
         risk_manager.partial_close(symbol, qty, price, now, reason)
 
     def update_highest_prices(self, risk_manager, quotes: dict):
-        """Update highest_price_seen from live quote data (called by WebSocket handler)."""
+        """Update price extremes from live quote data (called by WebSocket handler)."""
         for symbol, price in quotes.items():
             if symbol in risk_manager.open_trades:
                 trade = risk_manager.open_trades[symbol]
                 if trade.side == "buy" and price > trade.highest_price_seen:
                     trade.highest_price_seen = price
-                elif trade.side == "sell" and (trade.highest_price_seen == 0 or price < trade.highest_price_seen):
-                    trade.highest_price_seen = price
+                elif trade.side == "sell":
+                    if trade.lowest_price_seen == 0 or price < trade.lowest_price_seen:
+                        trade.lowest_price_seen = price

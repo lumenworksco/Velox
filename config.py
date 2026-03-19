@@ -161,7 +161,7 @@ VWAP_MAX_SPREAD_PCT  = 0.001      # Skip if bid-ask spread > 0.1%
 VWAP_VOLUME_RATIO    = 0.8        # Volume ratio vs 20-bar average
 MAX_INTRADAY_MOVE_PCT = 0.03      # Skip if stock moved > 3% today
 VWAP_BAND_STD        = 2.0        # Standard deviation multiplier for VWAP bands
-VWAP_RSI_OVERSOLD    = 30         # RSI below this = oversold (buy signal)
+VWAP_RSI_OVERSOLD    = 40         # RSI below this = oversold (buy signal, was 30)
 VWAP_RSI_OVERBOUGHT  = 70         # RSI above this = overbought (short signal)
 VWAP_CONFIRMATION_BARS = 1        # Bars confirming bounce (1 = disabled)
 VWAP_STOP_EXTENSION  = 0.5        # Stop extension beyond band (in std devs)
@@ -177,6 +177,8 @@ PAIRS_MIN_CORRELATION = 0.80
 PAIRS_COINT_PVALUE = 0.05
 KALMAN_DELTA = 1e-4
 KALMAN_OBS_NOISE = 0.001
+PAIRS_TP_PCT = 0.015   # V10: 1.5% take-profit (was 0.5% — negative EV after costs)
+PAIRS_SL_PCT = 0.010   # V10: 1.0% stop-loss (was 1.5% — gives 1.5:1 R/R)
 
 # --- Opening Range Breakout ---
 ORB_ENABLED          = True
@@ -192,8 +194,8 @@ ORB_SL_MULT          = 0.5        # Stop loss = entry ∓ 0.5x ORB range
 ORB_TIME_STOP_HOURS  = 2          # Close after 2 hours
 
 # --- Micro Momentum ---
-MICRO_SPY_VOL_SPIKE_MULT = 3.0
-MICRO_SPY_MIN_MOVE_PCT = 0.0015
+MICRO_SPY_VOL_SPIKE_MULT = 2.0     # Was 3.0 — detect more events
+MICRO_SPY_MIN_MOVE_PCT = 0.001     # Was 0.0015 — 0.1% SPY move triggers event
 MICRO_MAX_HOLD_MINUTES = 15          # Was 8 — give trades room to work
 MICRO_STOP_PCT = 0.01                # Was 0.003 — 1% stop survives noise on beta=2 stocks
 MICRO_TARGET_PCT = 0.02              # Was 0.006 — 2% target keeps 2:1 R/R
@@ -294,7 +296,8 @@ NO_SHORT_SYMBOLS = {"SPY", "QQQ", "IWM", "DIA"}
 # --- Dynamic Capital Allocation ---
 DYNAMIC_ALLOCATION = os.getenv("DYNAMIC_ALLOCATION", "true") == "true"
 ALLOCATION_LOOKBACK_DAYS = 20      # Rolling window for Sharpe-based allocation
-ALLOCATION_MIN_WEIGHT = 0.10       # Min 10% per strategy
+# V10 CONFIG-002: Removed legacy 10% minimum (conflicted with ADAPTIVE_MIN_WEIGHT 3%)
+ALLOCATION_MIN_WEIGHT = 0.03  # Aligned with ADAPTIVE_MIN_WEIGHT
 
 # --- Adaptive Strategy Allocation ---
 ADAPTIVE_ALLOCATION_ENABLED = True
@@ -519,12 +522,17 @@ NEWS_LOOKBACK_HOURS = 6
 # RUNTIME PARAMETERS
 # ============================================================
 
+import threading as _threading
+
 _runtime_params: dict = {}
+_runtime_lock = _threading.Lock()  # V10 CONFIG-001: Thread-safe access
 
 def get_param(key: str, default=None):
     """Get a runtime parameter (optimizer-modified or config default)."""
-    return _runtime_params.get(key, default)
+    with _runtime_lock:
+        return _runtime_params.get(key, default)
 
 def set_param(key: str, value):
     """Set a runtime parameter (used by optimizer)."""
-    _runtime_params[key] = value
+    with _runtime_lock:
+        _runtime_params[key] = value

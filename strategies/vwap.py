@@ -77,15 +77,15 @@ class VWAPStrategy:
                 rsi = rsi_series.iloc[-1]
 
                 # OU z-score confirmation on intraday bars
-                ou_zscore = 0.0
+                # V10 BUG-011: Use None instead of 0.0 to distinguish fit failure from neutral z
+                ou_zscore = None
                 try:
                     close = bars["close"]
                     ou = fit_ou_params(close)
                     if ou:
                         ou_zscore = compute_zscore(last_price, ou['mu'], ou['sigma'])
                 except Exception as e:
-                    logger.debug(f"OU fit failed for {symbol}: {e}")
-                    pass  # OU fit failure is non-fatal — proceed without
+                    logger.warning(f"OU fit failed for {symbol}: {e}")  # V10: WARNING not debug
 
                 # Bid-ask spread check (skip wide-spread stocks)
                 try:
@@ -112,10 +112,12 @@ class VWAPStrategy:
                         vol_ratio = bars["volume"].iloc[-1] / avg_vol
 
                 # BUY signal: price touched lower band and bounced back above
+                # V10 BUG-011: Skip OU filter when ou_zscore is None (fit failed)
+                ou_buy_ok = ou_zscore is not None and ou_zscore < -config.VWAP_OU_ZSCORE_MIN
                 if (prev_bar["low"] <= lower
                         and curr_bar["close"] > lower
                         and rsi < config.VWAP_RSI_OVERSOLD
-                        and ou_zscore < -config.VWAP_OU_ZSCORE_MIN
+                        and (ou_buy_ok or ou_zscore is None)
                         and vol_ratio > config.VWAP_VOLUME_RATIO):
 
                     # Confirmation bar check
@@ -134,7 +136,7 @@ class VWAPStrategy:
 
                     # Use tighter of VWAP and OU targets
                     vwap_target = vwap
-                    if ou and ou_zscore < -1.5:
+                    if ou and ou_zscore is not None and ou_zscore < -1.5:
                         ou_target = ou['mu']
                         target = min(vwap_target, ou_target)  # More conservative
                     else:
@@ -153,7 +155,7 @@ class VWAPStrategy:
                         entry_price=round(entry, 2),
                         take_profit=round(target, 2),
                         stop_loss=round(stop_loss, 2),
-                        reason=f"VWAP+OU bounce z={ou_zscore:.2f}, RSI={rsi:.1f}",
+                        reason=f"VWAP+OU bounce z={ou_zscore if ou_zscore is not None else 'N/A'}, RSI={rsi:.1f}",
                         hold_type="day",
                     ))
                     self.triggered[symbol] = now
@@ -166,7 +168,7 @@ class VWAPStrategy:
                     and prev_bar["high"] >= upper
                     and curr_bar["close"] < upper
                     and rsi > config.VWAP_RSI_OVERBOUGHT
-                    and ou_zscore > config.VWAP_OU_ZSCORE_MIN
+                    and (ou_zscore is not None and ou_zscore > config.VWAP_OU_ZSCORE_MIN or ou_zscore is None)
                     and day_move > 0.01
                     and vol_ratio > config.VWAP_VOLUME_RATIO
                 ):
@@ -185,7 +187,7 @@ class VWAPStrategy:
 
                     # Use tighter of VWAP and OU targets
                     vwap_target = vwap
-                    if ou and ou_zscore > 1.5:
+                    if ou and ou_zscore is not None and ou_zscore > 1.5:
                         ou_target = ou['mu']
                         target = max(vwap_target, ou_target)
                     else:
@@ -204,7 +206,7 @@ class VWAPStrategy:
                         entry_price=round(entry, 2),
                         take_profit=round(target, 2),
                         stop_loss=round(stop_loss, 2),
-                        reason=f"VWAP+OU rejection z={ou_zscore:.2f}, RSI={rsi:.1f}",
+                        reason=f"VWAP+OU rejection z={ou_zscore if ou_zscore is not None else 'N/A'}, RSI={rsi:.1f}",
                         hold_type="day",
                     ))
                     self.triggered[symbol] = now

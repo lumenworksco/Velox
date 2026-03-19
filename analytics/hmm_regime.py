@@ -16,7 +16,7 @@ Model persisted to models/hmm_regime.pkl.
 """
 
 import logging
-import pickle
+import joblib
 from enum import Enum
 from pathlib import Path
 
@@ -246,8 +246,7 @@ class HMMRegimeDetector:
         """Load a previously fitted model from disk."""
         try:
             if MODEL_PATH.exists():
-                with open(MODEL_PATH, "rb") as f:
-                    saved = pickle.load(f)
+                saved = joblib.load(MODEL_PATH)
                 self.model = saved["model"]
                 self._label_map = saved["label_map"]
                 self._feature_means = saved.get("feature_means")
@@ -263,13 +262,12 @@ class HMMRegimeDetector:
         """Save fitted model to disk."""
         try:
             MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(MODEL_PATH, "wb") as f:
-                pickle.dump({
-                    "model": self.model,
-                    "label_map": self._label_map,
-                    "feature_means": self._feature_means,
-                    "feature_stds": self._feature_stds,
-                }, f)
+            joblib.dump({
+                "model": self.model,
+                "label_map": self._label_map,
+                "feature_means": self._feature_means,
+                "feature_stds": self._feature_stds,
+            }, MODEL_PATH)
             logger.info(f"HMM regime model saved to {MODEL_PATH}")
         except Exception as e:
             logger.warning(f"Failed to save HMM model: {e}")
@@ -298,6 +296,11 @@ class HMMRegimeDetector:
         try:
             features, means, stds = _normalize_features(raw_features)
 
+            # V10 BUG-017: Train/validation split (80/20) to detect overfitting
+            split_idx = int(len(features) * 0.8)
+            train_features = features[:split_idx]
+            val_features = features[split_idx:]
+
             model = GaussianHMM(
                 n_components=self.n_states,
                 covariance_type="diag",
@@ -305,7 +308,19 @@ class HMMRegimeDetector:
                 random_state=42,
                 verbose=False,
             )
-            model.fit(features)
+            model.fit(train_features)
+
+            # Validate: check that validation score is not drastically worse
+            train_score = model.score(train_features)
+            val_score = model.score(val_features) if len(val_features) >= 10 else train_score
+            score_ratio = val_score / train_score if train_score != 0 else 1.0
+
+            if score_ratio < 0.5:
+                logger.warning(
+                    f"HMM overfitting detected: train_score={train_score:.1f}, "
+                    f"val_score={val_score:.1f} (ratio={score_ratio:.2f})"
+                )
+
             self.model = model
             self._label_map = _label_states(model, features)
             self._feature_means = means
@@ -314,8 +329,8 @@ class HMMRegimeDetector:
             self._save_model()
 
             logger.info(
-                f"HMM fitted on {len(features)} samples, "
-                f"{self.n_states} states, score={model.score(features):.1f}"
+                f"HMM fitted on {len(train_features)} train + {len(val_features)} val samples, "
+                f"{self.n_states} states, train_score={train_score:.1f}, val_score={val_score:.1f}"
             )
             return True
 

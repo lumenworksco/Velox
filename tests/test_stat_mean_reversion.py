@@ -261,10 +261,9 @@ class TestCheckExits:
 
         bars = _make_intraday_bars(5, base_price=100.0)
         mock_bars.return_value = bars
-        # For a long trade entered at negative z, a z of -0.4 is between
-        # -MR_ZSCORE_EXIT_PARTIAL (-0.5) and -MR_ZSCORE_EXIT_FULL (-0.2).
-        # The code checks: zscore >= -MR_ZSCORE_EXIT_PARTIAL for partial.
-        mock_zscore.return_value = -0.4
+        # V10: For a long trade, partial exit triggers when z crosses ABOVE
+        # +MR_ZSCORE_EXIT_PARTIAL (0.5), meaning price overshot above the mean.
+        mock_zscore.return_value = 0.6
 
         trade = SimpleNamespace(
             strategy="STAT_MR", side="buy",
@@ -335,9 +334,11 @@ class TestCheckExits:
     def test_check_exits_time_stop(
         self, mock_zscore, mock_bars, strategy
     ):
-        """Time stop when trade exceeds max hold duration."""
+        """Time stop when trade exceeds max hold duration (capped at 240 min)."""
+        # V10: half_life * 2 * 390 = time stop in minutes, capped at 240
+        # Use half_life=0.1 so time stop = 0.1 * 2 * 390 = 78 min (within 30-240 clamp)
         strategy.ou_params = {
-            "AAPL": {'kappa': 0.15, 'mu': 100.0, 'sigma': 1.5, 'half_life': 0.5}
+            "AAPL": {'kappa': 0.15, 'mu': 100.0, 'sigma': 1.5, 'half_life': 0.1}
         }
 
         bars = _make_intraday_bars(5, base_price=100.0)
@@ -346,7 +347,7 @@ class TestCheckExits:
 
         trade = SimpleNamespace(
             strategy="STAT_MR", side="buy",
-            entry_time=datetime(2026, 3, 13, 7, 0, tzinfo=ET),  # 4 hours ago
+            entry_time=datetime(2026, 3, 13, 9, 0, tzinfo=ET),  # ~2 hours ago
         )
 
         now = datetime(2026, 3, 13, 11, 0, tzinfo=ET)

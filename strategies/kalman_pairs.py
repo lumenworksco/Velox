@@ -168,41 +168,14 @@ class KalmanPairsTrader:
         if spread_std < 1e-6:
             return None
 
-        # 4. ADF test on spread (simple: regress spread on lagged spread)
-        spread_series = pd.Series(spread)
-        delta_spread = spread_series.diff().iloc[1:].values
-        spread_lag = spread_series.iloc[:-1].values
-
-        X_adf = np.column_stack([np.ones(len(spread_lag)), spread_lag])
+        # 4. V10: Proper ADF test using statsmodels (replaces hand-rolled approximation)
         try:
-            adf_params = np.linalg.lstsq(X_adf, delta_spread, rcond=None)[0]
-        except np.linalg.LinAlgError:
+            from statsmodels.tsa.stattools import adfuller
+            adf_result = adfuller(spread, maxlag=None, autolag='AIC')
+            t_stat = adf_result[0]
+            approx_pvalue = adf_result[1]
+        except Exception:
             return None
-
-        # Use ADF coefficient to estimate p-value (approximate)
-        # More negative = more stationary
-        adf_coeff = adf_params[1]
-        if adf_coeff >= 0:
-            return None  # Not mean-reverting
-
-        # Approximate p-value using MacKinnon critical values
-        # For n~60: 1% critical ~= -3.5, 5% ~= -2.9, 10% ~= -2.6
-        residuals = delta_spread - X_adf @ adf_params
-        se = np.std(residuals) / (np.std(spread_lag) * np.sqrt(len(spread_lag)))
-        t_stat = adf_coeff / se if se > 1e-10 else 0.0
-
-        if t_stat > -2.0:  # Not significant enough
-            return None
-
-        # Approximate p-value
-        if t_stat < -3.5:
-            approx_pvalue = 0.01
-        elif t_stat < -2.9:
-            approx_pvalue = 0.05
-        elif t_stat < -2.6:
-            approx_pvalue = 0.10
-        else:
-            approx_pvalue = 0.20
 
         if approx_pvalue > config.PAIRS_COINT_PVALUE:
             return None
@@ -250,13 +223,25 @@ class KalmanPairsTrader:
         # Innovation covariance
         R = config.KALMAN_OBS_NOISE  # Observation noise
         S = x @ P @ x.T + R
+        S = max(S, 1e-8)  # V10: prevent division by near-zero
 
         # Kalman gain
         K = P @ x / S
 
+        # V10: Clamp Kalman gain to prevent divergence
+        k_norm = np.linalg.norm(K)
+        if k_norm > 1.0:
+            K = K / k_norm
+
         # Update step
         theta = theta + K * e
         P = P - np.outer(K, x) @ P
+
+        # V10: Enforce P symmetry and positive semi-definiteness
+        P = (P + P.T) / 2
+        eigvals = np.linalg.eigvalsh(P)
+        if np.any(eigvals < 0):
+            P += np.eye(P.shape[0]) * (abs(min(eigvals)) + 1e-8)
 
         # Store updated state
         state['theta'] = theta
@@ -324,8 +309,8 @@ class KalmanPairsTrader:
                             strategy="KALMAN_PAIRS",
                             side="sell",
                             entry_price=round(price1, 2),
-                            take_profit=round(price1 * 0.995, 2),  # ~0.5% target
-                            stop_loss=round(price1 * 1.015, 2),    # ~1.5% stop
+                            take_profit=round(price1 * (1 - config.PAIRS_TP_PCT), 2),
+                            stop_loss=round(price1 * (1 + config.PAIRS_SL_PCT), 2),
                             reason=f"Pairs short z={zscore:.2f} vs {sym2}",
                             hold_type="day",
                             pair_id=pair_id,
@@ -337,8 +322,8 @@ class KalmanPairsTrader:
                         strategy="KALMAN_PAIRS",
                         side="buy",
                         entry_price=round(price2, 2),
-                        take_profit=round(price2 * 1.005, 2),
-                        stop_loss=round(price2 * 0.985, 2),
+                        take_profit=round(price2 * (1 + config.PAIRS_TP_PCT), 2),
+                        stop_loss=round(price2 * (1 - config.PAIRS_SL_PCT), 2),
                         reason=f"Pairs long z={zscore:.2f} vs {sym1}",
                         hold_type="day",
                         pair_id=pair_id,
@@ -354,8 +339,8 @@ class KalmanPairsTrader:
                         strategy="KALMAN_PAIRS",
                         side="buy",
                         entry_price=round(price1, 2),
-                        take_profit=round(price1 * 1.005, 2),
-                        stop_loss=round(price1 * 0.985, 2),
+                        take_profit=round(price1 * (1 + config.PAIRS_TP_PCT), 2),
+                        stop_loss=round(price1 * (1 - config.PAIRS_SL_PCT), 2),
                         reason=f"Pairs long z={zscore:.2f} vs {sym2}",
                         hold_type="day",
                         pair_id=pair_id,
@@ -368,8 +353,8 @@ class KalmanPairsTrader:
                             strategy="KALMAN_PAIRS",
                             side="sell",
                             entry_price=round(price2, 2),
-                            take_profit=round(price2 * 0.995, 2),
-                            stop_loss=round(price2 * 1.015, 2),
+                            take_profit=round(price2 * (1 - config.PAIRS_TP_PCT), 2),
+                            stop_loss=round(price2 * (1 + config.PAIRS_SL_PCT), 2),
                             reason=f"Pairs short z={zscore:.2f} vs {sym1}",
                             hold_type="day",
                             pair_id=pair_id,

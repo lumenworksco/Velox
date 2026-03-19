@@ -78,24 +78,20 @@ class ORBStrategyV2:
         orb_high = bars_930_1000["high"].max()
         orb_low = bars_930_1000["low"].min()
         orb_mid = (orb_high + orb_low) / 2
-        range_pct = (orb_high - orb_low) / orb_mid if orb_mid > 0 else 0
+        # V10 BUG-033: Use orb_low as divisor (standard range calculation)
+        range_pct = (orb_high - orb_low) / orb_low if orb_low > 0 else 0
 
-        # Gap % — use first bar open vs previous close
+        # V10 BUG-010: Gap calculation using previous day's close from snapshot
         first_open = bars_930_1000["open"].iloc[0]
-        prev_close = bars_930_1000["close"].iloc[0]  # caller may embed prev close
-        # More robust: try to get previous close from snapshot or daily bars
-        # For now, use the open of the first bar compared to the close of
-        # the *last bar of yesterday*.  The caller is responsible for passing
-        # bars that include prev-close info, or we approximate with the first
-        # bar's open vs low.
-        # In practice the caller passes 30-min intraday bars; use the bar
-        # *before* the opening bar if available, else approximate gap = 0.
         gap_pct = 0.0
         try:
             snap = get_snapshot(symbol)
             if snap and hasattr(snap, "prev_daily_bar") and snap.prev_daily_bar:
-                prev_close = snap.prev_daily_bar.close
-                gap_pct = abs(first_open - prev_close) / prev_close
+                prev_close = float(snap.prev_daily_bar.close)
+                if prev_close > 0:
+                    gap_pct = abs(first_open - prev_close) / prev_close
+            else:
+                logger.debug(f"ORBv2: no prev_daily_bar for {symbol}, assuming gap=0")
         except Exception as e:
             logger.debug(f"Prev close lookup failed for {symbol}: {e}")
 

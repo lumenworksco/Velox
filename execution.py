@@ -60,22 +60,8 @@ def _submit_order(signal: Signal, qty: int, client=None):
             )
         )
 
-    # --- Legacy strategies (backward compat) -----------------------------
-    if signal.strategy == "MOMENTUM":
-        # Momentum uses GTC limit order with bracket (holds overnight)
-        return client.submit_order(
-            LimitOrderRequest(
-                symbol=signal.symbol,
-                qty=qty,
-                side=side,
-                time_in_force=TimeInForce.GTC,
-                limit_price=round(signal.entry_price, 2),
-                order_class=OrderClass.BRACKET,
-                take_profit={"limit_price": round(signal.take_profit, 2)},
-                stop_loss={"stop_price": round(signal.stop_loss, 2)},
-            )
-        )
-    elif signal.strategy == "ORB":
+    # V10: Removed dead MOMENTUM routing (strategy no longer exists)
+    if signal.strategy == "ORB":
         # ORB uses limit order at breakout price (day only)
         return client.submit_order(
             LimitOrderRequest(
@@ -149,8 +135,8 @@ def submit_twap_order(
     order_ids: list[str] = []
 
     for i in range(slices):
-        # Add remainder shares to the last slice
-        qty = slice_qty + (remainder if i == slices - 1 else 0)
+        # V10 BUG-004: Distribute remainder across first N slices (1 extra each)
+        qty = slice_qty + (1 if i < remainder else 0)
         if qty <= 0:
             continue
 
@@ -266,54 +252,18 @@ def check_vwap_time_stops(open_trades: dict, now: datetime) -> list[str]:
     return expired
 
 
-def check_momentum_max_hold(open_trades: dict, now: datetime) -> list[str]:
-    """Check momentum trades for max hold period. Returns list of symbols to close."""
-    expired = []
-    for symbol, trade in open_trades.items():
-        if trade.strategy == "MOMENTUM" and trade.max_hold_date:
-            if now >= trade.max_hold_date:
-                if close_position(symbol, reason="momentum max hold"):
-                    expired.append(symbol)
-    return expired
-
-
-def close_gap_go_positions(open_trades: dict, now: datetime) -> list[str]:
-    """V3: Close all Gap & Go positions at 11:30 AM time stop."""
-    closed = []
-    for symbol, trade in list(open_trades.items()):
-        if trade.strategy == "GAP_GO":
-            if close_position(symbol, reason="gap_go time stop"):
-                closed.append(symbol)
-    return closed
-
-
-def check_sector_max_hold(open_trades: dict, now: datetime) -> list[str]:
-    """Check sector rotation trades for max hold period (legacy)."""
-    expired = []
-    for symbol, trade in open_trades.items():
-        if trade.strategy == "SECTOR_ROTATION" and trade.max_hold_date:
-            if now >= trade.max_hold_date:
-                if close_position(symbol, reason="sector max hold"):
-                    expired.append(symbol)
-    return expired
-
-
-def check_pairs_max_hold(open_trades: dict, now: datetime) -> list[str]:
-    """Check pairs trades for max hold period (legacy)."""
-    expired = []
-    for symbol, trade in open_trades.items():
-        if trade.strategy == "PAIRS" and trade.max_hold_date:
-            if now >= trade.max_hold_date:
-                if close_position(symbol, reason="pairs max hold"):
-                    expired.append(symbol)
-    return expired
+## V10: Removed dead strategy functions:
+# check_momentum_max_hold, close_gap_go_positions,
+# check_sector_max_hold, check_pairs_max_hold
+# (MOMENTUM, GAP_GO, SECTOR_ROTATION, PAIRS strategies no longer exist)
 
 
 def close_partial_position(symbol: str, qty: int) -> bool:
     """Close a partial position (for scaled exits)."""
     client = get_trading_client()
     try:
-        client.close_position(symbol, qty=str(qty))
+        # V10 BUG-016: Validate qty is int before string conversion (Alpaca API requires str)
+        client.close_position(symbol, qty=str(int(qty)))
         logger.info(f"Partial close: {symbol} qty={qty}")
         return True
     except Exception as e:

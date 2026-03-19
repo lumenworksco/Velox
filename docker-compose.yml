@@ -1,17 +1,86 @@
+# V10 Production Stack: Velox + PostgreSQL + Prometheus + Grafana
+#
+# Usage:
+#   docker compose up -d              # Start all services
+#   docker compose logs -f velox      # Follow trading bot logs
+#   docker compose exec velox python main.py --diagnose  # Run diagnostic
+#
+# Endpoints:
+#   http://localhost:8080       — Velox dashboard
+#   http://localhost:8080/metrics — Prometheus metrics
+#   http://localhost:9090       — Prometheus UI
+#   http://localhost:3000       — Grafana (admin/admin)
+
 services:
   velox:
     build: .
-    container_name: velox-v6
+    container_name: velox-v10
     restart: unless-stopped
     env_file: .env
+    environment:
+      - DATABASE_URL=postgresql://velox:velox@postgres:5432/velox
+      - STRUCTURED_LOGGING=true
+      - WEB_DASHBOARD_PORT=8080
     ports:
       - "8080:8080"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; r = httpx.get('http://localhost:8080/health'); assert r.status_code == 200"]
-      interval: 60s
-      timeout: 10s
-      start_period: 30s
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
       retries: 3
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: velox-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: velox
+      POSTGRES_PASSWORD: velox
+      POSTGRES_DB: velox
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U velox"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: velox-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    depends_on:
+      - velox
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: velox-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafdata:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  pgdata:
+  promdata:
+  grafdata:

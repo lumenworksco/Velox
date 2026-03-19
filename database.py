@@ -10,6 +10,18 @@ import config
 
 logger = logging.getLogger(__name__)
 
+
+def _to_iso(dt) -> str | None:
+    """V10 BUG-046: Standardize all datetime serialization to ISO format with timezone."""
+    if dt is None:
+        return None
+    if hasattr(dt, 'isoformat'):
+        # Ensure timezone-aware
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=config.ET)
+        return dt.isoformat()
+    return str(dt)
+
 _conn: sqlite3.Connection | None = None
 
 
@@ -68,6 +80,7 @@ def init_db():
             pair_id TEXT DEFAULT '',
             partial_exits INTEGER DEFAULT 0,
             highest_price_seen REAL DEFAULT 0.0,
+            lowest_price_seen REAL DEFAULT 0.0,
             entry_atr REAL DEFAULT 0.0
         );
 
@@ -245,21 +258,24 @@ def init_db():
     """)
     conn.commit()
 
-    # V4: Add new columns to open_positions if they don't exist (migration)
+    # V4+V10: Add new columns to open_positions if they don't exist (migration)
+    # V10 BUG-045: Use BEGIN EXCLUSIVE for thread-safe migration
     try:
+        conn.execute("BEGIN EXCLUSIVE")
         cursor = conn.execute("PRAGMA table_info(open_positions)")
         existing_cols = {row["name"] for row in cursor.fetchall()}
         v4_cols = {
             "pair_id": "TEXT DEFAULT ''",
             "partial_exits": "INTEGER DEFAULT 0",
             "highest_price_seen": "REAL DEFAULT 0.0",
+            "lowest_price_seen": "REAL DEFAULT 0.0",
             "entry_atr": "REAL DEFAULT 0.0",
         }
         for col, col_type in v4_cols.items():
             if col not in existing_cols:
                 conn.execute(f"ALTER TABLE open_positions ADD COLUMN {col} {col_type}")
                 logger.info(f"Added column {col} to open_positions")
-        conn.commit()
+        conn.execute("COMMIT")
     except Exception as e:
         logger.warning(f"V4 schema migration note: {e}")
 
@@ -301,28 +317,37 @@ def log_signal(timestamp: datetime, symbol: str, strategy: str,
 # --- Open Positions (replaces state.json) ---
 
 def save_open_positions(open_trades: dict):
-    """Replace all open_positions rows with current state."""
+    """Replace all open_positions rows with current state.
+
+    V10 BUG-029: Atomic transaction — if crash occurs mid-save, all positions are preserved.
+    """
     conn = _get_conn()
-    conn.execute("DELETE FROM open_positions")
-    for symbol, trade in open_trades.items():
-        conn.execute(
-            """INSERT INTO open_positions (symbol, strategy, side, entry_price,
-               qty, entry_time, take_profit, stop_loss, alpaca_order_id,
-               hold_type, time_stop, max_hold_date,
-               pair_id, partial_exits, highest_price_seen, entry_atr)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (symbol, trade.strategy, trade.side, trade.entry_price,
-             trade.qty, trade.entry_time.isoformat(), trade.take_profit,
-             trade.stop_loss, trade.order_id,
-             getattr(trade, 'hold_type', 'day'),
-             trade.time_stop.isoformat() if trade.time_stop else None,
-             trade.max_hold_date.isoformat() if getattr(trade, 'max_hold_date', None) else None,
-             getattr(trade, 'pair_id', ''),
-             getattr(trade, 'partial_exits', 0),
-             getattr(trade, 'highest_price_seen', 0.0),
-             getattr(trade, 'entry_atr', 0.0)),
-        )
-    conn.commit()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM open_positions")
+        for symbol, trade in open_trades.items():
+            conn.execute(
+                """INSERT INTO open_positions (symbol, strategy, side, entry_price,
+                   qty, entry_time, take_profit, stop_loss, alpaca_order_id,
+                   hold_type, time_stop, max_hold_date,
+                   pair_id, partial_exits, highest_price_seen, lowest_price_seen, entry_atr)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (symbol, trade.strategy, trade.side, trade.entry_price,
+                 trade.qty, _to_iso(trade.entry_time), trade.take_profit,
+                 trade.stop_loss, trade.order_id,
+                 getattr(trade, 'hold_type', 'day'),
+                 _to_iso(trade.time_stop),
+                 _to_iso(getattr(trade, 'max_hold_date', None)),
+                 getattr(trade, 'pair_id', ''),
+                 getattr(trade, 'partial_exits', 0),
+                 getattr(trade, 'highest_price_seen', 0.0),
+                 getattr(trade, 'lowest_price_seen', 0.0),
+                 getattr(trade, 'entry_atr', 0.0)),
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def load_open_positions() -> list[dict]:
@@ -786,7 +811,7 @@ def save_kalman_pair(symbol1: str, symbol2: str, hedge_ratio: float,
         (symbol1, symbol2),
     ).fetchone()
 
-    now_str = __import__('datetime').datetime.now().isoformat()
+    now_str = _to_iso(datetime.now(config.ET))  # V10 BUG-044: timezone-aware
 
     if existing:
         conn.execute(
@@ -866,8 +891,8 @@ def get_consistency_log(days: int = 30) -> list[dict]:
 
 def get_trades_by_strategy(strategy: str, days: int = 30) -> list[dict]:
     """Get closed trades for a specific strategy within the last N days."""
-    from datetime import datetime, timedelta
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    from datetime import timedelta
+    cutoff = _to_iso(datetime.now(config.ET) - timedelta(days=days))  # V10 BUG-043
     conn = _get_conn()
     rows = conn.execute(
         "SELECT * FROM trades WHERE strategy = ? AND exit_time > ? ORDER BY exit_time DESC",
@@ -878,8 +903,8 @@ def get_trades_by_strategy(strategy: str, days: int = 30) -> list[dict]:
 
 def get_signals_by_strategy(strategy: str, days: int = 7) -> list[dict]:
     """Get signal records for a specific strategy within the last N days."""
-    from datetime import datetime, timedelta
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    from datetime import timedelta
+    cutoff = _to_iso(datetime.now(config.ET) - timedelta(days=days))  # V10 BUG-043
     conn = _get_conn()
     rows = conn.execute(
         "SELECT * FROM signals WHERE strategy = ? AND timestamp > ? ORDER BY timestamp DESC",

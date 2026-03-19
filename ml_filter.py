@@ -2,7 +2,7 @@
 
 import json
 import logging
-import pickle
+import joblib
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -40,8 +40,7 @@ class MLSignalFilter:
             path = MODELS_DIR / f"signal_filter_{strategy}.pkl"
             if path.exists():
                 try:
-                    with open(path, "rb") as f:
-                        data = pickle.load(f)
+                    data = joblib.load(path)
                     self._models[strategy] = data["model"]
                     self._active[strategy] = data.get("active", False)
                     logger.info(
@@ -148,8 +147,7 @@ class MLSignalFilter:
             "features": FEATURE_NAMES,
         }
         path = MODELS_DIR / f"signal_filter_{strategy}.pkl"
-        with open(path, "wb") as f:
-            pickle.dump(model_data, f)
+        joblib.dump(model_data, path)
 
         self._models[strategy] = model
         self._active[strategy] = active

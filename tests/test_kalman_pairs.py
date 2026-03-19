@@ -178,6 +178,8 @@ class TestScan:
         with patch.object(type(trader), '_update_kalman', return_value=2.5):
             with patch("strategies.kalman_pairs.config") as mock_cfg:
                 mock_cfg.PAIRS_ZSCORE_ENTRY = 2.0
+                mock_cfg.PAIRS_TP_PCT = 0.015
+                mock_cfg.PAIRS_SL_PCT = 0.010
                 mock_cfg.ALLOW_SHORT = True
                 mock_cfg.NO_SHORT_SYMBOLS = set()
                 signals = trader.scan(now)
