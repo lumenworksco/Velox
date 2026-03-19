@@ -27,7 +27,7 @@ def upgrade() -> None:
         sa.Column('id', sa.Integer, primary_key=True, autoincrement=True),
         sa.Column('oms_id', sa.String(12), nullable=False, unique=True),
         sa.Column('broker_order_id', sa.Text, server_default=''),
-        sa.Column('idempotency_key', sa.Text, server_default=''),
+        sa.Column('idempotency_key', sa.Text, nullable=False, server_default='', unique=True),
         sa.Column('symbol', sa.String(10), nullable=False),
         sa.Column('strategy', sa.String(30), nullable=False),
         sa.Column('side', sa.String(4), nullable=False),

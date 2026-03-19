@@ -14,6 +14,13 @@ PAPER_MODE = os.getenv("ALPACA_LIVE", "false") != "true"
 API_KEY = os.getenv("ALPACA_API_KEY", "")
 API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 
+# Validate API credentials at import time (skip in test environments)
+if not os.getenv("TESTING") and not os.getenv("PYTEST_CURRENT_TEST"):
+    if not API_KEY:
+        raise RuntimeError("ALPACA_API_KEY environment variable is required")
+    if not API_SECRET:
+        raise RuntimeError("ALPACA_API_SECRET environment variable is required")
+
 ALLOW_SHORT = os.getenv("ALLOW_SHORT", "false") == "true"
 ASYNC_MODE = os.getenv("ASYNC_MODE", "false") == "true"
 
@@ -504,7 +511,8 @@ PARAM_OPTIMIZER_MIN_IMPROVEMENT = 0.15   # 15% Sortino improvement required
 PARAM_OPTIMIZER_APPLY_AUTO = False       # Manual approval by default
 
 # ============================================================
-# LEGACY (backward-compat for archived strategies)
+# LEGACY — deprecated, kept for backward-compat with risk_manager.py
+# TODO: Remove once dead strategy blocks in risk_manager.py are cleaned up
 # ============================================================
 
 MAX_MOMENTUM_POSITIONS = 4

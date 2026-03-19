@@ -120,8 +120,10 @@ class OrderManager:
                         cancelled.append(order.oms_id)
         return cancelled
 
+    _MAX_AUDIT_ENTRIES = 10_000
+
     def _log_transition(self, order: Order, old_state: OrderState | None, new_state: OrderState):
-        """Log a state transition for audit trail."""
+        """Log a state transition for audit trail (capped at 10k entries)."""
         self._audit.append({
             "timestamp": datetime.now().isoformat(),
             "oms_id": order.oms_id,
@@ -130,6 +132,9 @@ class OrderManager:
             "old_state": old_state.value if old_state else "NEW",
             "new_state": new_state.value,
         })
+        # Rotate: keep only last MAX entries to prevent memory leak
+        if len(self._audit) > self._MAX_AUDIT_ENTRIES:
+            self._audit = self._audit[-self._MAX_AUDIT_ENTRIES:]
 
     def get_audit_trail(self, limit: int = 50) -> list[dict]:
         """Get recent audit trail entries."""

@@ -6,6 +6,7 @@ Checks alignment across daily, hourly, and 15-min timeframes.
 """
 
 import logging
+import threading
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -15,7 +16,8 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Cache to avoid refetching
+# Cache to avoid refetching (thread-safe)
+_mtf_lock = threading.Lock()
 _mtf_cache: dict[str, tuple[float, datetime]] = {}
 
 
@@ -48,10 +50,11 @@ def get_mtf_confluence(symbol: str, side: str, now: datetime | None = None) -> f
 
     # Check cache
     cache_key = f"{symbol}_{side}"
-    if now and cache_key in _mtf_cache:
-        cached_score, cached_time = _mtf_cache[cache_key]
-        if (now - cached_time).total_seconds() < config.MTF_CACHE_SECONDS:
-            return cached_score
+    with _mtf_lock:
+        if now and cache_key in _mtf_cache:
+            cached_score, cached_time = _mtf_cache[cache_key]
+            if (now - cached_time).total_seconds() < config.MTF_CACHE_SECONDS:
+                return cached_score
 
     aligned = 0
     total = 0
@@ -123,7 +126,8 @@ def get_mtf_confluence(symbol: str, side: str, now: datetime | None = None) -> f
 
     # Cache result
     if now:
-        _mtf_cache[cache_key] = (score, now)
+        with _mtf_lock:
+            _mtf_cache[cache_key] = (score, now)
 
     return score
 
@@ -158,4 +162,5 @@ def check_mtf_filter(symbol: str, strategy: str, side: str,
 def clear_cache():
     """Clear the MTF cache."""
     global _mtf_cache
-    _mtf_cache = {}
+    with _mtf_lock:
+        _mtf_cache = {}

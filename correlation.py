@@ -1,6 +1,7 @@
 """Correlation filter — prevent opening positions too correlated with existing ones."""
 
 import logging
+import threading
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -11,6 +12,7 @@ import config
 logger = logging.getLogger(__name__)
 
 # Cache: correlation matrix refreshed once per day
+_corr_lock = threading.Lock()
 _corr_matrix: pd.DataFrame | None = None
 _cache_date: str = ""
 _returns_cache: dict[str, pd.Series] = {}
@@ -21,8 +23,9 @@ def load_correlation_cache(symbols: list[str]):
     global _corr_matrix, _cache_date, _returns_cache
 
     today = datetime.now(config.ET).strftime("%Y-%m-%d")
-    if _cache_date == today and _corr_matrix is not None:
-        return
+    with _corr_lock:
+        if _cache_date == today and _corr_matrix is not None:
+            return
 
     logger.info(f"Loading correlation data for {len(symbols)} symbols...")
     _returns_cache.clear()

@@ -7,6 +7,18 @@ on:
     branches: [main, master]
 
 jobs:
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan for secrets with gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        continue-on-error: false
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -27,6 +39,8 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Verify core imports
+        env:
+          TESTING: "1"
         run: |
           python -c "
           # Core modules

@@ -5,7 +5,8 @@ Configuration via environment variables:
     DASHBOARD_USERNAME: Login username (default: admin)
     DASHBOARD_PASSWORD_HASH: bcrypt hash of password
 
-If DASHBOARD_SECRET_KEY is not set, auth is disabled (development mode).
+Auth is ENABLED by default. To explicitly disable (dev only):
+    DASHBOARD_AUTH_DISABLED=true
 """
 
 import os
@@ -24,7 +25,15 @@ USERNAME = os.getenv("DASHBOARD_USERNAME", "admin")
 PASSWORD_HASH = os.getenv("DASHBOARD_PASSWORD_HASH", "")
 TOKEN_EXPIRY_HOURS = int(os.getenv("DASHBOARD_TOKEN_EXPIRY_HOURS", "24"))
 
-AUTH_ENABLED = bool(SECRET_KEY)
+# Auth is ON by default — must explicitly disable with DASHBOARD_AUTH_DISABLED=true
+_auth_disabled = os.getenv("DASHBOARD_AUTH_DISABLED", "false").lower() == "true"
+AUTH_ENABLED = not _auth_disabled
+
+if AUTH_ENABLED and not SECRET_KEY:
+    logger.warning(
+        "DASHBOARD_SECRET_KEY not set — dashboard auth is enabled but no key configured. "
+        "Set DASHBOARD_SECRET_KEY or DASHBOARD_AUTH_DISABLED=true"
+    )
 
 
 def _b64_encode(data: bytes) -> str:
@@ -85,24 +94,21 @@ def verify_token(token: str) -> dict | None:
 
 
 def verify_password(password: str) -> bool:
-    """Verify a password against the stored hash.
+    """Verify a password against the stored bcrypt hash.
 
-    Supports bcrypt hashes ($2b$ prefix) with SHA256 fallback.
-    Generate bcrypt hash: python3 -c "import bcrypt; print(bcrypt.hashpw(b'PASSWORD', bcrypt.gensalt()).decode())"
+    Generate hash: python3 -c "import bcrypt; print(bcrypt.hashpw(b'PASSWORD', bcrypt.gensalt()).decode())"
     """
     if not PASSWORD_HASH:
         return False
-    # bcrypt hash detection
-    if PASSWORD_HASH.startswith("$2b$") or PASSWORD_HASH.startswith("$2a$"):
-        try:
-            import bcrypt
-            return bcrypt.checkpw(password.encode(), PASSWORD_HASH.encode())
-        except ImportError:
-            logger.warning("bcrypt not installed — cannot verify bcrypt password hash")
-            return False
-    # SHA256 fallback (legacy)
-    password_hash = hashlib.sha256(password.encode()).hexdigest()
-    return hmac.compare_digest(password_hash, PASSWORD_HASH)
+
+    import bcrypt
+    if not (PASSWORD_HASH.startswith("$2b$") or PASSWORD_HASH.startswith("$2a$")):
+        logger.error(
+            "DASHBOARD_PASSWORD_HASH is not a bcrypt hash. "
+            "Generate one: python3 -c \"import bcrypt; print(bcrypt.hashpw(b'PASSWORD', bcrypt.gensalt()).decode())\""
+        )
+        return False
+    return bcrypt.checkpw(password.encode(), PASSWORD_HASH.encode())
 
 
 def get_fastapi_dependency():

@@ -9,7 +9,7 @@
 #   http://localhost:8080       — Velox dashboard
 #   http://localhost:8080/metrics — Prometheus metrics
 #   http://localhost:9090       — Prometheus UI
-#   http://localhost:3000       — Grafana (admin/admin)
+#   http://localhost:3000       — Grafana (credentials in .env)
 
 services:
   velox:
@@ -18,7 +18,7 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      - DATABASE_URL=postgresql://velox:velox@postgres:5432/velox
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-velox}:${POSTGRES_PASSWORD:-velox}@postgres:5432/${POSTGRES_DB:-velox}
       - STRUCTURED_LOGGING=true
       - WEB_DASHBOARD_PORT=8080
     ports:
@@ -36,15 +36,20 @@ services:
       timeout: 5s
       start_period: 15s
       retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
 
   postgres:
     image: postgres:16-alpine
     container_name: velox-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: velox
-      POSTGRES_PASSWORD: velox
-      POSTGRES_DB: velox
+      POSTGRES_USER: ${POSTGRES_USER:-velox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-velox}
     ports:
       - "5432:5432"
     volumes:
@@ -54,11 +59,19 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
 
   prometheus:
     image: prom/prometheus:latest
     container_name: velox-prometheus
     restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=90d"
     ports:
       - "9090:9090"
     volumes:
@@ -66,6 +79,11 @@ services:
       - promdata:/prometheus
     depends_on:
       - velox
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
 
   grafana:
     image: grafana/grafana:latest
@@ -74,12 +92,17 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - grafdata:/var/lib/grafana
     depends_on:
       - prometheus
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
 
 volumes:
   pgdata:

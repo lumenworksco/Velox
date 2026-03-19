@@ -1,13 +1,25 @@
+# Velox V10 — systemd service file
+#
+# Setup:
+#   1. Copy .env.example to .env and fill in your credentials
+#   2. Edit this file — replace YOUR_USERNAME and /path/to/trading_bot
+#   3. sudo cp trading_bot.service /etc/systemd/system/
+#   4. sudo cp deploy/logrotate-velox /etc/logrotate.d/velox
+#   5. sudo systemctl daemon-reload
+#   6. sudo systemctl enable --now trading_bot
+#
+# Logs: journalctl -u trading_bot -f
+#       tail -f /var/log/trading_bot.log
+
 [Unit]
-Description=Algorithmic Trading Bot V2
+Description=Velox V10 Algorithmic Trading Bot
 After=network.target
 
 [Service]
 Type=simple
 User=YOUR_USERNAME
 WorkingDirectory=/path/to/trading_bot
-Environment="ALPACA_API_KEY=your_key"
-Environment="ALPACA_API_SECRET=your_secret"
+EnvironmentFile=/path/to/trading_bot/.env
 ExecStart=/usr/bin/python3 main.py --live
 Restart=always
 RestartSec=10

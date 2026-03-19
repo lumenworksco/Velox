@@ -114,12 +114,42 @@ async def health():
     }
 
 
+# V10: Login rate limiting (IP-based, 3 attempts per minute)
+_login_attempts: dict[str, list[float]] = {}
+_login_lock = __import__("threading").Lock()
+_LOGIN_MAX_ATTEMPTS = 3
+_LOGIN_WINDOW_SEC = 60
+
+
+def _check_rate_limit(ip: str) -> bool:
+    """Return True if request is allowed, False if rate-limited."""
+    import time as _time
+    now = _time.time()
+    with _login_lock:
+        attempts = _login_attempts.get(ip, [])
+        # Remove expired attempts
+        attempts = [t for t in attempts if now - t < _LOGIN_WINDOW_SEC]
+        _login_attempts[ip] = attempts
+        if len(attempts) >= _LOGIN_MAX_ATTEMPTS:
+            return False
+        attempts.append(now)
+        return True
+
+
 # V10: Login endpoint for JWT token
 @app.post("/api/login")
-async def login(username: str = Query(...), password: str = Query(...)):
+async def login(request: Request, username: str = Query(...), password: str = Query(...)):
     """Authenticate and return a JWT token."""
     if not AUTH_ENABLED:
         return {"token": "auth_disabled", "message": "Authentication is not configured"}
+
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many login attempts. Try again in {_LOGIN_WINDOW_SEC}s."
+        )
+
     if username != "admin":
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not verify_password(password):

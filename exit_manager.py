@@ -215,7 +215,7 @@ class ExitManager:
 
             # For shorts, use lowest_price_seen as reference
             if trade.lowest_price_seen <= 0:
-                return None
+                trade.lowest_price_seen = current_price
             atr_trail_stop = trade.lowest_price_seen + trail_distance
 
             # Only ratchet down (for shorts), must be better (lower) than current SL

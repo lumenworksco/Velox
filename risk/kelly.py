@@ -48,6 +48,12 @@ class KellyEngine:
 
                 win_loss_ratio = avg_win / avg_loss
 
+                # Guard against near-zero win/loss ratio
+                if win_loss_ratio < 1e-6:
+                    self._fractions[strategy] = config.KELLY_MIN_RISK
+                    logger.warning(f"Kelly {strategy}: near-zero win/loss ratio={win_loss_ratio:.6f}, using min risk")
+                    continue
+
                 # Kelly fraction = win_rate - ((1 - win_rate) / win_loss_ratio)
                 kelly_f = win_rate - ((1 - win_rate) / win_loss_ratio)
 

@@ -34,7 +34,7 @@ def _get_conn() -> sqlite3.Connection:
         _conn = sqlite3.connect(config.DB_FILE, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
-        _conn.execute("PRAGMA synchronous=NORMAL")
+        _conn.execute("PRAGMA synchronous=FULL")
     return _conn
 
 

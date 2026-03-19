@@ -98,6 +98,29 @@ def sync_positions_with_broker(risk: RiskManager, now: datetime, ws_monitor=None
             side = "buy" if qty > 0 else "sell"
             original_strategy = recent_match["strategy"] if recent_match else "re-adopted"
 
+            # Use ATR-based TP/SL for re-adopted positions (fall back to 2%)
+            atr_val = avg_price * 0.02  # Default: 2% of price
+            try:
+                from data import get_intraday_bars
+                from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+                bars = get_intraday_bars(symbol, TimeFrame(5, TimeFrameUnit.Minute),
+                                         start=now - timedelta(hours=2), end=now)
+                if bars is not None and len(bars) >= 10:
+                    import pandas_ta as pta
+                    atr = pta.atr(bars['high'], bars['low'], bars['close'], length=10)
+                    if atr is not None and len(atr) > 0:
+                        atr_val = float(atr.iloc[-1])
+            except Exception:
+                pass  # Use default 2%
+
+            tp_mult, sl_mult = 2.0, 1.5  # 2 ATR TP, 1.5 ATR SL
+            if side == "buy":
+                take_profit = avg_price + (atr_val * tp_mult)
+                stop_loss = avg_price - (atr_val * sl_mult)
+            else:
+                take_profit = avg_price - (atr_val * tp_mult)
+                stop_loss = avg_price + (atr_val * sl_mult)
+
             trade = TradeRecord(
                 symbol=symbol,
                 strategy=original_strategy,
@@ -105,8 +128,8 @@ def sync_positions_with_broker(risk: RiskManager, now: datetime, ws_monitor=None
                 entry_price=avg_price,
                 entry_time=now,
                 qty=abs(qty),
-                take_profit=avg_price * (1.02 if side == "buy" else 0.98),
-                stop_loss=avg_price * (0.98 if side == "buy" else 1.02),
+                take_profit=round(take_profit, 2),
+                stop_loss=round(stop_loss, 2),
                 order_id="",
                 hold_type="day",
             )

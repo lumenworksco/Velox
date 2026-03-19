@@ -1,6 +1,7 @@
 """Smart Order Routing — choose order type and timing based on signal context."""
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -164,6 +165,7 @@ class FillMonitor:
     def __init__(self):
         self._pending: dict[str, dict] = {}  # order_id -> {signal, submit_time, qty}
         self._fill_stats: dict[str, list] = {}  # strategy -> [slippage_pcts]
+        self._lock = threading.Lock()
 
     def register_order(
         self, order_id: str, signal: Signal, submit_time: datetime, qty: int
@@ -224,7 +226,8 @@ class FillMonitor:
         if expected_price == 0:
             return
         slippage_pct = (fill_price - expected_price) / expected_price
-        self._fill_stats.setdefault(strategy, []).append(slippage_pct)
+        with self._lock:
+            self._fill_stats.setdefault(strategy, []).append(slippage_pct)
         self.remove_order(order_id)
         logger.info(
             f"Fill recorded: order={order_id} strategy={strategy} "
@@ -233,11 +236,12 @@ class FillMonitor:
 
     def get_slippage_stats(self) -> dict[str, float]:
         """Return average slippage per strategy."""
-        result: dict[str, float] = {}
-        for strategy, slippages in self._fill_stats.items():
-            if slippages:
-                result[strategy] = sum(slippages) / len(slippages)
-        return result
+        with self._lock:
+            result: dict[str, float] = {}
+            for strategy, slippages in self._fill_stats.items():
+                if slippages:
+                    result[strategy] = sum(slippages) / len(slippages)
+            return result
 
     @property
     def pending_count(self) -> int:

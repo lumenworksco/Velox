@@ -25,6 +25,7 @@ class PositionMonitor:
         self._running = False
         self._subscribed_symbols: set[str] = set()
         self._close_callback = None  # Set by main.py to handle position closes
+        self.monitoring_disabled = False  # Set True after repeated WS failures
 
     @property
     def is_connected(self) -> bool:
@@ -78,13 +79,32 @@ class PositionMonitor:
         """Background thread event loop."""
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        consecutive_failures = 0
 
         while self._running:
             try:
                 self._loop.run_until_complete(self._connect_and_stream())
+                consecutive_failures = 0  # Reset on successful connection
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
                 self._connected = False
+                consecutive_failures += 1
+
+                # Alert after 3 consecutive failures
+                if consecutive_failures == 3:
+                    self.monitoring_disabled = True
+                    logger.critical(
+                        f"WebSocket failed {consecutive_failures} consecutive times — "
+                        "real-time monitoring disabled! SL/TP checks rely on polling."
+                    )
+                    try:
+                        from notifications import send_telegram
+                        send_telegram(
+                            f"⚠️ VELOX ALERT: WebSocket disconnected {consecutive_failures}x. "
+                            "Real-time SL/TP monitoring disabled."
+                        )
+                    except Exception:
+                        pass
 
             if self._running:
                 logger.info(
@@ -170,6 +190,8 @@ class PositionMonitor:
 
             # Short hard stop check (4% max loss)
             if trade.side == "sell" and config.ALLOW_SHORT:
+                if trade.entry_price <= 0:
+                    return
                 loss_pct = (current_price - trade.entry_price) / trade.entry_price
                 if loss_pct > config.SHORT_HARD_STOP_PCT:
                     logger.info(f"WS: {symbol} short hard stop at {loss_pct:.2%} loss")

@@ -11,6 +11,7 @@ Strategies: StatMR (40%), VWAP (20%), KalmanPairs (20%), PEAD (10%), ORB (5%), M
 import argparse
 import asyncio
 import logging
+import signal
 import sys
 import time as time_mod
 from datetime import datetime, time, timedelta
@@ -288,6 +289,17 @@ def main():
         database.init_db()
         walk_forward_test()
         return
+
+    # Register SIGTERM handler for graceful Docker shutdown
+    _shutdown_requested = False
+
+    def _sigterm_handler(signum, frame):
+        nonlocal _shutdown_requested
+        _shutdown_requested = True
+        logger.info("SIGTERM received — initiating graceful shutdown")
+        raise KeyboardInterrupt()  # Reuse existing shutdown path
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
     console.print("[bold cyan]Starting Velox V10 Trading Bot...[/bold cyan]\n")
 

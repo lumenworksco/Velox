@@ -45,6 +45,7 @@ class KillSwitch:
             logger.info(f"Kill switch: cancelled {len(cancelled)} orders")
 
         # 2. Close all positions via broker
+        failed_closes = []
         if risk_manager:
             from execution import close_position
             for symbol in list(risk_manager.open_trades.keys()):
@@ -59,7 +60,14 @@ class KillSwitch:
                         )
                     logger.info(f"Kill switch: closed {symbol}")
                 except Exception as e:
+                    failed_closes.append(symbol)
                     logger.error(f"Kill switch: failed to close {symbol}: {e}")
+
+            if failed_closes:
+                logger.critical(
+                    f"KILL SWITCH: {len(failed_closes)} positions FAILED to close: "
+                    f"{failed_closes}. MANUAL INTERVENTION REQUIRED."
+                )
 
         # 3. Send notification
         try:

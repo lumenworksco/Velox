@@ -87,12 +87,8 @@ class PortfolioHeatTracker:
                 except (KeyError, ValueError):
                     continue
 
-            if len(cluster) > 1:
-                clusters[cluster_id] = cluster
-                cluster_id += 1
-            else:
-                clusters[cluster_id] = cluster
-                cluster_id += 1
+            clusters[cluster_id] = cluster
+            cluster_id += 1
 
         self._clusters = clusters
 

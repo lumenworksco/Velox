@@ -1,0 +1,13 @@
+# /etc/logrotate.d/velox — log rotation for Velox trading bot
+# Install: sudo cp deploy/logrotate-velox /etc/logrotate.d/velox
+
+/var/log/trading_bot.log /var/log/trading_bot_error.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    size 100M
+    copytruncate
+}

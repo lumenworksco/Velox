@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 import config
 from data import get_intraday_bars
@@ -66,7 +66,7 @@ class IntradayMicroMomentum:
 
         try:
             lookback = now - timedelta(minutes=30)
-            bars = get_intraday_bars("SPY", TimeFrame.Minute, start=lookback, end=now)
+            bars = get_intraday_bars("SPY", TimeFrame(1, TimeFrameUnit.Minute), start=lookback, end=now)
 
             if bars is None or bars.empty or len(bars) < 20:
                 return False
@@ -150,7 +150,7 @@ class IntradayMicroMomentum:
             try:
                 # Get current price
                 lookback = now - timedelta(minutes=5)
-                bars = get_intraday_bars(symbol, TimeFrame.Minute, start=lookback, end=now)
+                bars = get_intraday_bars(symbol, TimeFrame(1, TimeFrameUnit.Minute), start=lookback, end=now)
                 if bars is None or bars.empty:
                     continue
 

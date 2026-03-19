@@ -10,6 +10,7 @@ This creates an asymmetric daily P&L distribution:
 """
 
 import logging
+import threading
 from enum import Enum
 
 import config
@@ -27,6 +28,7 @@ class DailyPnLLock:
     """Tracks daily P&L and restricts trading based on thresholds."""
 
     def __init__(self):
+        self._lock = threading.Lock()
         self.state = LockState.NORMAL
         self._day_pnl_pct = 0.0
 
@@ -39,26 +41,27 @@ class DailyPnLLock:
         Returns:
             Current lock state
         """
-        self._day_pnl_pct = day_pnl_pct
+        with self._lock:
+            self._day_pnl_pct = day_pnl_pct
 
-        if day_pnl_pct <= config.PNL_LOSS_HALT_PCT:
-            if self.state != LockState.LOSS_HALT:
-                logger.warning(
-                    f"PNL LOCK: LOSS HALT activated at {day_pnl_pct:.2%} "
-                    f"(threshold: {config.PNL_LOSS_HALT_PCT:.2%})"
-                )
-            self.state = LockState.LOSS_HALT
-        elif day_pnl_pct >= config.PNL_GAIN_LOCK_PCT:
-            if self.state != LockState.GAIN_LOCK:
-                logger.info(
-                    f"PNL LOCK: GAIN LOCK activated at {day_pnl_pct:.2%} "
-                    f"(threshold: {config.PNL_GAIN_LOCK_PCT:.2%})"
-                )
-            self.state = LockState.GAIN_LOCK
-        else:
-            self.state = LockState.NORMAL
+            if day_pnl_pct <= config.PNL_LOSS_HALT_PCT:
+                if self.state != LockState.LOSS_HALT:
+                    logger.warning(
+                        f"PNL LOCK: LOSS HALT activated at {day_pnl_pct:.2%} "
+                        f"(threshold: {config.PNL_LOSS_HALT_PCT:.2%})"
+                    )
+                self.state = LockState.LOSS_HALT
+            elif day_pnl_pct >= config.PNL_GAIN_LOCK_PCT:
+                if self.state != LockState.GAIN_LOCK:
+                    logger.info(
+                        f"PNL LOCK: GAIN LOCK activated at {day_pnl_pct:.2%} "
+                        f"(threshold: {config.PNL_GAIN_LOCK_PCT:.2%})"
+                    )
+                self.state = LockState.GAIN_LOCK
+            else:
+                self.state = LockState.NORMAL
 
-        return self.state
+            return self.state
 
     def get_size_multiplier(self) -> float:
         """Get position size multiplier based on current lock state.
@@ -66,21 +69,25 @@ class DailyPnLLock:
         Returns:
             1.0 for NORMAL, 0.30 for GAIN_LOCK, 0.0 for LOSS_HALT
         """
-        if self.state == LockState.LOSS_HALT:
-            return 0.0
-        elif self.state == LockState.GAIN_LOCK:
-            return config.PNL_GAIN_LOCK_SIZE_MULT
-        return 1.0
+        with self._lock:
+            if self.state == LockState.LOSS_HALT:
+                return 0.0
+            elif self.state == LockState.GAIN_LOCK:
+                return config.PNL_GAIN_LOCK_SIZE_MULT
+            return 1.0
 
     def is_trading_allowed(self) -> bool:
         """Whether new trades are allowed."""
-        return self.state != LockState.LOSS_HALT
+        with self._lock:
+            return self.state != LockState.LOSS_HALT
 
     def reset_daily(self):
         """Reset state for new trading day."""
-        self.state = LockState.NORMAL
-        self._day_pnl_pct = 0.0
+        with self._lock:
+            self.state = LockState.NORMAL
+            self._day_pnl_pct = 0.0
 
     @property
     def day_pnl_pct(self) -> float:
-        return self._day_pnl_pct
+        with self._lock:
+            return self._day_pnl_pct

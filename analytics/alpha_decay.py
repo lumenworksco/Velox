@@ -115,11 +115,11 @@ class AlphaDecayMonitor:
         """Sharpe over the last *window* returns (per-trade basis)."""
         if len(returns) < min(window, 5):
             if len(returns) >= 5:
-                # Use what we have
-                return round(compute_sharpe(returns, periods_per_year=252), 4)
+                # Use what we have — annualize by trade count, not 252
+                return round(compute_sharpe(returns, periods_per_year=max(len(returns), 1)), 4)
             return None
         subset = returns[-window:]
-        return round(compute_sharpe(subset, periods_per_year=252), 4)
+        return round(compute_sharpe(subset, periods_per_year=max(len(subset), 1)), 4)
 
     @staticmethod
     def _classify_status(sharpe_30d: float | None) -> str:

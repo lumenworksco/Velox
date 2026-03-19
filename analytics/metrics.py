@@ -34,7 +34,7 @@ def compute_sortino(returns, risk_free_rate: float = 0.045,
         # No downside — infinite Sortino, cap at a large number
         return 10.0
 
-    downside_std = np.sqrt(np.mean(downside ** 2))
+    downside_std = np.std(downside, ddof=1) if len(downside) > 1 else np.sqrt(np.mean(downside ** 2))
 
     if downside_std < 1e-8:
         return 10.0

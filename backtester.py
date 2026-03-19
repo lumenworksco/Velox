@@ -251,7 +251,7 @@ def _compute_result(strategy: str, trades: list[BacktestTrade],
     # Profit factor
     gross_profit = sum(t.pnl for t in trades if t.pnl > 0)
     gross_loss = abs(sum(t.pnl for t in trades if t.pnl < 0))
-    pf = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+    pf = gross_profit / gross_loss if gross_loss > 0 else 999.9
 
     # Max drawdown
     peak = arr[0]

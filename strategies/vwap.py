@@ -11,7 +11,7 @@ import logging
 from datetime import datetime
 
 import pandas_ta as ta
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 import config
 from data import get_intraday_bars, get_snapshot
@@ -51,7 +51,7 @@ class VWAPStrategy:
 
             try:
                 # Get all 1-min bars from open until now
-                bars = get_intraday_bars(symbol, TimeFrame.Minute, start=market_open, end=now)
+                bars = get_intraday_bars(symbol, TimeFrame(1, TimeFrameUnit.Minute), start=market_open, end=now)
                 if bars.empty or len(bars) < 15:
                     continue
 

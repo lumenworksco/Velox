@@ -10,6 +10,7 @@ Each tier is configurable via config constants.
 """
 
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from enum import IntEnum
@@ -54,9 +55,10 @@ class TieredCircuitBreaker:
         self.current_tier = CircuitTier.NORMAL
         self.last_update: datetime | None = None
         self.tier_history: list[tuple[datetime, CircuitTier]] = []
+        self._lock = threading.Lock()
 
     def update(self, day_pnl_pct: float, now: datetime | None = None) -> CircuitTier:
-        """Evaluate current P&L and determine the appropriate tier.
+        """Evaluate current P&L and determine the appropriate tier (thread-safe).
 
         Args:
             day_pnl_pct: Today's P&L as a decimal (e.g., -0.02 = -2%)
@@ -65,6 +67,10 @@ class TieredCircuitBreaker:
         Returns:
             The current CircuitTier
         """
+        with self._lock:
+            return self._update_locked(day_pnl_pct, now)
+
+    def _update_locked(self, day_pnl_pct: float, now: datetime | None = None) -> CircuitTier:
         if now is None:
             now = datetime.now(config.ET)
 
@@ -123,9 +129,10 @@ class TieredCircuitBreaker:
         return self.config.close_all
 
     def reset_daily(self):
-        """Reset at start of new trading day."""
-        self.current_tier = CircuitTier.NORMAL
-        self.tier_history.clear()
+        """Reset at start of new trading day (thread-safe)."""
+        with self._lock:
+            self.current_tier = CircuitTier.NORMAL
+            self.tier_history.clear()
         logger.info("Circuit breaker reset for new day")
 
     @property

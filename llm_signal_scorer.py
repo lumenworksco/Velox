@@ -50,6 +50,8 @@ class LLMSignalScorer:
 
         try:
             prompt = self._build_prompt(signal, context)
+            if not prompt:
+                return SignalScore(score=0.7, confidence='LOW', reasoning='invalid_entry_price', size_mult=1.0)
 
             response = self.client.messages.create(
                 model="claude-haiku-4-5-20251001",
@@ -83,6 +85,9 @@ class LLMSignalScorer:
 
     def _build_prompt(self, signal: Signal, context: dict) -> str:
         """Build the prompt asking the LLM to rate a trade signal."""
+        if signal.entry_price <= 0:
+            logger.warning(f"LLM scorer: invalid entry_price={signal.entry_price} for {signal.symbol}")
+            return ""
         gain_pct = abs(signal.take_profit - signal.entry_price) / signal.entry_price * 100
         loss_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price * 100
         rr_ratio = gain_pct / loss_pct if loss_pct > 0 else 0.0
