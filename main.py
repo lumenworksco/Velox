@@ -1,4 +1,4 @@
-"""Velox V9 — Autonomous Algorithmic Trading System.
+"""Velox V10 — Autonomous Algorithmic Trading System.
 
 Six-strategy portfolio with HMM regime detection, adaptive allocation,
 cross-asset signals, signal ranking, intraday seasonality, volatility-targeted
@@ -32,7 +32,7 @@ from engine.exit_processor import (
     handle_strategy_exits, handle_ws_close, get_current_prices,
 )
 from engine.scanner import scan_all_strategies, check_all_exits, run_beta_neutralization
-from engine.daily_tasks import daily_reset, weekly_tasks, eod_close, eod_summary
+from engine.daily_tasks import daily_reset, weekly_tasks, eod_close
 from strategies.base import Signal
 from strategies.regime import MarketRegime
 from strategies.stat_mean_reversion import StatMeanReversion
@@ -99,7 +99,7 @@ try:
 except ImportError:
     WalkForwardValidator = None
 
-# --- V9 module imports (all fail-open) ---
+# --- V10 module imports (all fail-open) ---
 try:
     from strategies.pead import PEADStrategy
 except ImportError:
@@ -265,7 +265,7 @@ def startup_checks() -> dict:
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Velox V9 Trading Bot")
+    parser = argparse.ArgumentParser(description="Velox V10 Trading Bot")
     parser.add_argument("--backtest", action="store_true", help="Run backtesting engine")
     parser.add_argument("--walkforward", action="store_true", help="Run walk-forward test")
     parser.add_argument("--live", action="store_true", help="Alias for ALPACA_LIVE=true")
@@ -368,7 +368,7 @@ def main():
     latest_consistency_score = 0.0
 
     # Feature flags
-    features = ["MR60%", "PAIRS25%", "MICRO15%"]
+    features = ["MR50%", "VWAP20%", "PAIRS20%", "ORB5%", "MICRO5%"]
     if config.ALLOW_SHORT:
         features.append("Short")
     if config.TELEGRAM_ENABLED:
@@ -379,8 +379,8 @@ def main():
         features.append("WS")
 
     features_str = ", ".join(features)
-    console.print(f"\n[bold green]Velox V9 is running. Press Ctrl+C to stop.[/bold green]")
-    console.print(f"[dim]Strategies: STAT_MR + KALMAN_PAIRS + MICRO_MOM[/dim]")
+    console.print(f"\n[bold green]Velox V10 is running. Press Ctrl+C to stop.[/bold green]")
+    console.print(f"[dim]Strategies: STAT_MR + VWAP + KALMAN_PAIRS + ORB + MICRO_MOM + PEAD[/dim]")
     console.print(f"[dim]Features: {features_str}[/dim]\n")
 
     # -----------------------------------------------------------------------
@@ -582,6 +582,7 @@ def main():
                         signals = scan_all_strategies(
                             current, regime, stat_mr, kalman_pairs, micro_mom,
                             vwap_strategy, orb_strategy, pead_strategy, signal_ranker,
+                            day_pnl_pct=day_pnl_pct,
                         )
 
                         # 4. Process signals
@@ -853,8 +854,9 @@ def main():
                     )
                 )
 
-                # Sleep until next scan
-                time_mod.sleep(config.SCAN_INTERVAL_SEC)
+                # Sleep until next scan — interruptible 1s ticks
+                for _ in range(config.SCAN_INTERVAL_SEC):
+                    time_mod.sleep(1)
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down gracefully...[/yellow]")
@@ -878,482 +880,10 @@ def main():
         sys.exit(1)
 
 
+
 # ===========================================================================
-# ASYNC MODE
+# (Legacy async mode removed in V10 — synchronous main loop has all features)
 # ===========================================================================
-
-async def _async_scanner(
-    risk, regime_detector, stat_mr, kalman_pairs, micro_mom,
-    vol_engine, pnl_lock, beta_neutral, ws_monitor,
-):
-    """Async task: scan for V6 signals and process them every SCAN_INTERVAL_SEC."""
-    universe_prepared_today = False
-
-    while True:
-        try:
-            current = now_et()
-            ct = current.time()
-            regime = regime_detector.regime
-
-            if is_market_hours(ct):
-                # 9:00 AM universe prep
-                if not universe_prepared_today and ct >= config.MR_UNIVERSE_PREP_TIME:
-                    try:
-                        stat_mr.prepare_universe(config.STANDARD_SYMBOLS, current)
-                        universe_prepared_today = True
-                    except Exception as e:
-                        logger.error(f"[async] MR universe prep failed: {e}")
-
-                    if current.weekday() == 0:
-                        try:
-                            kalman_pairs.select_pairs_weekly(current)
-                        except Exception as e:
-                            logger.error(f"[async] Monday pair selection failed: {e}")
-
-                # Trading hours
-                if is_trading_hours(ct):
-                    pnl_lock.update(risk.day_pnl)
-
-                    try:
-                        micro_mom.detect_event(current)
-                    except Exception as e:
-                        logger.error(f"[async] Micro event detection failed: {e}")
-
-                    signals: list[Signal] = []
-                    try:
-                        signals.extend(stat_mr.scan(current, regime))
-                    except Exception as e:
-                        logger.error(f"[async] StatMR scan failed: {e}")
-                    try:
-                        signals.extend(kalman_pairs.scan(current, regime))
-                    except Exception as e:
-                        logger.error(f"[async] KalmanPairs scan failed: {e}")
-                    try:
-                        signals.extend(micro_mom.scan(current, day_pnl_pct=risk.day_pnl, regime=regime))
-                    except Exception as e:
-                        logger.error(f"[async] MicroMom scan failed: {e}")
-
-                    if signals:
-                        process_signals(
-                            signals, risk, regime, current,
-                            vol_engine, pnl_lock, ws_monitor,
-                        )
-
-            # Reset universe tracking at day boundary
-            if ct < config.MARKET_OPEN:
-                universe_prepared_today = False
-
-        except Exception as e:
-            logger.error(f"[async] Scanner error: {e}", exc_info=True)
-
-        await asyncio.sleep(config.SCAN_INTERVAL_SEC)
-
-
-async def _async_exit_checker(
-    risk, stat_mr, kalman_pairs, micro_mom, beta_neutral,
-    vol_engine, pnl_lock, ws_monitor,
-):
-    """Async task: check V6 exit conditions every 30 seconds."""
-    while True:
-        try:
-            current = now_et()
-            ct = current.time()
-
-            if is_trading_hours(ct):
-                # Strategy exits
-                try:
-                    mr_exits = stat_mr.check_exits(risk.open_trades, current)
-                    if mr_exits:
-                        handle_strategy_exits(mr_exits, risk, current, ws_monitor)
-                except Exception as e:
-                    logger.error(f"[async] StatMR exit check failed: {e}")
-
-                try:
-                    pair_exits = kalman_pairs.check_exits(risk.open_trades, current)
-                    if pair_exits:
-                        handle_strategy_exits(pair_exits, risk, current, ws_monitor)
-                except Exception as e:
-                    logger.error(f"[async] KalmanPairs exit check failed: {e}")
-
-                try:
-                    micro_exits = micro_mom.check_exits(risk.open_trades, current)
-                    if micro_exits:
-                        handle_strategy_exits(micro_exits, risk, current, ws_monitor)
-                except Exception as e:
-                    logger.error(f"[async] MicroMom exit check failed: {e}")
-
-                # Beta neutralization
-                if beta_neutral.should_check_now(current):
-                    if not beta_neutral.should_skip(current):
-                        try:
-                            prices = get_current_prices(risk.open_trades)
-                            beta_neutral.compute_portfolio_beta(risk.open_trades, prices)
-                            if beta_neutral.needs_hedge():
-                                spy_price = prices.get("SPY")
-                                if not spy_price:
-                                    try:
-                                        snap = get_snapshot("SPY")
-                                        spy_price = float(snap.latest_trade.price) if snap and snap.latest_trade else None
-                                    except Exception:
-                                        spy_price = None
-                                if spy_price:
-                                    hedge_signal = beta_neutral.compute_hedge_signal(
-                                        risk.current_equity, spy_price
-                                    )
-                                    if hedge_signal:
-                                        regime = "UNKNOWN"  # Hedge is regime-agnostic
-                                        process_signals(
-                                            [hedge_signal], risk, regime, current,
-                                            vol_engine, pnl_lock, ws_monitor,
-                                        )
-                        except Exception as e:
-                            logger.error(f"[async] Beta neutralization failed: {e}")
-
-                # EOD close for day-hold positions
-                if ct >= config.ORB_EXIT_TIME:
-                    for symbol in list(risk.open_trades.keys()):
-                        trade = risk.open_trades[symbol]
-                        if trade.hold_type == "day" and trade.strategy in ("MICRO_MOM", "BETA_HEDGE"):
-                            try:
-                                close_position(symbol, reason="eod_close")
-                                try:
-                                    snap = get_snapshot(symbol)
-                                    ep = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
-                                except Exception:
-                                    ep = trade.entry_price
-                                risk.close_trade(symbol, ep, current, exit_reason="eod_close")
-                                if ws_monitor:
-                                    ws_monitor.unsubscribe(symbol)
-                            except Exception as e:
-                                logger.error(f"[async] EOD close failed for {symbol}: {e}")
-
-                # Shadow exits
-                check_shadow_exits(current)
-
-        except Exception as e:
-            logger.error(f"[async] Exit checker error: {e}", exc_info=True)
-
-        await asyncio.sleep(30)
-
-
-async def _async_broker_sync(risk, ws_monitor):
-    """Async task: sync positions with broker every 60 seconds.
-
-    FIXED in V9: Always run broker sync regardless of WebSocket status.
-    The WS monitors quotes for price-based exits, but bracket order TP/SL
-    legs fire at the broker level — only broker sync detects those closes.
-    """
-    while True:
-        try:
-            current = now_et()
-            if is_market_hours(current.time()):
-                sync_positions_with_broker(risk, current, ws_monitor)
-
-
-                if risk.check_circuit_breaker():
-                    if notifications and config.TELEGRAM_ENABLED:
-                        try:
-                            notifications.notify_circuit_breaker(risk.day_pnl)
-                        except Exception:
-                            pass
-        except Exception as e:
-            logger.error(f"[async] Broker sync error: {e}", exc_info=True)
-
-        await asyncio.sleep(60)
-
-
-async def _async_state_saver(risk):
-    """Async task: save open positions to DB every STATE_SAVE_INTERVAL_SEC."""
-    while True:
-        await asyncio.sleep(config.STATE_SAVE_INTERVAL_SEC)
-        try:
-            database.save_open_positions(risk.open_trades)
-        except Exception as e:
-            logger.error(f"[async] State save failed: {e}")
-
-
-async def _async_daily_tasks(
-    risk, regime_detector, stat_mr, kalman_pairs, micro_mom,
-    pnl_lock, beta_neutral, vol_engine,
-):
-    """Async task: handle daily resets, regime updates, analytics, consistency score."""
-    last_day = now_et().date()
-    last_sunday_task = None
-    eod_summary_printed = False
-    current_analytics = None
-    latest_consistency_score = 0.0
-
-    while True:
-        try:
-            current = now_et()
-            ct = current.time()
-
-            # Daily reset
-            if current.date() != last_day:
-                logger.info("[async] New trading day -- resetting state")
-                stat_mr.reset_daily()
-                micro_mom.reset_daily()
-                pnl_lock.reset_daily()
-                beta_neutral.reset_daily()
-
-                try:
-                    account = get_account()
-                    risk.reset_daily(float(account.equity), float(account.cash))
-                except Exception as e:
-                    logger.error(f"[async] Daily reset failed: {e}")
-                last_day = current.date()
-                eod_summary_printed = False
-
-                try:
-                    load_earnings_cache(config.SYMBOLS)
-                    load_correlation_cache(config.SYMBOLS)
-                except Exception as e:
-                    logger.error(f"[async] Cache refresh failed: {e}")
-
-            # Sunday tasks
-            if (current.weekday() == 6 and ct >= time(0, 0)
-                    and last_sunday_task != current.date()):
-                last_sunday_task = current.date()
-                try:
-                    kalman_pairs.select_pairs_weekly(current)
-                except Exception as e:
-                    logger.error(f"[async] Weekly pair selection failed: {e}")
-
-            # Regime update
-            regime_detector.update(current)
-
-            # Vol scalar update
-            try:
-                from risk import get_vix_level
-                vix = get_vix_level()
-                pnl_series = database.get_daily_pnl_series(days=20)
-                rolling_std = float(np.std(pnl_series)) if np is not None and len(pnl_series) > 2 else 0.01
-                vol_engine.compute_vol_scalar(vix=vix, rolling_pnl_std=rolling_std)
-            except Exception:
-                pass
-
-            # EOD summary
-            if ct >= config.EOD_SUMMARY_TIME and not eod_summary_printed:
-                summary = risk.get_day_summary()
-                print_day_summary(summary, consistency_score=latest_consistency_score)
-                logger.info(f"Day summary: {summary}")
-                if notifications and config.TELEGRAM_ENABLED:
-                    try:
-                        notifications.notify_daily_summary(summary, risk.current_equity)
-                    except Exception:
-                        pass
-                try:
-                    wr = summary.get("win_rate", 0) if summary.get("trades", 0) > 0 else 0
-                    database.save_daily_snapshot(
-                        date=current.strftime("%Y-%m-%d"),
-                        portfolio_value=risk.current_equity,
-                        cash=risk.current_cash,
-                        day_pnl=risk.day_pnl * risk.starting_equity,
-                        day_pnl_pct=risk.day_pnl,
-                        total_trades=summary.get("trades", 0),
-                        win_rate=wr,
-                        sharpe_rolling=current_analytics.get("sharpe_7d", 0) if current_analytics else 0,
-                    )
-                except Exception as e:
-                    logger.error(f"[async] Daily snapshot failed: {e}")
-
-                # Consistency score
-                try:
-                    daily_pnls = database.get_daily_pnl_series(days=30)
-                    sharpe = current_analytics.get("sharpe_7d", 0) if current_analytics else 0
-                    max_dd = current_analytics.get("max_drawdown", 0) if current_analytics else 0
-                    latest_consistency_score = compute_consistency_score(daily_pnls, sharpe, max_dd)
-                    pct_positive = sum(1 for p in daily_pnls if p > 0) / max(len(daily_pnls), 1)
-                    database.save_consistency_log(
-                        date=current.strftime("%Y-%m-%d"),
-                        consistency_score=latest_consistency_score,
-                        pct_positive=pct_positive,
-                        sharpe=sharpe,
-                        max_drawdown=max_dd,
-                        vol_scalar_avg=vol_engine.last_scalar,
-                        beta_avg=beta_neutral.portfolio_beta,
-                    )
-                except Exception as e:
-                    logger.error(f"[async] Consistency score failed: {e}")
-
-                eod_summary_printed = True
-
-            # Analytics
-            try:
-                current_analytics = analytics_mod.compute_analytics()
-                if current_analytics and notifications and config.TELEGRAM_ENABLED:
-                    dd = current_analytics.get("max_drawdown", 0)
-                    if dd > 0.05:
-                        try:
-                            notifications.notify_drawdown_warning(dd)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-        except Exception as e:
-            logger.error(f"[async] Daily tasks error: {e}", exc_info=True)
-
-        await asyncio.sleep(60)
-
-
-async def _async_dashboard_updater(
-    risk, regime_detector, start_time, live,
-    pnl_lock, vol_engine, beta_neutral,
-):
-    """Async task: refresh the Rich dashboard."""
-    latest_consistency_score = 0.0
-    while True:
-        try:
-            current = now_et()
-            live.update(
-                build_dashboard(
-                    risk, regime_detector.regime, start_time, current, current,
-                    len(config.SYMBOLS), None,
-                    pnl_lock_state=pnl_lock.state.value,
-                    vol_scalar=vol_engine.last_scalar,
-                    portfolio_beta=beta_neutral.portfolio_beta,
-                    consistency_score=latest_consistency_score,
-                )
-            )
-        except Exception as e:
-            logger.error(f"[async] Dashboard update failed: {e}")
-        await asyncio.sleep(5)
-
-
-async def async_main():
-    """Async entry point -- runs all tasks concurrently under supervision."""
-    import asyncio as _asyncio
-    from supervisor import TaskSupervisor
-
-    console.print("[bold cyan]Starting Velox V9 Trading Bot (ASYNC MODE)...[/bold cyan]\n")
-
-    # Initialize database
-    database.init_db()
-    database.migrate_from_json()
-
-    # Startup checks
-    info = startup_checks()
-
-    # Strategy initialization
-    stat_mr = StatMeanReversion()
-    kalman_pairs = KalmanPairsTrader()
-    micro_mom = IntradayMicroMomentum()
-
-    # Risk engine
-    vol_engine = VolatilityTargetingRiskEngine()
-    pnl_lock = DailyPnLLock()
-    beta_neutral = BetaNeutralizer()
-
-    regime_detector = MarketRegime()
-    risk = RiskManager()
-    risk.reset_daily(info["equity"], info["cash"])
-    risk.load_from_db()
-
-    # WS monitor
-    ws_monitor = None
-    if config.WEBSOCKET_MONITORING and PositionMonitor:
-        ws_monitor = PositionMonitor(risk)
-        ws_monitor.set_close_callback(
-            lambda symbol, reason: handle_ws_close(symbol, reason, risk, ws_monitor)
-        )
-        for symbol in risk.open_trades:
-            ws_monitor.subscribe(symbol)
-        ws_monitor.start()
-
-    # Web dashboard
-    if config.WEB_DASHBOARD_ENABLED:
-        try:
-            from web_dashboard import start_web_dashboard
-            start_web_dashboard()
-        except Exception:
-            pass
-
-    # Notifications
-    if notifications and config.TELEGRAM_ENABLED:
-        console.print("[green]Notifications enabled.[/green]")
-
-    # Load filters
-    try:
-        load_earnings_cache(config.SYMBOLS)
-    except Exception:
-        pass
-    try:
-        load_correlation_cache(config.SYMBOLS)
-    except Exception:
-        pass
-
-    start_time = now_et()
-    logging.getLogger().removeHandler(_stream_handler)
-
-    console.print(f"\n[bold green]Velox V9 (ASYNC) is running. Press Ctrl+C to stop.[/bold green]\n")
-
-    supervisor = TaskSupervisor()
-
-    if notifications and config.TELEGRAM_ENABLED:
-        async def _crash_notify(name, exc, count):
-            try:
-                notifications.send_message(f"Task '{name}' crashed (#{count}): {exc}")
-            except Exception:
-                pass
-        supervisor.set_notify(_crash_notify)
-
-    try:
-        with Live(
-            build_dashboard(
-                risk, regime_detector.regime, start_time, now_et(), None,
-                len(config.SYMBOLS), None,
-                pnl_lock_state=pnl_lock.state.value,
-                vol_scalar=vol_engine.last_scalar,
-                portfolio_beta=beta_neutral.portfolio_beta,
-            ),
-            console=console, refresh_per_second=0.2, transient=False,
-        ) as live:
-            await supervisor.launch(
-                "scanner", _async_scanner,
-                risk, regime_detector, stat_mr, kalman_pairs, micro_mom,
-                vol_engine, pnl_lock, beta_neutral, ws_monitor,
-            )
-            await supervisor.launch(
-                "exit_checker", _async_exit_checker,
-                risk, stat_mr, kalman_pairs, micro_mom, beta_neutral,
-                vol_engine, pnl_lock, ws_monitor,
-            )
-            await supervisor.launch(
-                "broker_sync", _async_broker_sync,
-                risk, ws_monitor,
-            )
-            await supervisor.launch(
-                "state_saver", _async_state_saver,
-                risk,
-            )
-            await supervisor.launch(
-                "daily_tasks", _async_daily_tasks,
-                risk, regime_detector, stat_mr, kalman_pairs, micro_mom,
-                pnl_lock, beta_neutral, vol_engine,
-            )
-            await supervisor.launch(
-                "dashboard", _async_dashboard_updater,
-                risk, regime_detector, start_time, live,
-                pnl_lock, vol_engine, beta_neutral,
-            )
-
-            try:
-                await _asyncio.Event().wait()
-            except _asyncio.CancelledError:
-                pass
-
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Shutting down async tasks...[/yellow]")
-    finally:
-        await supervisor.stop_all()
-        if ws_monitor:
-            ws_monitor.stop()
-        try:
-            database.save_open_positions(risk.open_trades)
-        except Exception:
-            pass
-        console.print("[green]State saved. Bot stopped.[/green]")
 
 
 # ===========================================================================
@@ -1362,7 +892,7 @@ async def async_main():
 
 def run_diagnostic():
     """Run one diagnostic scan cycle and print what's blocking trades."""
-    print("\n=== VELOX V9 SIGNAL DIAGNOSTIC MODE ===\n")
+    print("\n=== VELOX V10 SIGNAL DIAGNOSTIC MODE ===\n")
     print("Initializing strategies and filters...\n")
 
     from earnings import has_earnings_soon, load_earnings_cache
@@ -1499,14 +1029,11 @@ def run_diagnostic():
 if __name__ == "__main__":
     import argparse as _argparse
 
-    _parser = _argparse.ArgumentParser(description="Velox V9 Trading Bot")
+    _parser = _argparse.ArgumentParser(description="Velox V10 Trading Bot")
     _parser.add_argument("--diagnose", action="store_true", help="Run one diagnostic scan cycle (read-only)")
     _args = _parser.parse_args()
 
     if _args.diagnose:
         run_diagnostic()
-    elif config.ASYNC_MODE:
-        import asyncio
-        asyncio.run(async_main())
     else:
         main()

@@ -58,10 +58,10 @@ class LLMSignalScorer:
                 messages=[{"role": "user", "content": prompt}],
             )
 
-            # Track cost (Haiku: $0.25/M input, $1.25/M output as of 2024-11)
+            # Track cost (Haiku 4.5: $0.25/M input, $1.25/M output)
             input_tokens = response.usage.input_tokens
             output_tokens = response.usage.output_tokens
-            cost = (input_tokens * 0.80 / 1_000_000) + (output_tokens * 4.0 / 1_000_000)
+            cost = (input_tokens * 0.25 / 1_000_000) + (output_tokens * 1.25 / 1_000_000)
             self._daily_cost_usd += cost
             self._call_count += 1
 

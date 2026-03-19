@@ -85,8 +85,11 @@ class TestScaledTP:
 
 class TestTrailingStop:
     def test_trailing_stop_updates_highest(self, override_config):
-        """highest_price_seen updates and trailing stop triggers."""
+        """ATR trailing stop triggers when price drops below trail."""
         with override_config(ADVANCED_EXITS_ENABLED=True, SCALED_TP_ENABLED=False,
+                             ATR_TRAILING_ENABLED=True,
+                             ATR_TRAIL_MULT={"STAT_MR": 2.0},
+                             ATR_TRAIL_ACTIVATION=0.5,
                              TRAILING_STOP_PCT=0.015, RSI_EXIT_THRESHOLD=80):
             from exit_manager import ExitManager
             from risk import RiskManager
@@ -94,23 +97,25 @@ class TestTrailingStop:
             em = ExitManager()
             rm = RiskManager(current_equity=100_000, starting_equity=100_000)
 
-            trade = _make_trade(symbol="NVDA", strategy="MOMENTUM",
+            # Use ATR trailing: entry_atr=1.0, mult=2.0 → trail = 2.0
+            # highest=110, trail stop = 110 - 2.0 = 108.0
+            trade = _make_trade(symbol="NVDA", strategy="STAT_MR",
                                 entry_price=100.0, qty=10, side="buy",
                                 take_profit=115.0, stop_loss=95.0,
-                                highest_price_seen=110.0)
+                                highest_price_seen=110.0, entry_atr=1.0)
             rm.register_trade(trade)
 
             now = datetime(2026, 3, 13, 14, 0, tzinfo=ET)
 
-            # Price has dropped below trailing stop: 110 * (1 - 0.015) = 108.35
+            # Price at 107.5 is below ATR trail of 108.0
             mock_snap = MagicMock()
-            mock_snap.latest_trade.price = 108.0
+            mock_snap.latest_trade.price = 107.5
 
             with patch("data.get_snapshot", return_value=mock_snap):
                 actions = em.check_exits(rm, now)
 
             assert len(actions) == 1
-            assert actions[0]["action"] == "trailing_stop"
+            assert actions[0]["action"] == "atr_trailing_stop"
 
 
 class TestVolatilityExit:

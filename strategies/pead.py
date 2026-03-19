@@ -43,7 +43,8 @@ class PEADStrategy:
 
         # Only scan at or after 9:00 AM ET
         scan_time = now.time()
-        if scan_time < config.MARKET_OPEN.__class__(9, 0):
+        from datetime import time as dt_time
+        if scan_time < dt_time(9, 0):
             return []
 
         self._scanned_today = True
@@ -157,8 +158,13 @@ class PEADStrategy:
                         })
                         continue
 
-                # P&L based exits using entry_price and current highest/latest
-                current_price = getattr(trade, "highest_price_seen", 0) or trade.entry_price
+                # P&L based exits using current market price
+                try:
+                    from data import get_snapshot
+                    snap = get_snapshot(symbol)
+                    current_price = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
+                except Exception:
+                    current_price = trade.entry_price
                 if trade.side == "buy":
                     pnl_pct = (current_price - trade.entry_price) / trade.entry_price
                     if pnl_pct >= config.PEAD_TAKE_PROFIT:

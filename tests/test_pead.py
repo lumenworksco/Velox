@@ -239,7 +239,10 @@ class TestPEADExits:
             entry_price=100.0, entry_time=entry_time,
             hold_type="swing", highest_price_seen=105.5,
         )
-        exits = strat.check_exits({"AAPL": trade}, SCAN_TIME)
+        mock_snap = MagicMock()
+        mock_snap.latest_trade.price = 105.5
+        with patch("data.get_snapshot", return_value=mock_snap):
+            exits = strat.check_exits({"AAPL": trade}, SCAN_TIME)
         assert len(exits) == 1
         assert "take profit" in exits[0]["reason"]
 
@@ -252,7 +255,10 @@ class TestPEADExits:
             entry_price=100.0, entry_time=entry_time,
             hold_type="swing", highest_price_seen=96.5,
         )
-        exits = strat.check_exits({"AAPL": trade}, SCAN_TIME)
+        mock_snap = MagicMock()
+        mock_snap.latest_trade.price = 96.5
+        with patch("data.get_snapshot", return_value=mock_snap):
+            exits = strat.check_exits({"AAPL": trade}, SCAN_TIME)
         assert len(exits) == 1
         assert "stop loss" in exits[0]["reason"]
 

@@ -87,10 +87,20 @@ def verify_token(token: str) -> dict | None:
 def verify_password(password: str) -> bool:
     """Verify a password against the stored hash.
 
-    Uses simple SHA256 hash comparison. For production, use bcrypt.
+    Supports bcrypt hashes ($2b$ prefix) with SHA256 fallback.
+    Generate bcrypt hash: python3 -c "import bcrypt; print(bcrypt.hashpw(b'PASSWORD', bcrypt.gensalt()).decode())"
     """
     if not PASSWORD_HASH:
         return False
+    # bcrypt hash detection
+    if PASSWORD_HASH.startswith("$2b$") or PASSWORD_HASH.startswith("$2a$"):
+        try:
+            import bcrypt
+            return bcrypt.checkpw(password.encode(), PASSWORD_HASH.encode())
+        except ImportError:
+            logger.warning("bcrypt not installed — cannot verify bcrypt password hash")
+            return False
+    # SHA256 fallback (legacy)
     password_hash = hashlib.sha256(password.encode()).hexdigest()
     return hmac.compare_digest(password_hash, PASSWORD_HASH)
 

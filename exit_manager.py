@@ -85,12 +85,6 @@ class ExitManager:
                 return action
 
         # --- 2. TRAILING STOP ---
-        # Legacy: fixed trailing for swing strategies
-        if trade.strategy in ("MOMENTUM", "SECTOR_ROTATION", "PAIRS"):
-            action = self._check_trailing_stop(trade, current_price, risk_manager, now)
-            if action:
-                return action
-
         # V8: ATR-based trailing for all strategies
         if config.ATR_TRAILING_ENABLED and trade.entry_atr > 0:
             action = self._check_atr_trailing_stop(trade, current_price, risk_manager, now)

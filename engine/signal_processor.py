@@ -152,13 +152,19 @@ def process_signals(
 
                 if second_sig.symbol not in risk.open_trades:
                     logger.warning(f"Pair {pair_id}: second leg {second_sig.symbol} failed, closing first leg {first_sig.symbol}")
-                    try:
-                        close_position(first_sig.symbol, reason="pair_rollback")
-                        trade = risk.open_trades.get(first_sig.symbol)
-                        if trade:
-                            risk.close_trade(first_sig.symbol, trade.entry_price, now, exit_reason="pair_rollback")
-                    except Exception as e:
-                        logger.error(f"Pair rollback failed for {first_sig.symbol}: {e}")
+                    rollback_ok = False
+                    for attempt in range(3):
+                        try:
+                            close_position(first_sig.symbol, reason="pair_rollback")
+                            trade = risk.open_trades.get(first_sig.symbol)
+                            if trade:
+                                risk.close_trade(first_sig.symbol, trade.entry_price, now, exit_reason="pair_rollback")
+                            rollback_ok = True
+                            break
+                        except Exception as e:
+                            logger.error(f"Pair rollback attempt {attempt+1}/3 failed for {first_sig.symbol}: {e}")
+                    if not rollback_ok:
+                        logger.critical(f"PAIR ROLLBACK FAILED after 3 attempts for {first_sig.symbol} — manual intervention required")
             else:
                 database.log_signal(now, second_sig.symbol, second_sig.strategy, second_sig.side, False, "pair_first_leg_failed")
         else:

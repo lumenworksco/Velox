@@ -1,6 +1,7 @@
 """Risk management — position sizing, circuit breaker, portfolio limits, VIX scaling."""
 
 import logging
+import threading
 import time as time_mod
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -93,6 +94,7 @@ class RiskManager:
     closed_trades: list = field(default_factory=list)    # today's closed trades
     signals_today: int = 0
     _strategy_weights: dict = field(default_factory=dict)  # V3: strategy -> weight
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def reset_daily(self, equity: float, cash: float):
         """Reset daily state. Preserves swing (multi-day) trades."""
@@ -114,6 +116,8 @@ class RiskManager:
         self.current_cash = cash
         if self.starting_equity > 0:
             self.day_pnl = (equity - self.starting_equity) / self.starting_equity
+        else:
+            self.day_pnl = 0.0
 
     def check_circuit_breaker(self) -> bool:
         """Check if daily loss limit hit. Returns True if trading should halt."""
@@ -251,9 +255,10 @@ class RiskManager:
         return max(qty, 0)
 
     def register_trade(self, trade: TradeRecord):
-        """Register a new open trade."""
-        self.open_trades[trade.symbol] = trade
-        self.signals_today += 1
+        """Register a new open trade (thread-safe)."""
+        with self._lock:
+            self.open_trades[trade.symbol] = trade
+            self.signals_today += 1
         logger.info(
             f"Trade opened: {trade.side.upper()} {trade.qty} {trade.symbol} "
             f"@ {trade.entry_price:.2f} ({trade.strategy}/{trade.hold_type}) "
@@ -262,11 +267,11 @@ class RiskManager:
 
     def close_trade(self, symbol: str, exit_price: float, now: datetime,
                     exit_reason: str = ""):
-        """Close a trade, record P&L, and log to database."""
-        if symbol not in self.open_trades:
-            return
-
-        trade = self.open_trades.pop(symbol)
+        """Close a trade, record P&L, and log to database (thread-safe)."""
+        with self._lock:
+            if symbol not in self.open_trades:
+                return
+            trade = self.open_trades.pop(symbol)
         trade.exit_price = exit_price
         trade.exit_time = now
         trade.status = "closed"

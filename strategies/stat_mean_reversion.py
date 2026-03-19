@@ -157,7 +157,7 @@ class StatMeanReversion:
                 # Get 2-min intraday bars (last 2 hours)
                 lookback = now - timedelta(hours=2)
                 bars = get_intraday_bars(
-                    symbol, TimeFrame(2, "Min"), start=lookback, end=now
+                    symbol, TimeFrame(2, TimeFrameUnit.Minute), start=lookback, end=now
                 )
                 if bars is None or bars.empty or len(bars) < 20:
                     continue
@@ -283,7 +283,7 @@ class StatMeanReversion:
                 # Get current price from recent bars
                 lookback = now - timedelta(minutes=10)
                 bars = get_intraday_bars(
-                    symbol, TimeFrame(2, "Min"), start=lookback, end=now
+                    symbol, TimeFrame(2, TimeFrameUnit.Minute), start=lookback, end=now
                 )
                 if bars is None or bars.empty:
                     continue
@@ -295,9 +295,9 @@ class StatMeanReversion:
 
                 # Time stop: 2x half_life
                 if hasattr(trade, 'entry_time') and trade.entry_time:
-                    # V10: half_life is in bar units; convert to trading minutes
-                    # A trading day = 390 minutes (6.5 hours), so 1 daily bar = 390 min
-                    half_life_minutes = ou['half_life'] * 2 * 390  # 2x half-life in minutes
+                    # V10: half_life is in 2-min bar units; convert to trading minutes
+                    # half_life * 2 (min/bar) * 2 (2x half-life for time stop)
+                    half_life_minutes = ou['half_life'] * 2 * 2  # 2x half-life in minutes
                     max_hold = max(30, min(half_life_minutes, 240))  # 30 min to 4 hours
                     elapsed = (now - trade.entry_time).total_seconds() / 60
                     if elapsed > max_hold:

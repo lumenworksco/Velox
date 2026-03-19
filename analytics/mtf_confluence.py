@@ -58,7 +58,7 @@ def get_mtf_confluence(symbol: str, side: str, now: datetime | None = None) -> f
 
     try:
         from data import get_daily_bars, get_intraday_bars
-        from alpaca.data.timeframe import TimeFrame
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
         # 1. Daily: Price vs EMA20
         try:
@@ -99,7 +99,7 @@ def get_mtf_confluence(symbol: str, side: str, now: datetime | None = None) -> f
         try:
             if now:
                 start = now - timedelta(days=2)
-                min15_bars = get_intraday_bars(symbol, TimeFrame(15, "Min"), start=start, end=now)
+                min15_bars = get_intraday_bars(symbol, TimeFrame(15, TimeFrameUnit.Minute), start=start, end=now)
             else:
                 min15_bars = None
 

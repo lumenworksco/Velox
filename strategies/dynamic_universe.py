@@ -148,12 +148,13 @@ class DynamicUniverse:
         Higher score = more desirable. Returns 0 if filtered out.
         """
         score = 0.5  # Base score
+        price = 0.0
 
         if snapshots and symbol in snapshots:
             snap = snapshots[symbol]
-            price = getattr(snap, 'latest_trade', None)
-            if price:
-                price = float(price.price)
+            latest_trade = getattr(snap, 'latest_trade', None)
+            if latest_trade and hasattr(latest_trade, 'price'):
+                price = float(latest_trade.price)
                 if price < self.min_price or price > self.max_price:
                     return 0.0
                 # Prefer mid-range prices (better for retail sizing)

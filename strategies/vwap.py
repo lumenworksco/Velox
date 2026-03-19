@@ -112,12 +112,14 @@ class VWAPStrategy:
                         vol_ratio = bars["volume"].iloc[-1] / avg_vol
 
                 # BUY signal: price touched lower band and bounced back above
-                # V10 BUG-011: Skip OU filter when ou_zscore is None (fit failed)
-                ou_buy_ok = ou_zscore is not None and ou_zscore < -config.VWAP_OU_ZSCORE_MIN
+                # Require valid OU z-score — skip symbol if OU fit failed
+                if ou_zscore is None:
+                    continue
+                ou_buy_ok = ou_zscore < -config.VWAP_OU_ZSCORE_MIN
                 if (prev_bar["low"] <= lower
                         and curr_bar["close"] > lower
                         and rsi < config.VWAP_RSI_OVERSOLD
-                        and (ou_buy_ok or ou_zscore is None)
+                        and ou_buy_ok
                         and vol_ratio > config.VWAP_VOLUME_RATIO):
 
                     # Confirmation bar check
@@ -168,7 +170,7 @@ class VWAPStrategy:
                     and prev_bar["high"] >= upper
                     and curr_bar["close"] < upper
                     and rsi > config.VWAP_RSI_OVERBOUGHT
-                    and (ou_zscore is not None and ou_zscore > config.VWAP_OU_ZSCORE_MIN or ou_zscore is None)
+                    and ou_zscore > config.VWAP_OU_ZSCORE_MIN
                     and day_move > 0.01
                     and vol_ratio > config.VWAP_VOLUME_RATIO
                 ):

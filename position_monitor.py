@@ -166,11 +166,7 @@ class PositionMonitor:
                 self._trigger_close(symbol, "take_profit_ws")
                 return
 
-            # Update trailing stop for momentum positions
-            if trade.strategy == "MOMENTUM" and trade.side == "buy":
-                trailing_stop = current_price * (1 - config.MOMENTUM_TRAILING_STOP_PCT)
-                if trailing_stop > trade.stop_loss:
-                    trade.stop_loss = trailing_stop
+            # Update trailing stop via ATR-based trailing (handled by exit_manager)
 
             # Short hard stop check (4% max loss)
             if trade.side == "sell" and config.ALLOW_SHORT:

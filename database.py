@@ -22,7 +22,10 @@ def _to_iso(dt) -> str | None:
         return dt.isoformat()
     return str(dt)
 
+import threading
+
 _conn: sqlite3.Connection | None = None
+_db_lock = threading.Lock()
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -320,34 +323,36 @@ def save_open_positions(open_trades: dict):
     """Replace all open_positions rows with current state.
 
     V10 BUG-029: Atomic transaction — if crash occurs mid-save, all positions are preserved.
+    Thread-safe via _db_lock.
     """
     conn = _get_conn()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute("DELETE FROM open_positions")
-        for symbol, trade in open_trades.items():
-            conn.execute(
-                """INSERT INTO open_positions (symbol, strategy, side, entry_price,
-                   qty, entry_time, take_profit, stop_loss, alpaca_order_id,
-                   hold_type, time_stop, max_hold_date,
-                   pair_id, partial_exits, highest_price_seen, lowest_price_seen, entry_atr)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (symbol, trade.strategy, trade.side, trade.entry_price,
-                 trade.qty, _to_iso(trade.entry_time), trade.take_profit,
-                 trade.stop_loss, trade.order_id,
-                 getattr(trade, 'hold_type', 'day'),
-                 _to_iso(trade.time_stop),
-                 _to_iso(getattr(trade, 'max_hold_date', None)),
-                 getattr(trade, 'pair_id', ''),
-                 getattr(trade, 'partial_exits', 0),
-                 getattr(trade, 'highest_price_seen', 0.0),
-                 getattr(trade, 'lowest_price_seen', 0.0),
-                 getattr(trade, 'entry_atr', 0.0)),
-            )
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+    with _db_lock:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM open_positions")
+            for symbol, trade in open_trades.items():
+                conn.execute(
+                    """INSERT INTO open_positions (symbol, strategy, side, entry_price,
+                       qty, entry_time, take_profit, stop_loss, alpaca_order_id,
+                       hold_type, time_stop, max_hold_date,
+                       pair_id, partial_exits, highest_price_seen, lowest_price_seen, entry_atr)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (symbol, trade.strategy, trade.side, trade.entry_price,
+                     trade.qty, _to_iso(trade.entry_time), trade.take_profit,
+                     trade.stop_loss, trade.order_id,
+                     getattr(trade, 'hold_type', 'day'),
+                     _to_iso(trade.time_stop),
+                     _to_iso(getattr(trade, 'max_hold_date', None)),
+                     getattr(trade, 'pair_id', ''),
+                     getattr(trade, 'partial_exits', 0),
+                     getattr(trade, 'highest_price_seen', 0.0),
+                     getattr(trade, 'lowest_price_seen', 0.0),
+                     getattr(trade, 'entry_atr', 0.0)),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
 
 def load_open_positions() -> list[dict]:

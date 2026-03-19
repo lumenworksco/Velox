@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 import config
 from data import get_intraday_bars, get_daily_bars
@@ -283,8 +283,8 @@ class KalmanPairsTrader:
             try:
                 # Get latest prices (use 2-min bars, last bar)
                 lookback = now - timedelta(minutes=10)
-                bars1 = get_intraday_bars(sym1, TimeFrame(2, "Min"), start=lookback, end=now)
-                bars2 = get_intraday_bars(sym2, TimeFrame(2, "Min"), start=lookback, end=now)
+                bars1 = get_intraday_bars(sym1, TimeFrame(2, TimeFrameUnit.Minute), start=lookback, end=now)
+                bars2 = get_intraday_bars(sym2, TimeFrame(2, TimeFrameUnit.Minute), start=lookback, end=now)
 
                 if bars1 is None or bars2 is None or bars1.empty or bars2.empty:
                     continue
@@ -397,8 +397,8 @@ class KalmanPairsTrader:
             try:
                 # Get current prices
                 lookback = now - timedelta(minutes=10)
-                bars1 = get_intraday_bars(sym1, TimeFrame(2, "Min"), start=lookback, end=now)
-                bars2 = get_intraday_bars(sym2, TimeFrame(2, "Min"), start=lookback, end=now)
+                bars1 = get_intraday_bars(sym1, TimeFrame(2, TimeFrameUnit.Minute), start=lookback, end=now)
+                bars2 = get_intraday_bars(sym2, TimeFrame(2, TimeFrameUnit.Minute), start=lookback, end=now)
 
                 if bars1 is None or bars2 is None or bars1.empty or bars2.empty:
                     continue

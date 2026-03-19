@@ -24,6 +24,7 @@ def scan_all_strategies(
     orb_strategy=None,
     pead_strategy=None,
     signal_ranker=None,
+    day_pnl_pct: float = 0.0,
 ) -> list[Signal]:
     """Scan all active strategies and return ranked signals.
 
@@ -72,7 +73,7 @@ def scan_all_strategies(
 
     try:
         micro_signals = micro_mom.scan(
-            current, day_pnl_pct=0, regime=regime  # day_pnl passed separately
+            current, day_pnl_pct=day_pnl_pct, regime=regime
         )
         signals.extend(micro_signals)
     except Exception as e:

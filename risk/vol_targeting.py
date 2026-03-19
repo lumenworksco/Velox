@@ -64,8 +64,8 @@ class VolatilityTargetingRiskEngine:
         )
 
         if estimated_vol < 1e-6:
-            self._last_scalar = 1.0
-            return 1.0
+            self._last_scalar = config.VOL_SCALAR_MIN
+            return config.VOL_SCALAR_MIN
 
         scalar = self.target_vol / estimated_vol
         scalar = max(config.VOL_SCALAR_MIN, min(config.VOL_SCALAR_MAX, scalar))

@@ -49,12 +49,12 @@ except ImportError:
     AlpacaNewsSentiment = None
 
 try:
-    from llm_scorer import LLMSignalScorer
+    from llm_signal_scorer import LLMSignalScorer
 except ImportError:
     LLMSignalScorer = None
 
 try:
-    from exit_manager import AdaptiveExitManager
+    from adaptive_exit_manager import AdaptiveExitManager
 except ImportError:
     AdaptiveExitManager = None
 
