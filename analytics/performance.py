@@ -47,7 +47,7 @@ def sortino_ratio(daily_returns: list[float], risk_free_rate: float = 0.045) -> 
     # Downside deviation: only negative returns
     downside = excess[excess < 0]
     if len(downside) == 0:
-        return float('inf') if mean_excess > 0 else 0.0
+        return 99.9 if mean_excess > 0 else 0.0
 
     downside_std = np.std(downside, ddof=1)
     if downside_std == 0:
@@ -62,7 +62,7 @@ def profit_factor(trades: list[dict]) -> float:
     gross_loss = abs(sum(t["pnl"] for t in trades if t.get("pnl", 0) < 0))
 
     if gross_loss == 0:
-        return float('inf') if gross_profit > 0 else 0.0
+        return 99.9 if gross_profit > 0 else 0.0
 
     return gross_profit / gross_loss
 
@@ -124,6 +124,29 @@ def strategy_attribution(trades: list[dict]) -> dict:
     return result
 
 
+def _derive_daily_returns_from_trades(trades: list[dict], portfolio_value: float = 1_000_000) -> list[float]:
+    """Derive daily returns from trade P&L when snapshot data is unreliable.
+
+    Groups trades by exit date and computes daily return as sum(pnl) / portfolio_value.
+    """
+    from collections import defaultdict
+
+    daily_pnl = defaultdict(float)
+    for t in trades:
+        exit_time = t.get("exit_time", "")
+        pnl = t.get("pnl", 0) or 0
+        if exit_time and pnl != 0:
+            day = exit_time[:10]  # YYYY-MM-DD
+            daily_pnl[day] += pnl
+
+    if not daily_pnl:
+        return []
+
+    # Sort by date and convert to returns
+    sorted_days = sorted(daily_pnl.keys())
+    return [daily_pnl[d] / portfolio_value for d in sorted_days]
+
+
 def compute_analytics() -> dict:
     """Compute all analytics from DB data. Returns dict for dashboard."""
     # Get recent trades and daily data
@@ -132,19 +155,32 @@ def compute_analytics() -> dict:
     daily_returns = database.get_daily_pnl_series(days=30)
     portfolio_vals = database.get_portfolio_values(days=30)
 
+    # If snapshot daily returns are all near-zero but we have trades with real P&L,
+    # derive daily returns from trade data instead
+    has_real_snapshots = any(abs(r) > 1e-5 for r in daily_returns)
+    if not has_real_snapshots and trades_7d:
+        portfolio_val = portfolio_vals[-1] if portfolio_vals else 1_000_000
+        daily_returns = _derive_daily_returns_from_trades(trades_all, portfolio_val)
+
     # Weekly P&L
     week_pnl = sum(t.get("pnl", 0) for t in trades_7d)
-    week_pnl_pct = sum(daily_returns[-5:]) if len(daily_returns) >= 5 else sum(daily_returns)
+    week_pnl_pct = (week_pnl / portfolio_vals[-1] * 100) if portfolio_vals else 0.0
+
+    # Clamp Sharpe/Sortino to reasonable range for display
+    def _clamp_ratio(val: float, lo: float = -10.0, hi: float = 10.0) -> float:
+        if math.isinf(val) or math.isnan(val):
+            return 0.0
+        return max(lo, min(hi, val))
 
     result = {
-        "sharpe_7d": sharpe_ratio(daily_returns[-7:]) if len(daily_returns) >= 3 else 0.0,
-        "sharpe_30d": sharpe_ratio(daily_returns) if len(daily_returns) >= 5 else 0.0,
-        "sortino_7d": sortino_ratio(daily_returns[-7:]) if len(daily_returns) >= 3 else 0.0,
+        "sharpe_7d": _clamp_ratio(sharpe_ratio(daily_returns[-7:])) if len(daily_returns) >= 3 else 0.0,
+        "sharpe_30d": _clamp_ratio(sharpe_ratio(daily_returns)) if len(daily_returns) >= 5 else 0.0,
+        "sortino_7d": _clamp_ratio(sortino_ratio(daily_returns[-7:])) if len(daily_returns) >= 3 else 0.0,
         "win_rate": win_rate(trades_7d),
         "profit_factor": profit_factor(trades_7d),
         "max_drawdown": max_drawdown(portfolio_vals) if portfolio_vals else 0.0,
-        "week_pnl": week_pnl,
-        "week_pnl_pct": week_pnl_pct,
+        "week_pnl": round(week_pnl, 2),
+        "week_pnl_pct": round(week_pnl_pct, 4),
         "strategy_breakdown": strategy_attribution(trades_7d),
         "total_trades_7d": len(trades_7d),
         "total_trades_all": len(trades_all),

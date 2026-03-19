@@ -155,14 +155,38 @@ async def trades(limit: int = Query(100, ge=1, le=1000),
 
 @app.get("/api/stats")
 async def stats():
-    """Return current performance statistics."""
+    """Return current performance statistics, enriched with live Alpaca data."""
     try:
         from analytics import compute_analytics
-        analytics = compute_analytics()
+        result = compute_analytics()
     except Exception as e:
         logger.warning(f"Analytics computation failed: {e}")
-        analytics = {}
-    return analytics
+        result = {}
+
+    # Enrich with live Alpaca account data for accurate equity/P&L
+    try:
+        from data import get_account, get_positions
+        acct = get_account()
+        equity = float(acct.equity)
+        last_equity = float(acct.last_equity)
+        cash = float(acct.cash)
+        day_pnl = equity - last_equity
+        day_pnl_pct = (day_pnl / last_equity * 100) if last_equity else 0.0
+
+        broker_positions = get_positions()
+        total_unrealized = sum(float(p.unrealized_pl) for p in broker_positions)
+
+        result["equity"] = round(equity, 2)
+        result["cash"] = round(cash, 2)
+        result["day_pnl"] = round(day_pnl, 2)
+        result["day_pnl_pct"] = round(day_pnl_pct, 4)
+        result["open_positions"] = len(broker_positions)
+        result["unrealized_pnl"] = round(total_unrealized, 2)
+        result["paper_mode"] = config.PAPER_MODE
+    except Exception as e:
+        logger.warning(f"Live account enrichment failed: {e}")
+
+    return result
 
 
 @app.get("/api/signals")
@@ -179,12 +203,31 @@ async def signals(date: str = Query(None)):
 
 @app.get("/api/positions")
 async def positions():
-    """Return current open positions."""
+    """Return current open positions from live broker."""
     try:
-        return database.load_open_positions()
+        from data import get_positions
+        broker_positions = get_positions()
+        return [
+            {
+                "symbol": p.symbol,
+                "qty": float(p.qty),
+                "side": str(p.side).replace("PositionSide.", ""),
+                "avg_entry_price": float(p.avg_entry_price),
+                "current_price": float(p.current_price),
+                "market_value": round(float(p.market_value), 2),
+                "unrealized_pl": round(float(p.unrealized_pl), 2),
+                "unrealized_plpc": round(float(p.unrealized_plpc) * 100, 2),
+                "change_today": round(float(p.change_today) * 100, 2) if p.change_today else 0.0,
+            }
+            for p in broker_positions
+        ]
     except Exception as e:
-        logger.error(f"positions endpoint failed: {e}")
-        return {"error": str(e)}
+        logger.warning(f"Live positions failed, falling back to DB: {e}")
+        try:
+            return database.load_open_positions()
+        except Exception as e2:
+            logger.error(f"positions endpoint failed: {e2}")
+            return {"error": str(e2)}
 
 
 @app.get("/api/signal_stats")
@@ -445,7 +488,7 @@ tr:hover{background:rgba(255,255,255,0.03)}
   <h1>VELOX</h1>
   <div class="header-right">
    <div class="header-meta" id="header-meta"></div>
-   <div class="status-pill"><span class="dot"></span>Paper Trading</div>
+   <div class="status-pill" id="mode-pill"><span class="dot"></span>Paper Trading</div>
   </div>
  </div>
 
@@ -454,6 +497,14 @@ tr:hover{background:rgba(255,255,255,0.03)}
  <div class="chart-card">
   <h2>Portfolio Value</h2>
   <canvas id="equityChart" height="70"></canvas>
+ </div>
+
+ <div class="section" id="positions-section" style="display:none">
+  <h2>Open Positions</h2>
+  <table>
+   <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Avg Entry</th><th>Current</th><th>Mkt Value</th><th>Unrealized P&L</th><th>%</th></tr></thead>
+   <tbody id="positions-body"></tbody>
+  </table>
  </div>
 
  <div class="section">
@@ -503,13 +554,15 @@ function stratPill(s){return `<span class="pill ${pillMap[s]||''}">${s}</span>`}
 async function loadStats(){
  try{
   const r=await fetch('/api/stats');const d=await r.json();
+  const eq=d.equity||0;const dp=d.day_pnl||0;const dpp=d.day_pnl_pct||0;
+  const wp=d.week_pnl||0;const wpp=d.week_pnl_pct||0;
   document.getElementById('stats-grid').innerHTML=`
-   <div class="stat-card"><div class="stat-label">Sharpe (7d)</div><div class="stat-value blue">${(d.sharpe_7d||0).toFixed(2)}</div></div>
+   <div class="stat-card"><div class="stat-label">Equity</div><div class="stat-value blue">$${eq.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div></div>
+   <div class="stat-card"><div class="stat-label">Day P&L</div><div class="stat-value ${dp>=0?'green':'red'}">${dp>=0?'+':''}$${dp.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})} (${dpp>=0?'+':''}${dpp.toFixed(2)}%)</div></div>
+   <div class="stat-card"><div class="stat-label">Week P&L</div><div class="stat-value ${wp>=0?'green':'red'}">${wp>=0?'+':''}$${wp.toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:0})} (${wpp>=0?'+':''}${wpp.toFixed(2)}%)</div></div>
    <div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value">${((d.win_rate||0)*100).toFixed(0)}%</div></div>
    <div class="stat-card"><div class="stat-label">Profit Factor</div><div class="stat-value">${(d.profit_factor||0).toFixed(2)}</div></div>
-   <div class="stat-card"><div class="stat-label">Max Drawdown</div><div class="stat-value red">${((d.max_drawdown||0)*100).toFixed(1)}%</div></div>
-   <div class="stat-card"><div class="stat-label">Week P&L</div><div class="stat-value ${(d.week_pnl||0)>=0?'green':'red'}">$${(d.week_pnl||0).toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:0})}</div></div>
-   <div class="stat-card"><div class="stat-label">Trades (7d)</div><div class="stat-value">${d.total_trades_7d||0}</div></div>`;
+   <div class="stat-card"><div class="stat-label">Trades (7d)</div><div class="stat-value">${d.total_trades_7d||0} / ${d.total_trades_all||0}</div></div>`;
  }catch(e){console.error(e)}
 }
 
@@ -597,12 +650,29 @@ async function loadShadowTrades(){
  }catch(e){console.error(e)}
 }
 
+async function loadPositions(){
+ try{
+  const r=await fetch('/api/positions');const d=await r.json();
+  const sec=document.getElementById('positions-section');
+  if(!Array.isArray(d)||!d.length){sec.style.display='none';return;}
+  sec.style.display='block';
+  document.getElementById('positions-body').innerHTML=d.map(p=>{
+   const pc=(p.unrealized_pl||0)>=0?'green':'red';
+   return `<tr><td style="font-weight:600">${p.symbol}</td><td>${p.side||'long'}</td>
+    <td>${(p.qty||0).toLocaleString()}</td><td>$${(p.avg_entry_price||0).toFixed(2)}</td>
+    <td>$${(p.current_price||0).toFixed(2)}</td><td>$${(p.market_value||0).toLocaleString(undefined,{minimumFractionDigits:2})}</td>
+    <td class="${pc}">${(p.unrealized_pl||0)>=0?'+':''}$${(p.unrealized_pl||0).toFixed(2)}</td>
+    <td class="${pc}">${(p.unrealized_plpc||0)>=0?'+':''}${(p.unrealized_plpc||0).toFixed(2)}%</td></tr>`
+  }).join('');
+ }catch(e){console.error(e)}
+}
+
 async function loadMeta(){
  try{const r=await fetch('/health');const d=await r.json();
   document.getElementById('header-meta').textContent=`Uptime: ${Math.floor(d.uptime_seconds/60)}m`;
  }catch(e){}}
 
-function refresh(){loadStats();loadChart();loadTrades();loadSignalStats();loadTradeAnalysis();loadShadowTrades();loadMeta()}
+function refresh(){loadStats();loadChart();loadPositions();loadTrades();loadSignalStats();loadTradeAnalysis();loadShadowTrades();loadMeta()}
 refresh();setInterval(refresh,30000);
 </script>
 </body>

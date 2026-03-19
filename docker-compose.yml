@@ -26,6 +26,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./bot.db:/app/bot.db
     depends_on:
       postgres:
         condition: service_healthy

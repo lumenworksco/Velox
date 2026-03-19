@@ -73,7 +73,7 @@ class TestLogTradeRoundTrip:
 
     def test_log_and_retrieve_trade(self):
         """A logged trade is retrievable via get_recent_trades."""
-        now = datetime(2026, 3, 15, 14, 0, tzinfo=ET)
+        now = datetime.now(ET)
         database.log_trade(
             symbol="NVDA",
             strategy="ORB",
@@ -100,8 +100,10 @@ class TestLogTradeRoundTrip:
 
     def test_multiple_trades_ordered_desc(self):
         """get_recent_trades returns rows ordered by exit_time DESC."""
-        t1 = datetime(2026, 3, 15, 10, 0, tzinfo=ET)
-        t2 = datetime(2026, 3, 15, 14, 0, tzinfo=ET)
+        from datetime import timedelta
+        now = datetime.now(ET)
+        t1 = now - timedelta(hours=4)
+        t2 = now - timedelta(hours=1)
         for ts, sym in [(t1, "AAPL"), (t2, "MSFT")]:
             database.log_trade(
                 symbol=sym, strategy="VWAP", side="sell",
@@ -411,7 +413,7 @@ class TestSaveExecutionAnalytics:
     def _save_sample(self, order_id="ord-001", symbol="AAPL", strategy="ORB",
                      side="buy", expected=150.0, filled=150.05):
         """Helper to insert one execution analytics record."""
-        now = datetime(2026, 3, 15, 10, 0, tzinfo=ET)
+        now = datetime.now(ET)
         database.save_execution_analytics(
             order_id=order_id,
             symbol=symbol,
