@@ -337,111 +337,205 @@ async def dashboard():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Velox V9 Dashboard</title>
+<title>Velox Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;padding:20px}
-h1{color:#58a6ff;margin-bottom:20px;font-size:1.4em}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:24px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px}
-.card .label{color:#8b949e;font-size:0.75em;text-transform:uppercase}
-.card .value{font-size:1.4em;font-weight:bold;margin-top:4px}
-.green{color:#3fb950}.red{color:#f85149}.blue{color:#58a6ff}
-.chart-container{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:24px}
-table{width:100%;border-collapse:collapse;font-size:0.85em}
-th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #21262d}
-th{color:#8b949e;font-weight:normal;text-transform:uppercase;font-size:0.7em}
-tr:hover{background:#161b22}
-.filters{margin-bottom:12px}
-.filters select{background:#161b22;color:#c9d1d9;border:1px solid #30363d;padding:6px 12px;border-radius:4px}
-.section{margin-bottom:24px}
-.section h2{color:#8b949e;font-size:0.9em;margin-bottom:12px;text-transform:uppercase}
-.footer{color:#484f58;font-size:0.75em;margin-top:32px;text-align:center}
+:root{
+ --bg:#0a0e1a;--surface:rgba(255,255,255,0.05);--surface-hover:rgba(255,255,255,0.08);
+ --border:rgba(255,255,255,0.08);--text:#f5f5f7;--text-secondary:rgba(255,255,255,0.5);
+ --blue:#007AFF;--green:#34C759;--red:#FF3B30;--orange:#FF9F0A;
+ --radius:16px;--radius-sm:12px;
+}
+body{font-family:'Inter',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);
+ min-height:100vh;padding:0}
+.container{max-width:1400px;margin:0 auto;padding:32px 40px}
+
+/* Header */
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:40px}
+.header h1{font-size:1.8em;font-weight:700;letter-spacing:0.04em;
+ background:linear-gradient(135deg,#fff 0%,rgba(255,255,255,0.6) 100%);
+ -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.status-pill{display:inline-flex;align-items:center;gap:8px;padding:6px 16px;
+ border-radius:20px;font-size:0.78em;font-weight:500;letter-spacing:0.02em;
+ background:rgba(52,199,89,0.15);color:var(--green);border:1px solid rgba(52,199,89,0.2)}
+.status-pill .dot{width:7px;height:7px;border-radius:50%;background:var(--green);
+ animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+.header-right{display:flex;align-items:center;gap:16px}
+.header-meta{font-size:0.78em;color:var(--text-secondary)}
+
+/* Stats Grid */
+.stats{display:grid;grid-template-columns:repeat(6,1fr);gap:16px;margin-bottom:32px}
+@media(max-width:1100px){.stats{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:600px){.stats{grid-template-columns:repeat(2,1fr)}}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+ padding:20px 24px;transition:all 0.2s ease;backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px)}
+.stat-card:hover{background:var(--surface-hover);transform:translateY(-2px);
+ box-shadow:0 8px 32px rgba(0,0,0,0.3)}
+.stat-label{font-size:0.72em;font-weight:500;color:var(--text-secondary);text-transform:uppercase;
+ letter-spacing:0.06em;margin-bottom:8px}
+.stat-value{font-size:1.7em;font-weight:600;letter-spacing:-0.02em}
+.stat-value.blue{color:var(--blue)}.stat-value.green{color:var(--green)}
+.stat-value.red{color:var(--red)}.stat-value.orange{color:var(--orange)}
+
+/* Chart */
+.chart-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+ padding:24px;margin-bottom:32px;backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px)}
+.chart-card h2{font-size:0.78em;font-weight:500;color:var(--text-secondary);text-transform:uppercase;
+ letter-spacing:0.06em;margin-bottom:16px}
+
+/* Sections */
+.section{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+ padding:24px;margin-bottom:24px;backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px)}
+.section h2{font-size:0.78em;font-weight:500;color:var(--text-secondary);text-transform:uppercase;
+ letter-spacing:0.06em;margin-bottom:16px}
+.section-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+@media(max-width:800px){.section-grid{grid-template-columns:1fr}}
+
+/* Tables */
+table{width:100%;border-collapse:collapse;font-size:0.82em}
+th{padding:10px 16px;text-align:left;font-size:0.7em;font-weight:500;color:var(--text-secondary);
+ text-transform:uppercase;letter-spacing:0.06em;border-bottom:1px solid var(--border)}
+td{padding:12px 16px;border-bottom:1px solid rgba(255,255,255,0.03)}
+tr{transition:background 0.15s ease}
+tr:hover{background:rgba(255,255,255,0.03)}
+.green{color:var(--green)}.red{color:var(--red)}.blue{color:var(--blue)}
+
+/* Strategy pills */
+.pill{display:inline-block;padding:3px 10px;border-radius:6px;font-size:0.72em;font-weight:500;
+ letter-spacing:0.02em}
+.pill-mr{background:rgba(0,122,255,0.15);color:var(--blue)}
+.pill-vwap{background:rgba(175,82,222,0.15);color:#AF52DE}
+.pill-pairs{background:rgba(255,159,10,0.15);color:var(--orange)}
+.pill-orb{background:rgba(52,199,89,0.15);color:var(--green)}
+.pill-micro{background:rgba(255,59,48,0.15);color:var(--red)}
+.pill-hedge{background:rgba(255,255,255,0.1);color:var(--text-secondary)}
+.pill-pead{background:rgba(90,200,250,0.15);color:#5AC8FA}
+
+/* Filter dropdown */
+.filter-select{-webkit-appearance:none;-moz-appearance:none;appearance:none;
+ background:rgba(255,255,255,0.06) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='rgba(255,255,255,0.4)' d='M6 8L1 3h10z'/%3E%3C/svg%3E") no-repeat right 14px center;
+ color:var(--text);border:1px solid var(--border);
+ padding:10px 38px 10px 16px;border-radius:10px;font-family:inherit;font-size:0.82em;font-weight:500;
+ outline:none;cursor:pointer;transition:all 0.2s ease;letter-spacing:0.01em}
+.filter-select:hover{background-color:rgba(255,255,255,0.09);border-color:rgba(255,255,255,0.15)}
+.filter-select:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(0,122,255,0.2)}
+.filter-select option{background:#1a1f30;color:var(--text);padding:8px}
+
+/* Info tags */
+.info-tag{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;margin:4px;
+ background:rgba(255,255,255,0.05);border-radius:8px;font-size:0.78em}
+.info-tag b{color:var(--text)}
+.info-tag span{color:var(--text-secondary)}
+
+/* Footer */
+.footer{text-align:center;padding:24px 0;font-size:0.72em;color:var(--text-secondary);letter-spacing:0.02em}
+
+/* Animations */
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.stats,.chart-card,.section{animation:fadeIn 0.5s ease forwards}
+.section:nth-child(4){animation-delay:0.1s}.section:nth-child(5){animation-delay:0.15s}
 </style>
 </head>
 <body>
-<h1>VELOX V9 — Autonomous Algorithmic Trading System</h1>
+<div class="container">
+ <div class="header">
+  <h1>VELOX</h1>
+  <div class="header-right">
+   <div class="header-meta" id="header-meta"></div>
+   <div class="status-pill"><span class="dot"></span>Paper Trading</div>
+  </div>
+ </div>
 
-<div class="grid" id="stats-grid"></div>
+ <div class="stats" id="stats-grid"></div>
 
-<div class="chart-container">
-<canvas id="equityChart" height="80"></canvas>
+ <div class="chart-card">
+  <h2>Portfolio Value</h2>
+  <canvas id="equityChart" height="70"></canvas>
+ </div>
+
+ <div class="section">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+   <h2 style="margin-bottom:0">Recent Trades</h2>
+   <select id="stratFilter" class="filter-select" onchange="loadTrades()">
+    <option value="">All Strategies</option>
+    <option value="STAT_MR">Mean Reversion</option>
+    <option value="VWAP">VWAP</option>
+    <option value="KALMAN_PAIRS">Pairs Trading</option>
+    <option value="ORB">Opening Range</option>
+    <option value="MICRO_MOM">Micro Momentum</option>
+    <option value="PEAD">PEAD</option>
+   </select>
+  </div>
+  <table>
+   <thead><tr><th>Time</th><th>Symbol</th><th>Strategy</th><th>Side</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&L</th><th>%</th><th>Reason</th></tr></thead>
+   <tbody id="trades-body"></tbody>
+  </table>
+ </div>
+
+ <div class="section-grid">
+  <div class="section">
+   <h2>Trade Analysis (7 days)</h2>
+   <div id="trade-analysis"></div>
+  </div>
+  <div class="section">
+   <h2>Signal Filters (7 days)</h2>
+   <div id="signal-stats"></div>
+  </div>
+ </div>
+
+ <div class="section">
+  <h2>Shadow Trades</h2>
+  <div id="shadow-trades"></div>
+ </div>
+
+ <div class="footer">Auto-refreshes every 30s &middot; Velox V10</div>
 </div>
-
-<div class="section">
-<h2>Recent Trades</h2>
-<div class="filters">
-<select id="stratFilter" onchange="loadTrades()">
-<option value="">All Strategies</option>
-<option value="STAT_MR">Mean Reversion</option>
-<option value="VWAP">VWAP</option>
-<option value="KALMAN_PAIRS">Pairs Trading</option>
-<option value="ORB">Opening Range Breakout</option>
-<option value="MICRO_MOM">Micro Momentum</option>
-<option value="BETA_HEDGE">Beta Hedge</option>
-</select>
-</div>
-<table>
-<thead><tr><th>Time</th><th>Symbol</th><th>Strategy</th><th>Side</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&L</th><th>%</th><th>Reason</th></tr></thead>
-<tbody id="trades-body"></tbody>
-</table>
-</div>
-
-<div class="section">
-<h2>Trade Analysis (7 days)</h2>
-<div id="trade-analysis"></div>
-</div>
-
-<div class="section">
-<h2>Shadow Trades</h2>
-<div id="shadow-trades"></div>
-</div>
-
-<div class="section">
-<h2>Signal Filter Reasons (7 days)</h2>
-<div id="signal-stats"></div>
-</div>
-
-<div class="footer">Auto-refreshes every 30s | Velox V9</div>
 
 <script>
 let chart=null;
+const pillMap={STAT_MR:'pill-mr',VWAP:'pill-vwap',KALMAN_PAIRS:'pill-pairs',ORB:'pill-orb',
+ MICRO_MOM:'pill-micro',BETA_HEDGE:'pill-hedge',PEAD:'pill-pead'};
+function stratPill(s){return `<span class="pill ${pillMap[s]||''}">${s}</span>`}
 
 async function loadStats(){
  try{
-  const r=await fetch('/api/stats');
-  const d=await r.json();
-  const g=document.getElementById('stats-grid');
-  g.innerHTML=`
-   <div class="card"><div class="label">Sharpe (7d)</div><div class="value blue">${(d.sharpe_7d||0).toFixed(2)}</div></div>
-   <div class="card"><div class="label">Win Rate</div><div class="value">${((d.win_rate||0)*100).toFixed(0)}%</div></div>
-   <div class="card"><div class="label">Profit Factor</div><div class="value">${(d.profit_factor||0).toFixed(2)}</div></div>
-   <div class="card"><div class="label">Max Drawdown</div><div class="value red">${((d.max_drawdown||0)*100).toFixed(1)}%</div></div>
-   <div class="card"><div class="label">Week P&L</div><div class="value ${(d.week_pnl||0)>=0?'green':'red'}">$${(d.week_pnl||0).toFixed(0)}</div></div>
-   <div class="card"><div class="label">Trades (7d)</div><div class="value">${d.total_trades_7d||0}</div></div>
-  `;
+  const r=await fetch('/api/stats');const d=await r.json();
+  document.getElementById('stats-grid').innerHTML=`
+   <div class="stat-card"><div class="stat-label">Sharpe (7d)</div><div class="stat-value blue">${(d.sharpe_7d||0).toFixed(2)}</div></div>
+   <div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value">${((d.win_rate||0)*100).toFixed(0)}%</div></div>
+   <div class="stat-card"><div class="stat-label">Profit Factor</div><div class="stat-value">${(d.profit_factor||0).toFixed(2)}</div></div>
+   <div class="stat-card"><div class="stat-label">Max Drawdown</div><div class="stat-value red">${((d.max_drawdown||0)*100).toFixed(1)}%</div></div>
+   <div class="stat-card"><div class="stat-label">Week P&L</div><div class="stat-value ${(d.week_pnl||0)>=0?'green':'red'}">$${(d.week_pnl||0).toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:0})}</div></div>
+   <div class="stat-card"><div class="stat-label">Trades (7d)</div><div class="stat-value">${d.total_trades_7d||0}</div></div>`;
  }catch(e){console.error(e)}
 }
 
 async function loadChart(){
  try{
-  const r=await fetch('/api/portfolio_history?days=60');
-  const d=await r.json();
-  if(!d.length)return;
-  d.reverse();
-  const labels=d.map(x=>x.date);
-  const values=d.map(x=>x.portfolio_value);
+  const r=await fetch('/api/portfolio_history?days=60');const d=await r.json();
+  if(!d.length)return;d.reverse();
+  const labels=d.map(x=>x.date);const values=d.map(x=>x.portfolio_value);
   const ctx=document.getElementById('equityChart').getContext('2d');
   if(chart)chart.destroy();
-  chart=new Chart(ctx,{
-   type:'line',
+  const gradient=ctx.createLinearGradient(0,0,0,ctx.canvas.height);
+  gradient.addColorStop(0,'rgba(0,122,255,0.25)');gradient.addColorStop(1,'rgba(0,122,255,0)');
+  chart=new Chart(ctx,{type:'line',
    data:{labels,datasets:[{label:'Portfolio Value',data:values,
-    borderColor:'#58a6ff',backgroundColor:'rgba(88,166,255,0.1)',fill:true,tension:0.3,pointRadius:2}]},
-   options:{responsive:true,plugins:{legend:{display:false}},
-    scales:{x:{ticks:{color:'#484f58',maxTicksLimit:10},grid:{color:'#21262d'}},
-     y:{ticks:{color:'#484f58',callback:v=>'$'+v.toLocaleString()},grid:{color:'#21262d'}}}}
-  });
+    borderColor:'#007AFF',backgroundColor:gradient,fill:true,tension:0.4,pointRadius:0,
+    pointHoverRadius:5,pointHoverBackgroundColor:'#007AFF',pointHoverBorderColor:'#fff',pointHoverBorderWidth:2,
+    borderWidth:2.5}]},
+   options:{responsive:true,interaction:{intersect:false,mode:'index'},
+    plugins:{legend:{display:false},tooltip:{backgroundColor:'rgba(30,30,40,0.95)',titleColor:'#fff',
+     bodyColor:'rgba(255,255,255,0.7)',borderColor:'rgba(255,255,255,0.1)',borderWidth:1,
+     padding:12,cornerRadius:12,titleFont:{family:'Inter',weight:'600'},bodyFont:{family:'Inter'},
+     callbacks:{label:ctx=>'$'+ctx.parsed.y.toLocaleString()}}},
+    scales:{x:{ticks:{color:'rgba(255,255,255,0.3)',maxTicksLimit:8,font:{family:'Inter',size:11}},
+     grid:{color:'rgba(255,255,255,0.04)'},border:{display:false}},
+     y:{ticks:{color:'rgba(255,255,255,0.3)',callback:v=>'$'+(v/1000).toFixed(0)+'k',font:{family:'Inter',size:11}},
+     grid:{color:'rgba(255,255,255,0.04)'},border:{display:false}}}}});
  }catch(e){console.error(e)}
 }
 
@@ -449,85 +543,67 @@ async function loadTrades(){
  try{
   const strat=document.getElementById('stratFilter').value;
   const url='/api/trades?limit=50'+(strat?'&strategy='+strat:'');
-  const r=await fetch(url);
-  const d=await r.json();
-  const tb=document.getElementById('trades-body');
-  tb.innerHTML=d.map(t=>{
-   const pnlClass=(t.pnl||0)>=0?'green':'red';
-   const time=(t.exit_time||'').substring(5,16);
-   return `<tr><td>${time}</td><td>${t.symbol}</td><td>${t.strategy}</td><td>${t.side}</td>
-    <td>$${(t.entry_price||0).toFixed(2)}</td><td>$${(t.exit_price||0).toFixed(2)}</td>
-    <td>${t.qty}</td><td class="${pnlClass}">$${(t.pnl||0).toFixed(2)}</td>
-    <td class="${pnlClass}">${((t.pnl_pct||0)*100).toFixed(1)}%</td>
-    <td>${t.exit_reason||''}</td></tr>`;
-  }).join('');
+  const r=await fetch(url);const d=await r.json();
+  document.getElementById('trades-body').innerHTML=d.map(t=>{
+   const pc=(t.pnl||0)>=0?'green':'red';const time=(t.exit_time||'').substring(5,16);
+   return `<tr><td>${time}</td><td style="font-weight:600">${t.symbol}</td><td>${stratPill(t.strategy)}</td>
+    <td>${t.side}</td><td>$${(t.entry_price||0).toFixed(2)}</td><td>$${(t.exit_price||0).toFixed(2)}</td>
+    <td>${t.qty}</td><td class="${pc}">$${(t.pnl||0).toFixed(2)}</td>
+    <td class="${pc}">${((t.pnl_pct||0)*100).toFixed(1)}%</td><td style="color:var(--text-secondary)">${t.exit_reason||''}</td></tr>`
+  }).join('')||'<tr><td colspan="10" style="text-align:center;color:var(--text-secondary);padding:40px">No trades yet</td></tr>';
  }catch(e){console.error(e)}
 }
 
 async function loadSignalStats(){
  try{
-  const r=await fetch('/api/signal_stats?days=7');
-  const d=await r.json();
+  const r=await fetch('/api/signal_stats?days=7');const d=await r.json();
   const el=document.getElementById('signal-stats');
-  const items=Object.entries(d).map(([k,v])=>`<span style="margin-right:16px">${k}: <b>${v}</b></span>`);
-  el.innerHTML=items.join('')||'<span>No filtered signals</span>';
+  const items=Object.entries(d).map(([k,v])=>`<div class="info-tag"><span>${k}</span><b>${v}</b></div>`);
+  el.innerHTML=items.join('')||'<div style="color:var(--text-secondary);padding:16px 0">No filtered signals</div>';
  }catch(e){console.error(e)}
 }
 
 async function loadTradeAnalysis(){
  try{
-  const r=await fetch('/api/trade_analysis?days=7');
-  const d=await r.json();
-  const el=document.getElementById('trade-analysis');
-  let html='';
+  const r=await fetch('/api/trade_analysis?days=7');const d=await r.json();
+  const el=document.getElementById('trade-analysis');let html='';
   if(d.exit_breakdown&&d.exit_breakdown.length){
-   html+='<div style="margin-bottom:12px"><b>Exit Reasons:</b></div>';
    html+='<table><thead><tr><th>Reason</th><th>Count</th><th>Avg P&L</th><th>Avg %</th></tr></thead><tbody>';
-   d.exit_breakdown.forEach(r=>{
-    const pnlClass=(r.avg_pnl||0)>=0?'green':'red';
-    html+=`<tr><td>${r.exit_reason||'unknown'}</td><td>${r.count}</td><td class="${pnlClass}">$${(r.avg_pnl||0).toFixed(2)}</td><td class="${pnlClass}">${((r.avg_pnl_pct||0)*100).toFixed(1)}%</td></tr>`;
-   });
-   html+='</tbody></table>';
-  }
+   d.exit_breakdown.forEach(r=>{const pc=(r.avg_pnl||0)>=0?'green':'red';
+    html+=`<tr><td>${r.exit_reason||'unknown'}</td><td>${r.count}</td><td class="${pc}">$${(r.avg_pnl||0).toFixed(2)}</td><td class="${pc}">${((r.avg_pnl_pct||0)*100).toFixed(1)}%</td></tr>`});
+   html+='</tbody></table>';}
   if(d.filter_blocks&&Object.keys(d.filter_blocks).length){
-   html+='<div style="margin-top:12px;margin-bottom:8px"><b>Filter Blocks (today):</b></div>';
-   Object.entries(d.filter_blocks).forEach(([k,v])=>{html+=`<span style="margin-right:16px">${k}: <b>${v}</b></span>`;});
-  }
-  el.innerHTML=html||'<span>No trade analysis data</span>';
+   html+='<div style="margin-top:16px">';
+   Object.entries(d.filter_blocks).forEach(([k,v])=>{html+=`<div class="info-tag"><span>${k}</span><b>${v}</b></div>`});
+   html+='</div>';}
+  el.innerHTML=html||'<div style="color:var(--text-secondary);padding:16px 0">No trade analysis data</div>';
  }catch(e){console.error(e)}
 }
 
 async function loadShadowTrades(){
  try{
-  const r=await fetch('/api/shadow_trades?days=14');
-  const d=await r.json();
-  const el=document.getElementById('shadow-trades');
-  let html='';
+  const r=await fetch('/api/shadow_trades?days=14');const d=await r.json();
+  const el=document.getElementById('shadow-trades');let html='';
   if(d.performance&&d.performance.length){
-   html+='<div style="margin-bottom:8px"><b>Shadow Performance (14d):</b></div>';
    html+='<table><thead><tr><th>Strategy</th><th>Trades</th><th>Wins</th><th>Total P&L</th><th>Avg %</th></tr></thead><tbody>';
-   d.performance.forEach(p=>{
-    const wr=p.trades>0?(p.wins/p.trades*100).toFixed(0)+'%':'0%';
-    const pnlClass=(p.total_pnl||0)>=0?'green':'red';
-    html+=`<tr><td>${p.strategy}</td><td>${p.trades} (${wr} win)</td><td>${p.wins}</td><td class="${pnlClass}">$${(p.total_pnl||0).toFixed(2)}</td><td>${((p.avg_pnl_pct||0)*100).toFixed(2)}%</td></tr>`;
-   });
-   html+='</tbody></table>';
-  }
+   d.performance.forEach(p=>{const wr=p.trades>0?(p.wins/p.trades*100).toFixed(0)+'%':'0%';const pc=(p.total_pnl||0)>=0?'green':'red';
+    html+=`<tr><td>${stratPill(p.strategy)}</td><td>${p.trades} (${wr})</td><td>${p.wins}</td><td class="${pc}">$${(p.total_pnl||0).toFixed(2)}</td><td>${((p.avg_pnl_pct||0)*100).toFixed(2)}%</td></tr>`});
+   html+='</tbody></table>';}
   if(d.open&&d.open.length){
-   html+='<div style="margin-top:12px;margin-bottom:8px"><b>Open Shadow Trades:</b></div>';
-   html+='<table><thead><tr><th>Symbol</th><th>Strategy</th><th>Side</th><th>Entry</th><th>TP</th><th>SL</th></tr></thead><tbody>';
-   d.open.forEach(t=>{
-    html+=`<tr><td>${t.symbol}</td><td>${t.strategy}</td><td>${t.side}</td><td>$${(t.entry_price||0).toFixed(2)}</td><td>$${(t.take_profit||0).toFixed(2)}</td><td>$${(t.stop_loss||0).toFixed(2)}</td></tr>`;
-   });
-   html+='</tbody></table>';
-  }
-  el.innerHTML=html||'<span>No shadow trades</span>';
+   html+='<div style="margin-top:20px"><table><thead><tr><th>Symbol</th><th>Strategy</th><th>Side</th><th>Entry</th><th>TP</th><th>SL</th></tr></thead><tbody>';
+   d.open.forEach(t=>{html+=`<tr><td style="font-weight:600">${t.symbol}</td><td>${stratPill(t.strategy)}</td><td>${t.side}</td><td>$${(t.entry_price||0).toFixed(2)}</td><td>$${(t.take_profit||0).toFixed(2)}</td><td>$${(t.stop_loss||0).toFixed(2)}</td></tr>`});
+   html+='</tbody></table></div>';}
+  el.innerHTML=html||'<div style="color:var(--text-secondary);padding:16px 0">No shadow trades</div>';
  }catch(e){console.error(e)}
 }
 
-function refresh(){loadStats();loadChart();loadTrades();loadSignalStats();loadTradeAnalysis();loadShadowTrades()}
-refresh();
-setInterval(refresh,30000);
+async function loadMeta(){
+ try{const r=await fetch('/health');const d=await r.json();
+  document.getElementById('header-meta').textContent=`Uptime: ${Math.floor(d.uptime_seconds/60)}m`;
+ }catch(e){}}
+
+function refresh(){loadStats();loadChart();loadTrades();loadSignalStats();loadTradeAnalysis();loadShadowTrades();loadMeta()}
+refresh();setInterval(refresh,30000);
 </script>
 </body>
 </html>"""
