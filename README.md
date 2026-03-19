@@ -1,39 +1,38 @@
-# Velox V7 — Autonomous Algorithmic Trading System
+# Velox V10 — Autonomous Algorithmic Trading System
 
 ![CI](https://github.com/lumenworksco/Velox-Trader/actions/workflows/ci.yml/badge.svg)
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 
-An autonomous equity trading system built on the Alpaca API, targeting consistent low-variance returns through a diversified multi-strategy engine. Features statistical mean reversion, pairs trading, VWAP hybrid entries, ORB breakouts, news sentiment filtering, optional LLM signal scoring, and adaptive VIX-aware exits.
+A production-grade autonomous equity trading system built on the Alpaca API. Features 6 diversified strategies, a full order management system, tiered circuit breaker, real-time VaR monitoring, structured logging, and a Docker production stack with PostgreSQL, Prometheus, and Grafana.
 
-**Philosophy:** Consistent returns over big wins. Target 0.3–0.8% per trade, 65–75% win rate, 15–25 trades/day across 5 active strategies.
+**Philosophy:** Consistent returns over big wins. Target 0.3-0.8% per trade, 65-75% win rate, 15-25 trades/day across 6 active strategies.
 
 ---
 
 ## Quick Start
 
+### Option 1: Docker (Recommended)
+
 ```bash
 git clone https://github.com/lumenworksco/Velox-Trader.git
 cd Velox-Trader
+cp .env.example .env
+# Edit .env with your Alpaca API keys
+docker compose up -d
+```
+
+Services:
+- **Velox Dashboard**: http://localhost:8080
+- **Prometheus**: http://localhost:9090
+- **Grafana**: http://localhost:3000 (admin/admin)
+
+### Option 2: Local
+
+```bash
 pip install -r requirements.txt
-```
-
-Set your environment variables:
-
-```bash
 export ALPACA_API_KEY="your-api-key"
-export ALPACA_SECRET_KEY="your-secret-key"
-export ALPACA_LIVE=false                  # true for live trading
-export TELEGRAM_ENABLED=false              # optional
-export TELEGRAM_BOT_TOKEN=""              # from @BotFather
-export TELEGRAM_CHAT_ID=""                # your chat ID
-export LLM_SCORING_ENABLED=false          # optional Claude Haiku scoring
-export ANTHROPIC_API_KEY=""               # required if LLM scoring enabled
-```
-
-Run:
-
-```bash
+export ALPACA_API_SECRET="your-secret-key"
 python main.py
 ```
 
@@ -43,22 +42,23 @@ python main.py
 
 | Strategy | Allocation | Type | Hold | Description |
 |---|---|---|---|---|
-| **StatMeanReversion** | 50% | Mean Reversion | Intraday | OU process z-score entries with Hurst/ADF filtering on 2-min intraday bars |
+| **StatMeanReversion** | 50% | Mean Reversion | Intraday | OU process z-score entries with Hurst/ADF filtering on 2-min bars |
 | **VWAP v2 Hybrid** | 20% | Mean Reversion | Intraday | VWAP + OU z-score dual confirmation with bid-ask spread filter |
 | **KalmanPairsTrader** | 20% | Market-Neutral | Multi-day | Kalman filter dynamic hedge ratios on cointegrated sector pairs |
-| **ORB v2** | 5% | Breakout | Day | Opening range breakout with gap/range quality filters (10:00–11:30 AM) |
+| **ORB v2** | 5% | Breakout | Day | Opening range breakout with gap/range quality filters (10:00-11:30 AM) |
 | **IntradayMicroMomentum** | 5% | Event-Driven | 8 min | SPY volume spike detection, high-beta stock scalps |
+| **PEAD** | Optional | Event-Driven | Multi-day | Post-earnings announcement drift |
 
 ### How It Works
 
-1. **9:00 AM** — StatMR filters 128+ symbols by Hurst exponent (<0.52), ADF stationarity, and OU half-life (1–48h) to build a universe of ~40 mean-reverting candidates
-2. **9:30–10:00 AM** — ORB v2 records opening ranges for top 15 symbols by pre-market volume
-3. **9:30 AM** — 2-minute scan cycle begins: all five strategies scan for signals every 120 seconds
-4. **Signal processing** — News sentiment (Alpaca headlines) applies soft size multiplier; optional LLM scoring gates low-conviction signals
-5. **Ongoing** — Z-score based entries/exits for MR and VWAP; spread convergence for pairs; volume-confirmed breakouts for ORB
-6. **Every 15 min** — Beta neutralizer checks portfolio beta and hedges with SPY if |beta| > 0.3
-7. **Weekly (Monday)** — KalmanPairs selects top 15 cointegrated pairs within sector groups
-8. **Weekly** — Walk-forward validator checks OOS Sharpe, auto-demotes underperforming strategies
+1. **9:00 AM** -- Dynamic universe selection filters 127+ symbols by volume, market cap, and regime
+2. **9:00 AM** -- StatMR builds mean-reversion universe via Hurst exponent, ADF stationarity, and OU half-life
+3. **9:30 AM** -- 2-minute scan cycle begins: all strategies scan for signals every 120 seconds
+4. **Signal pipeline** -- Each signal passes through: transaction cost filter, VaR check, correlation limiter, news sentiment, optional LLM scoring
+5. **OMS** -- Orders tracked through 7-state lifecycle (PENDING -> SUBMITTED -> FILLED/CANCELLED/REJECTED)
+6. **Every 15 min** -- Beta neutralizer checks portfolio beta and hedges with SPY if |beta| > 0.3
+7. **Weekly** -- KalmanPairs selects top 15 cointegrated pairs; walk-forward validator checks OOS Sharpe
+8. **EOD** -- End-of-day close routine with overnight hold selection
 
 ---
 
@@ -66,70 +66,120 @@ python main.py
 
 ```
 trading_bot/
-  main.py                  # Entry point, 2-min scan loop orchestrator
-  config.py                # All configuration and strategy parameters
-  data.py                  # Alpaca market data (REST + WebSocket)
-  execution.py             # Order routing, TWAP splitting, bracket orders
-  database.py              # SQLite persistence (trades, signals, OU params)
-  dashboard.py             # Rich terminal dashboard
-  web_dashboard.py         # FastAPI web dashboard (port 8080)
-  position_monitor.py      # WebSocket real-time position monitoring
-  notifications.py         # Telegram trade alerts
-  earnings.py              # Earnings calendar filter
-  correlation.py           # Correlation-based position conflict filter
-  news_sentiment.py        # Alpaca News API keyword-based sentiment filter
-  llm_signal_scorer.py     # Optional Claude Haiku signal scoring (fail-open)
-  adaptive_exit_manager.py # VIX-aware adaptive exit parameters
-  walk_forward.py          # Weekly walk-forward OOS validation
+  main.py                    # Thin orchestrator (~1500 lines, down from 2300)
+  config.py                  # All configuration and strategy parameters
+  data.py                    # Alpaca market data (REST + WebSocket)
+  execution.py               # Order routing, TWAP splitting, bracket orders
+  database.py                # SQLite persistence layer
+
+  engine/                    # V10 engine package (extracted from main.py)
+    startup.py               # Module initialization and startup checks
+    signal_processor.py      # Full signal pipeline with OMS + cost filter + VaR
+    scanner.py               # Strategy scan orchestration
+    daily_tasks.py           # Daily reset, weekly tasks, EOD close
+    broker_sync.py           # Position reconciliation with broker
+    exit_processor.py        # Strategy exits + WebSocket exits
+    events.py                # Pub/sub event bus
+    metrics.py               # Prometheus counters/gauges/histograms
+    logging_config.py        # structlog dev/prod configuration
+
+  oms/                       # Order Management System
+    order.py                 # Order dataclass with 7-state machine
+    order_manager.py         # Thread-safe registry with idempotency keys
+    kill_switch.py           # Emergency halt: cancel all + close all
+    transaction_cost.py      # Pre-trade cost estimation (spread + slippage)
+
   strategies/
-    base.py                # Signal dataclass, shared types
-    regime.py              # SPY EMA market regime detection
-    stat_mean_reversion.py # OU z-score mean reversion (50%)
-    vwap.py                # VWAP + OU hybrid entries (20%)
-    kalman_pairs.py        # Kalman filter pairs trading (20%)
-    orb_v2.py              # Opening range breakout v2 (5%)
-    micro_momentum.py      # SPY vol spike micro momentum (5%)
-    archive/               # V1-V5 strategies (preserved)
+    base.py                  # Signal dataclass, shared types
+    regime.py                # SPY HMM market regime detection
+    stat_mean_reversion.py   # OU z-score mean reversion (50%)
+    vwap.py                  # VWAP + OU hybrid entries (20%)
+    kalman_pairs.py          # Kalman filter pairs trading (20%)
+    orb_v2.py                # Opening range breakout v2 (5%)
+    micro_momentum.py        # SPY vol spike micro momentum (5%)
+    pead.py                  # Post-earnings announcement drift
+    dynamic_universe.py      # Regime-adaptive universe selection
+
   risk/
-    risk_manager.py        # Trade tracking, circuit breaker, position limits
-    vol_targeting.py       # Volatility-targeted position sizing
-    daily_pnl_lock.py      # P&L lock states (NORMAL/GAIN_LOCK/LOSS_HALT)
-    beta_neutralizer.py    # Portfolio beta monitoring + SPY hedging
-  analytics/
-    ou_tools.py            # Ornstein-Uhlenbeck parameter fitting
-    hurst.py               # Hurst exponent (R/S analysis)
-    consistency_score.py   # Consistency score (0-100)
-  tests/                   # 196 unit tests
+    risk_manager.py          # Trade tracking, position limits
+    circuit_breaker.py       # V10 tiered circuit breaker (4 tiers)
+    var_monitor.py           # Parametric + Historical + Monte Carlo VaR
+    correlation_limiter.py   # Eigenvalue-based effective bets + sector limits
+    vol_targeting.py         # Volatility-targeted position sizing
+    daily_pnl_lock.py        # P&L lock states (NORMAL/GAIN_LOCK/LOSS_HALT)
+    beta_neutralizer.py      # Portfolio beta monitoring + SPY hedging
+
+  db/                        # SQLAlchemy database abstraction
+    __init__.py              # Dual-backend engine (SQLite/PostgreSQL)
+    models.py                # 16 table definitions
+    migrations/              # Alembic migration scripts
+
+  auth/                      # Dashboard authentication
+    jwt_auth.py              # JWT token create/verify
+
+  analytics/                 # Performance metrics and statistical tools
+    performance.py           # Sharpe, Sortino, drawdown, attribution
+    ou_tools.py              # Ornstein-Uhlenbeck parameter fitting
+    hurst.py                 # Hurst exponent (R/S analysis)
+    consistency_score.py     # Consistency score (0-100)
+
+  web_dashboard.py           # FastAPI dashboard with Apple-style UI
+  monitoring/
+    prometheus.yml           # Prometheus scrape configuration
+
+  tests/                     # 911 unit tests
   Dockerfile
-  docker-compose.yml
+  docker-compose.yml         # Production stack: Velox + PostgreSQL + Prometheus + Grafana
 ```
 
 ---
 
-## V7 Features
+## V10 Features
 
-### News Sentiment Filter
-Alpaca News API headlines scored via keyword matching. Returns a position-size multiplier:
-- **Halt keywords** (bankruptcy, fraud, SEC charges) → block trade entirely
-- **Strong negative** (misses, downgrade) → reduce size to 50%
-- **Neutral/positive** → full or boosted sizing
-- 30-minute cache per symbol, fail-safe returns neutral on API errors
+### Order Management System (OMS)
+Full order lifecycle tracking with 7-state machine (PENDING -> SUBMITTED -> PARTIALLY_FILLED -> FILLED / CANCELLED / REJECTED / EXPIRED). Thread-safe registry with idempotency keys prevents duplicate orders.
 
-### LLM Signal Scoring (Optional)
-Claude Haiku evaluates signals with market context. Opt-in (`LLM_SCORING_ENABLED=true`), fail-open design:
-- 3-second timeout, $0.10/day cost cap
-- Returns 0.0–1.0 confidence score; signals below threshold are blocked
-- Score can scale position size for partial-conviction entries
+### Tiered Circuit Breaker
+Progressive risk reduction based on daily P&L:
+- **Yellow** (-1%): Reduce new position sizes by 50%
+- **Orange** (-2%): Stop all new entries
+- **Red** (-3%): Close day trades, keep swing positions
+- **Black** (-4%): Kill switch -- close everything
 
-### Adaptive VIX-Aware Exits
-Four VIX regimes with dynamic exit parameters:
-- **Low vol** (VIX < 15): tighter targets, wider stops
-- **Normal** (15–20): balanced parameters
-- **High vol** (20–30): wider targets, tighter time stops
-- **Crisis** (30+): fastest exits, tightest stops
+### VaR Monitor
+Real-time portfolio Value-at-Risk using three methods:
+- Parametric VaR (95% and 99%)
+- Historical simulation
+- Monte Carlo (10,000 paths)
 
-### Walk-Forward Validation
-Weekly out-of-sample Sharpe check on each strategy. Auto-demotes strategies with OOS Sharpe < 0.3 by reducing allocation.
+### Correlation Limiter
+Prevents concentration risk via eigenvalue-based effective bets calculation and sector Herfindahl index monitoring.
+
+### Transaction Cost Filter
+Pre-trade expected value check: rejects signals where estimated costs (spread + slippage + commission) exceed expected profit.
+
+### Structured Logging
+JSON-formatted logs in production (structlog), human-readable in development. All events include correlation IDs for tracing.
+
+### Prometheus Metrics
+Exposed at `/metrics` on port 8080:
+- `velox_open_positions` -- Current position count
+- `velox_daily_pnl` -- Running daily P&L
+- `velox_order_latency` -- Order submission to fill latency
+- `velox_signal_count` -- Signals generated per strategy
+- `velox_circuit_breaker_state` -- Current circuit breaker tier
+
+### Web Dashboard
+Apple-style frosted glass UI at http://localhost:8080 with:
+- Live equity and P&L from Alpaca account
+- Open positions with real-time unrealized P&L
+- Trade log filterable by strategy
+- Signal filter analysis and exit reason breakdown
+- OMS status, circuit breaker state, kill switch controls
+- Auto-refresh every 30 seconds
+
+### Dynamic Universe
+Daily symbol selection at 9 AM based on volume, market cap, and current market regime. Adapts universe size and composition to volatility conditions.
 
 ---
 
@@ -137,66 +187,55 @@ Weekly out-of-sample Sharpe check on each strategy. Auto-demotes strategies with
 
 | Component | Description |
 |---|---|
+| **Tiered Circuit Breaker** | 4-tier progressive risk reduction (-1% to -4%) |
+| **VaR Monitor** | Parametric + Historical + Monte Carlo VaR at 95%/99% |
+| **Correlation Limiter** | Eigenvalue effective bets + sector concentration limits |
 | **Volatility Targeting** | Scales position sizes so daily portfolio vol = 1% target |
-| **Daily P&L Lock** | GAIN_LOCK at +1.5% (reduces to 30% sizing), LOSS_HALT at -1.0% (stops all new trades) |
-| **Beta Neutralization** | Monitors dollar-weighted portfolio beta, hedges with SPY when \|beta\| > 0.3 |
-| **Circuit Breaker** | Hard stop at -4% daily loss, closes all positions |
-| **VIX Risk Scaling** | Continuous VIX-based position size scaling (0.0–1.0 multiplier) |
-| **News Sentiment** | Soft size multiplier based on recent headlines |
-| **TWAP Execution** | Orders > $2,000 split into 5 time-weighted slices (60s apart) |
+| **Daily P&L Lock** | GAIN_LOCK at +1.5% (30% sizing), LOSS_HALT at -1.0% (stops new trades) |
+| **Beta Neutralization** | Monitors portfolio beta, hedges with SPY when \|beta\| > 0.3 |
+| **Transaction Cost Filter** | Rejects negative expected-value trades before submission |
+| **Kill Switch** | Emergency halt: cancels all orders, closes all positions |
+| **TWAP Execution** | Orders > $2,000 split into 5 time-weighted slices |
 
 ---
 
-## Configuration Reference
+## Docker Production Stack
+
+```bash
+docker compose up -d              # Start all services
+docker compose logs -f velox      # Follow trading bot logs
+docker compose exec velox python main.py --diagnose  # Run diagnostic
+```
+
+| Service | Port | Description |
+|---|---|---|
+| **velox** | 8080 | Trading bot + web dashboard |
+| **postgres** | 5432 | PostgreSQL 16 database |
+| **prometheus** | 9090 | Metrics collection |
+| **grafana** | 3000 | Monitoring dashboards (admin/admin) |
+
+Environment variables are configured in `.env` (see `.env.example`).
+
+---
+
+## Configuration
 
 | Parameter | Default | Description |
 |---|---|---|
 | `ALPACA_LIVE` | `false` | Paper vs live trading |
 | `MAX_POSITIONS` | `12` | Maximum concurrent positions |
-| `DAILY_LOSS_HALT` | `-4%` | Circuit breaker threshold |
 | `SCAN_INTERVAL_SEC` | `120` | Seconds between strategy scans |
 | `RISK_PER_TRADE_PCT` | `0.8%` | Max risk per trade |
 | `VOL_TARGET_DAILY` | `1.0%` | Daily portfolio volatility target |
-| `PNL_GAIN_LOCK_PCT` | `+1.5%` | P&L threshold to enter GAIN_LOCK |
-| `PNL_LOSS_HALT_PCT` | `-1.0%` | P&L threshold to enter LOSS_HALT |
-| `MR_ZSCORE_ENTRY` | `1.5` | Mean reversion z-score entry threshold |
-| `MR_ZSCORE_EXIT` | `0.2` | Mean reversion z-score full exit |
-| `MR_ZSCORE_STOP` | `2.5` | Mean reversion z-score stop loss |
-| `MR_HURST_MAX` | `0.52` | Maximum Hurst exponent for MR universe |
-| `PAIRS_ZSCORE_ENTRY` | `2.0` | Pairs z-score entry threshold |
-| `BETA_MAX_ABS` | `0.3` | Max absolute portfolio beta before hedging |
-| `ORB_ENABLED` | `true` | Enable ORB v2 strategy |
+| `DATABASE_URL` | `sqlite:///bot.db` | Database connection (PostgreSQL supported) |
+| `STRUCTURED_LOGGING` | `false` | Enable JSON structured logging |
+| `WEB_DASHBOARD_ENABLED` | `true` | Enable web dashboard on port 8080 |
+| `WATCHDOG_ENABLED` | `false` | Enable position watchdog |
 | `NEWS_SENTIMENT_ENABLED` | `true` | Enable Alpaca news sentiment filter |
 | `LLM_SCORING_ENABLED` | `false` | Enable Claude Haiku signal scoring |
 | `ADAPTIVE_EXITS_ENABLED` | `true` | Enable VIX-aware adaptive exits |
 | `WALK_FORWARD_ENABLED` | `true` | Enable weekly walk-forward validation |
 | `TELEGRAM_ENABLED` | `false` | Enable Telegram trade alerts |
-| `WEBSOCKET_MONITORING` | `true` | Enable WebSocket position monitoring |
-
----
-
-## Web Dashboard
-
-Access at `http://localhost:8080` when running. Features:
-
-- **Equity curve** — 60-day portfolio value chart
-- **Risk state** — Vol scalar, portfolio beta, P&L lock status, consistency score
-- **Strategy allocation** — MR 50% / VWAP 20% / PAIRS 20% / ORB 5% / MICRO 5%
-- **Strategy health** — Per-strategy 7d/30d win rate, P&L, trade count diagnostics
-- **Trade log** — Filterable by strategy (StatMR, VWAP, KalmanPairs, ORB, MicroMom)
-- **Signal analysis** — Filter skip reasons and exit reason breakdown
-
-API endpoints: `/api/stats`, `/api/trades`, `/api/positions`, `/api/portfolio_history`, `/api/consistency`, `/api/risk-state`, `/api/strategy_health`, `/api/filter_diagnostic`, `/api/signal_stats`, `/api/trade_analysis`
-
----
-
-## Docker
-
-```bash
-docker-compose up -d
-```
-
-The bot runs in a container with automatic restarts and health checks. Set environment variables in `.env`.
 
 ---
 
@@ -206,28 +245,53 @@ The bot runs in a container with automatic restarts and health checks. Set envir
 # Run all tests
 pytest tests/ -v
 
-# Run specific test modules
-pytest tests/test_stat_mean_reversion.py -v
-pytest tests/test_news_sentiment.py -v
-pytest tests/test_orb_v2.py -v
-pytest tests/test_adaptive_exit_manager.py -v
+# With coverage
+pytest tests/ -v --cov=. --cov-report=html
+
+# Run specific modules
+pytest tests/test_v10_oms.py -v
+pytest tests/test_v10_events.py -v
+pytest tests/test_v10_phase4.py -v
 ```
 
-196 tests covering all V7 strategies, risk modules, analytics, and new features.
+911 tests covering all strategies, risk modules, OMS, event bus, circuit breaker, and analytics.
+
+---
+
+## API Endpoints
+
+| Endpoint | Description |
+|---|---|
+| `GET /health` | Health check (Docker/monitoring) |
+| `GET /api/stats` | Live performance stats from Alpaca + analytics |
+| `GET /api/positions` | Current open positions (live broker data) |
+| `GET /api/trades` | Trade history (filterable by strategy) |
+| `GET /api/portfolio_history` | Daily portfolio snapshots |
+| `GET /api/signals` | Signal log by date |
+| `GET /api/signal_stats` | Signal skip reason breakdown |
+| `GET /api/trade_analysis` | Exit reason analysis |
+| `GET /api/risk-state` | Risk engine state (vol scalar, beta, P&L lock) |
+| `GET /api/strategy_health` | Per-strategy health metrics |
+| `GET /api/v10/oms` | OMS order status and history |
+| `GET /api/v10/circuit_breaker` | Circuit breaker state and history |
+| `POST /api/v10/kill_switch/activate` | Activate emergency kill switch |
 
 ---
 
 ## Version History
 
-| Version | Focus |
-|---|---|
-| V1 | ORB + VWAP strategies, basic risk management |
-| V2 | Momentum strategy, WebSocket monitoring |
-| V3 | ML signal filter, short selling, dynamic allocation |
-| V4 | Sector rotation, pairs trading, MTF confirmation, news filter |
-| V5 | EMA scalping, shadow mode, advanced exits |
-| V6 | Complete rebuild: statistical mean reversion, volatility targeting, P&L locking, beta neutralization |
-| **V7** | **5-strategy diversification (StatMR, VWAP v2, Pairs, ORB v2, MicroMom), news sentiment, LLM scoring, adaptive exits, walk-forward validation, strategy health dashboard** |
+| Version | Date | Focus |
+|---|---|---|
+| V1 | 2025-01 | ORB + VWAP strategies, basic risk management |
+| V2 | 2025-05 | Momentum strategy, WebSocket monitoring |
+| V3 | 2025-09 | ML signal filter, short selling, dynamic allocation |
+| V4 | 2026-03 | Sector rotation, pairs trading, MTF, news filter |
+| V5 | 2026-03 | EMA scalping, shadow mode, advanced exits |
+| V6 | 2026-03 | Complete rebuild: statistical mean reversion, vol targeting |
+| V7 | 2026-03 | 5-strategy diversification, news sentiment, LLM scoring, adaptive exits |
+| V8 | 2026-03 | Bug fixes, thread safety, dead code removal |
+| V9 | 2026-03 | Engine decomposition, PostgreSQL, OMS skeleton |
+| **V10** | **2026-03** | **Production-grade: tiered circuit breaker, VaR monitor, correlation limiter, event bus, structured logging, Prometheus metrics, Docker stack, Apple-style dashboard** |
 
 ---
 

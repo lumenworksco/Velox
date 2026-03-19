@@ -2,22 +2,64 @@
 
 All notable changes to this project will be documented in this file.
 
+## [10.0.0] - 2026-03-19
+
+### Added
+- **Order Management System (OMS)** -- 7-state order lifecycle (PENDING -> SUBMITTED -> FILLED/CANCELLED/REJECTED), thread-safe registry with idempotency keys, kill switch for emergency halt
+- **Tiered Circuit Breaker** -- 4-tier progressive risk reduction: Yellow (-1%), Orange (-2%), Red (-3%), Black (-4% kill switch)
+- **VaR Monitor** -- Real-time parametric, historical, and Monte Carlo Value-at-Risk at 95%/99%
+- **Correlation Limiter** -- Eigenvalue-based effective bets calculation, sector Herfindahl concentration limits
+- **Transaction Cost Model** -- Pre-trade expected value check rejects negative-EV signals (spread + slippage + commission)
+- **Event Bus** -- Pub/sub decoupling for signals, orders, positions, circuit breaker, and regime change events
+- **Structured Logging** -- structlog with JSON output in production, human-readable in development
+- **Prometheus Metrics** -- Counters, gauges, and histograms for positions, P&L, latency, signals, circuit breaker state
+- **PostgreSQL Support** -- SQLAlchemy dual-backend (SQLite for dev/tests, PostgreSQL for production) with Alembic migrations
+- **JWT Authentication** -- Optional dashboard auth with token-based access control
+- **Docker Production Stack** -- 4-service compose: Velox, PostgreSQL 16, Prometheus, Grafana
+- **Dynamic Universe Selection** -- Regime-adaptive daily symbol filtering by volume, market cap, and volatility
+- **Apple-Style Dashboard** -- Frosted glass UI with live Alpaca account data, open positions, strategy color pills
+- **PEAD Strategy** -- Post-earnings announcement drift (optional)
+- 911 unit tests (up from 196)
+
+### Changed
+- **main.py decomposed** -- 2329 -> 1512 lines (-35%), extracted into `engine/` package (10 modules, 1847 lines)
+- **Dashboard stats** -- Now pulls live equity, day P&L, and positions directly from Alpaca API
+- **Dashboard positions** -- Shows real-time broker positions with unrealized P&L instead of stale DB data
+- **Signal pipeline** -- Signals now pass through OMS, transaction cost filter, VaR multiplier, and correlation limiter
+- **Daily snapshots** -- Fallback to trade-derived daily returns when snapshot data is insufficient
+- All 25 dependencies pinned to exact versions (==)
+- Replaced `pickle` with `joblib` for model persistence (security)
+- Replaced custom RSI with `pandas_ta` library
+
+### Fixed
+- **47 bugs** from V10 audit fixed across exit manager, Kalman pairs, StatMR, circuit breaker, broker sync, database, and execution modules
+- **analytics module shadowing** -- `analytics.py` moved into `analytics/performance.py` to resolve package/file conflict
+- **Dashboard showing zeros** -- Fixed auth blocking (empty DASHBOARD_SECRET_KEY), bot.db volume mount, analytics import chain
+- **Test date sensitivity** -- Fixed 6 test failures caused by hardcoded dates falling outside query windows
+- **Rate limiter breaking tests** -- Skip rate limiting when PYTEST_CURRENT_TEST is set
+- Removed `.DS_Store` and `bot.db` from git tracking
+
+### Removed
+- Dead code: `news_filter.py`, `strategies/archive/`, legacy config flags, static beta tables
+- Dead strategy routing in execution.py (MOMENTUM, GAP_GO, SECTOR_ROTATION)
+- Junk files: `=0.49.0`, `strategies/=0.9.7`, `state.json.bak`
+
 ## [7.0.0] - 2026-03-14
 
 ### Bug Fixes
-- **Broker sync 0 P&L** — `sync_positions_with_broker()` now fetches market price via `get_snapshot()` instead of using entry_price as exit_price
-- **StatMR never firing** — Added startup initialization for `prepare_universe()` + switched to 2-min intraday bars for OU fitting (correct half-life conversion)
-- **KalmanPairs never initializing** — Loads existing pairs from DB on startup; runs `select_pairs_weekly()` if table is empty
-- **MTF over-filtering** — Per-strategy MTF control via `MTF_ENABLED_FOR` config dict; disabled for mean reversion strategies
+- **Broker sync 0 P&L** -- `sync_positions_with_broker()` now fetches market price via `get_snapshot()` instead of using entry_price as exit_price
+- **StatMR never firing** -- Added startup initialization for `prepare_universe()` + switched to 2-min intraday bars for OU fitting (correct half-life conversion)
+- **KalmanPairs never initializing** -- Loads existing pairs from DB on startup; runs `select_pairs_weekly()` if table is empty
+- **MTF over-filtering** -- Per-strategy MTF control via `MTF_ENABLED_FOR` config dict; disabled for mean reversion strategies
 
 ### Added
-- **VWAP v2 Hybrid strategy** (20% allocation) — VWAP + OU z-score dual confirmation with bid-ask spread filter
-- **ORB v2 strategy** (5% allocation) — Opening range breakout 10:00–11:30 AM with gap/range quality filters
-- **Alpaca News Sentiment** — Keyword-based headline scoring, soft position-size multiplier, 30-min cache
-- **LLM Signal Scoring** — Optional Claude Haiku signal evaluation; fail-open, 3s timeout, $0.10/day cost cap
-- **Adaptive VIX-Aware Exits** — Four VIX regimes with dynamic exit parameters
-- **Walk-Forward Validation** — Weekly OOS Sharpe check per strategy with auto-demotion
-- **Strategy Health Dashboard** — `/api/strategy_health` and `/api/filter_diagnostic` endpoints
+- **VWAP v2 Hybrid strategy** (20% allocation) -- VWAP + OU z-score dual confirmation with bid-ask spread filter
+- **ORB v2 strategy** (5% allocation) -- Opening range breakout 10:00-11:30 AM with gap/range quality filters
+- **Alpaca News Sentiment** -- Keyword-based headline scoring, soft position-size multiplier, 30-min cache
+- **LLM Signal Scoring** -- Optional Claude Haiku signal evaluation; fail-open, 3s timeout, $0.10/day cost cap
+- **Adaptive VIX-Aware Exits** -- Four VIX regimes with dynamic exit parameters
+- **Walk-Forward Validation** -- Weekly OOS Sharpe check per strategy with auto-demotion
+- **Strategy Health Dashboard** -- `/api/strategy_health` and `/api/filter_diagnostic` endpoints
 - 196 unit tests (up from ~108)
 
 ### Changed

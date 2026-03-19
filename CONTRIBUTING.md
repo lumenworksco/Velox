@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for your interest in contributing to the Algo Trading Bot.
+Thanks for your interest in contributing to Velox.
 
 ## Adding a New Strategy
 
@@ -10,8 +10,8 @@ Thanks for your interest in contributing to the Algo Trading Bot.
 
    ```python
    class MyStrategy:
-       def __init__(self, config: dict):
-           self.config = config
+       def __init__(self):
+           pass
 
        def scan(self, symbols: list[str], data: dict) -> list[dict]:
            """
@@ -23,7 +23,7 @@ Thanks for your interest in contributing to the Algo Trading Bot.
              - entry: float
              - stop_loss: float
              - take_profit: float
-             - strategy: str (strategy name)
+             - strategy: str (strategy name for routing)
            """
            signals = []
            # Your logic here
@@ -36,9 +36,20 @@ Thanks for your interest in contributing to the Algo Trading Bot.
    MY_STRATEGY_ENABLED = os.getenv("MY_STRATEGY_ENABLED", "false").lower() == "true"
    ```
 
-4. Register the strategy in `strategies/__init__.py` so the orchestrator picks it up.
+4. Register the strategy in `engine/startup.py` inside `initialize_strategies()`.
 
 5. Write tests in `tests/test_my_strategy.py`.
+
+## Project Structure
+
+- **`engine/`** -- Core trading engine (startup, scanning, signal processing, exits, events)
+- **`oms/`** -- Order Management System (order lifecycle, kill switch, cost model)
+- **`risk/`** -- Risk modules (circuit breaker, VaR, correlation, vol targeting, beta)
+- **`strategies/`** -- Trading strategies (StatMR, VWAP, Pairs, ORB, MicroMom, PEAD)
+- **`db/`** -- SQLAlchemy database abstraction and Alembic migrations
+- **`auth/`** -- JWT authentication for the web dashboard
+- **`analytics/`** -- Performance metrics, OU tools, Hurst exponent, consistency scoring
+- **`tests/`** -- 911 unit tests
 
 ## Pull Request Requirements
 
@@ -46,6 +57,7 @@ Thanks for your interest in contributing to the Algo Trading Bot.
 - New features must be gated behind config flags (disabled by default).
 - Include tests for any new strategy or module.
 - Update `CHANGELOG.md` with your changes.
+- Signals must pass through the full pipeline in `engine/signal_processor.py` (cost filter, VaR, correlation limiter).
 
 ## Code Style
 
@@ -57,6 +69,14 @@ Thanks for your interest in contributing to the Algo Trading Bot.
   ruff check .
   ruff format .
   ```
+
+## Docker Development
+
+```bash
+docker compose up -d --build velox   # Rebuild and restart bot
+docker compose logs -f velox         # Follow logs
+docker compose exec velox python main.py --diagnose  # Run diagnostics
+```
 
 ## Reporting Issues
 
