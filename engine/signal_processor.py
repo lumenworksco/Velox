@@ -7,6 +7,8 @@ Integrates:
 """
 
 import logging
+import threading
+import time as _time
 from datetime import datetime, timedelta
 
 import config
@@ -28,12 +30,16 @@ except ImportError:
     IntradaySeasonality = None
 
 # V10 BUG-042: Singleton IntradaySeasonality (created once, not per-signal)
+# BUG-008: Thread-safe singleton creation via double-checked locking
 _seasonality_instance = None
+_seasonality_lock = threading.Lock()
 
 def _get_seasonality():
     global _seasonality_instance
     if _seasonality_instance is None and IntradaySeasonality:
-        _seasonality_instance = IntradaySeasonality()
+        with _seasonality_lock:
+            if _seasonality_instance is None:
+                _seasonality_instance = IntradaySeasonality()
     return _seasonality_instance
 
 # OMS integration (fail-open: if OMS not available, orders still go through)
@@ -54,6 +60,45 @@ except ImportError:
 
 _notifications = None
 _order_manager = None
+
+# BUG-024: Halted symbol detection — symbols with zero volume over 5+ consecutive bars
+_halted_symbols: dict[str, float] = {}  # symbol -> expiry timestamp
+_HALT_BLOCKLIST_TTL_SEC = 300  # Block for 5 minutes after detection
+
+
+def _is_symbol_halted(symbol: str, now: datetime) -> bool:
+    """BUG-024: Check if a symbol appears halted (zero volume over 5+ bars).
+
+    Checks recent intraday bars for zero volume streaks. Adds halted
+    symbols to a temporary blocklist to avoid repeated data fetches.
+    """
+    # Check blocklist first
+    current_ts = _time.time()
+    if symbol in _halted_symbols:
+        if current_ts < _halted_symbols[symbol]:
+            return True
+        else:
+            del _halted_symbols[symbol]
+
+    try:
+        from data import get_intraday_bars
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+        lookback = now - timedelta(minutes=15)
+        bars = get_intraday_bars(symbol, TimeFrame(1, TimeFrameUnit.Minute), start=lookback, end=now)
+        if bars is None or bars.empty or len(bars) < 5:
+            return False
+
+        # Check last 5 bars for zero volume
+        last_5_vol = bars["volume"].iloc[-5:]
+        if (last_5_vol == 0).all():
+            _halted_symbols[symbol] = current_ts + _HALT_BLOCKLIST_TTL_SEC
+            logger.warning(f"BUG-024: {symbol} appears halted (zero volume for 5+ bars), blocking for {_HALT_BLOCKLIST_TTL_SEC}s")
+            return True
+    except Exception as e:
+        logger.debug(f"Halt detection check failed for {symbol}: {e}")
+
+    return False
 
 
 def _get_notifications():
@@ -79,8 +124,8 @@ def _emit_event(event_type: str, data: dict, source: str = "signal_processor"):
         try:
             bus = get_event_bus()
             bus.publish(Event(event_type, data, source=source))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Event bus publish failed: {e}")
 
 
 def process_signals(
@@ -198,6 +243,13 @@ def _process_single_signal(
         database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
         return
 
+    # 1a. BUG-024: Halted symbol detection
+    if _is_symbol_halted(signal.symbol, now):
+        skip_reason = "symbol_halted"
+        logger.info(f"Signal skipped for {signal.symbol}: appears halted (zero volume)")
+        database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
+        return
+
     # 1b. PDT rule check for day trades
     if signal.hold_type == "day":
         try:
@@ -213,8 +265,8 @@ def _process_single_signal(
                           details=f"Day trade blocked — PDT limit reached")
                 database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
                 return
-        except Exception:
-            pass  # Fail-open: don't block trades if PDT module has issues
+        except Exception as e:
+            logger.warning(f"PDT check failed for {signal.symbol} (fail-open): {e}")
 
     # 2. Earnings filter
     if has_earnings_soon(signal.symbol):
@@ -262,8 +314,8 @@ def _process_single_signal(
                     logger.info(f"Trade blocked for {signal.symbol}: {skip_reason}")
                     database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
                     return
-        except Exception:
-            pass  # Fail-open
+        except Exception as e:
+            logger.warning(f"Concentration check failed for {signal.symbol} (fail-open): {e}")
 
     # 5b. News sentiment size adjustment (soft filter)
     news_mult = 1.0
@@ -366,6 +418,7 @@ def _process_single_signal(
                 qty=qty,
                 side=signal.side,
                 win_rate=win_rate,
+                strategy=signal.strategy,  # BUG-026: pass strategy for per-strategy win rate
             )
             if not profitable:
                 skip_reason = f"negative_ev_after_costs_{cost_details['cost_bps']:.0f}bps"

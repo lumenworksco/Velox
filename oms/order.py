@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
+from tz_utils import now_et
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,7 +60,8 @@ class Order:
     filled_avg_price: float = 0.0
 
     # Timestamps
-    created_at: datetime = field(default_factory=datetime.now)
+    # BUG-009: Use timezone-aware ET datetime instead of naive datetime.now()
+    created_at: datetime = field(default_factory=now_et)
     submitted_at: datetime | None = None
     filled_at: datetime | None = None
     cancelled_at: datetime | None = None
@@ -72,12 +75,13 @@ class Order:
         if new_state in _TRANSITIONS.get(self.state, set()):
             old = self.state
             self.state = new_state
+            # BUG-009: Use timezone-aware ET datetime
             if new_state == OrderState.SUBMITTED:
-                self.submitted_at = datetime.now()
+                self.submitted_at = now_et()
             elif new_state == OrderState.FILLED:
-                self.filled_at = datetime.now()
+                self.filled_at = now_et()
             elif new_state == OrderState.CANCELLED:
-                self.cancelled_at = datetime.now()
+                self.cancelled_at = now_et()
             logger.debug(f"Order {self.oms_id} ({self.symbol}): {old.value} -> {new_state.value}")
             return True
         else:

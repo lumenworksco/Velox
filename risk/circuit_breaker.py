@@ -50,6 +50,10 @@ DEFAULT_TIERS = {
 class TieredCircuitBreaker:
     """Progressive circuit breaker with 4 severity tiers."""
 
+    # Hysteresis buffer: P&L must recover by this much beyond the threshold
+    # before de-escalating, to prevent rapid oscillation.
+    HYSTERESIS_PCT = 0.002  # 0.2%
+
     def __init__(self, tiers: dict[CircuitTier, TierConfig] | None = None):
         self.tiers = tiers or DEFAULT_TIERS
         self.current_tier = CircuitTier.NORMAL
@@ -76,15 +80,26 @@ class TieredCircuitBreaker:
 
         old_tier = self.current_tier
 
-        # Determine tier based on P&L (most severe matching tier wins)
+        # Determine tier based on P&L — check from most severe (BLACK) down
+        # to least severe (YELLOW), then fall through to NORMAL.
+        # This explicit ordering avoids IntEnum sort-order issues.
         new_tier = CircuitTier.NORMAL
-        for tier in sorted(self.tiers.keys(), reverse=True):
-            if tier == CircuitTier.NORMAL:
-                continue
+        for tier in (CircuitTier.BLACK, CircuitTier.RED, CircuitTier.ORANGE, CircuitTier.YELLOW):
             cfg = self.tiers[tier]
             if day_pnl_pct <= cfg.threshold_pct:
                 new_tier = tier
                 break
+
+        # Apply hysteresis buffer for de-escalation to prevent rapid
+        # oscillation when P&L hovers near a threshold boundary.
+        # Escalation applies immediately; de-escalation requires P&L to
+        # recover beyond the old tier's threshold by HYSTERESIS_PCT.
+        if new_tier < old_tier:
+            old_cfg = self.tiers[old_tier]
+            # P&L must be above (old threshold + hysteresis) to de-escalate.
+            # E.g. RED threshold is -3%; must recover above -2.8% to leave RED.
+            if day_pnl_pct <= old_cfg.threshold_pct + self.HYSTERESIS_PCT:
+                new_tier = old_tier  # stay at current tier
 
         if new_tier != old_tier:
             self.current_tier = new_tier

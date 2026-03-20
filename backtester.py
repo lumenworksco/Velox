@@ -11,6 +11,7 @@ from rich.table import Table
 
 import config
 import database
+from utils import safe_divide
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -96,7 +97,10 @@ def simulate_orb(data: dict[str, pd.DataFrame], initial_capital: float = 100000)
                 continue
 
             # Range quality filter
-            range_pct = orb_range / ((orb_high + orb_low) / 2)
+            midpoint = (orb_high + orb_low) / 2
+            range_pct = safe_divide(orb_range, midpoint, default=0.0)
+            if midpoint <= 0:
+                continue
             if range_pct > config.ORB_MAX_RANGE_PCT:
                 continue
 

@@ -26,9 +26,16 @@ state.json
 state.json.bak
 
 # Data & logs
-data/
+data/*.csv
+data/*.parquet
+data/*.json
+!data/*.py
+!data/__init__.py
 logs/
-models/
+models/*.pkl
+models/*.joblib
+models/*.json
+!models/*.py
 backups/
 
 # Testing
@@ -44,6 +51,11 @@ coverage.xml
 *.swo
 *~
 .DS_Store
+
+# Generated files
+audit.log
+bot.log
+*.jsonl
 
 # Claude
 .claude/

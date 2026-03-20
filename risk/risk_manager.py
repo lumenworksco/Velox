@@ -83,6 +83,7 @@ class TradeRecord:
     highest_price_seen: float = 0.0  # V4: for trailing stop tracking (longs)
     lowest_price_seen: float = 0.0   # V10: for trailing stop tracking (shorts)
     entry_atr: float = 0.0           # V4: ATR at time of entry
+    partial_closed_qty: int = 0      # V10 BUG-004: cumulative qty closed via partial exits
 
 
 @dataclass
@@ -96,7 +97,7 @@ class RiskManager:
     closed_trades: list = field(default_factory=list)    # today's closed trades
     signals_today: int = 0
     _strategy_weights: dict = field(default_factory=dict)  # V3: strategy -> weight
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def reset_daily(self, equity: float, cash: float):
         """Reset daily state. Preserves swing (multi-day) trades."""
@@ -189,13 +190,17 @@ class RiskManager:
         position_value = shares * entry_price
 
         # V3: Apply dynamic capital allocation weight
-        if config.DYNAMIC_ALLOCATION and strategy and self._strategy_weights:
-            weight = self._strategy_weights.get(strategy, 1.0)
-            # Scale position by strategy weight relative to equal weight
-            n_strategies = len(self._strategy_weights)
-            equal_weight = 1.0 / max(n_strategies, 1)
-            weight_factor = weight / equal_weight if equal_weight > 0 else 1.0
-            position_value *= weight_factor
+        # BUG-007: Protect _strategy_weights read with lock
+        if config.DYNAMIC_ALLOCATION and strategy:
+            with self._lock:
+                weights = dict(self._strategy_weights) if self._strategy_weights else {}
+            if weights:
+                weight = weights.get(strategy, 1.0)
+                # Scale position by strategy weight relative to equal weight
+                n_strategies = len(weights)
+                equal_weight = 1.0 / max(n_strategies, 1)
+                weight_factor = weight / equal_weight if equal_weight > 0 else 1.0
+                position_value *= weight_factor
 
         # Hard caps
         max_position = self.current_equity * config.MAX_POSITION_PCT
@@ -288,8 +293,8 @@ class RiskManager:
                     and trade.entry_time.date() == now.date()):
                 if hasattr(self, '_pdt') and self._pdt:
                     self._pdt.record_day_trade(trade.symbol, now.date())
-        except Exception:
-            pass  # Fail-open
+        except Exception as e:
+            logger.warning(f"PDT recording failed for {symbol}: {e}")  # Fail-open
 
     def partial_close(self, symbol: str, qty_to_close: int, exit_price: float,
                       now: datetime, exit_reason: str = "partial_tp"):
@@ -445,27 +450,33 @@ class RiskManager:
             if total_sharpe <= 0:
                 return
 
-            self._strategy_weights = {
+            new_weights = {
                 s: max(sharpe / total_sharpe, config.ALLOCATION_MIN_WEIGHT)
                 for s, sharpe in sharpes.items()
             }
 
             # Normalize so weights sum to 1.0
-            total_weight = sum(self._strategy_weights.values())
+            total_weight = sum(new_weights.values())
             if total_weight > 0:
-                self._strategy_weights = {
-                    s: w / total_weight for s, w in self._strategy_weights.items()
+                new_weights = {
+                    s: w / total_weight for s, w in new_weights.items()
                 }
 
-            logger.info(f"Capital allocation updated: {self._strategy_weights}")
-            database.log_allocation_weights(self._strategy_weights)
+            # BUG-007: Atomically swap weights under lock
+            with self._lock:
+                self._strategy_weights = new_weights
+
+            logger.info(f"Capital allocation updated: {new_weights}")
+            database.log_allocation_weights(new_weights)
 
         except Exception as e:
             logger.error(f"Failed to update strategy weights: {e}")
 
     def get_strategy_weights(self) -> dict:
-        """Get current strategy capital weights."""
-        return dict(self._strategy_weights)
+        """Get current strategy capital weights (thread-safe snapshot)."""
+        # BUG-007: Protect _strategy_weights read with lock
+        with self._lock:
+            return dict(self._strategy_weights)
 
     @staticmethod
     def _compute_strategy_daily_returns(trades: list[dict]) -> list[float]:

@@ -27,14 +27,33 @@ class OrderManager:
         self._lock = threading.Lock()
         self._audit: list[dict] = []               # State transition log
 
+    @staticmethod
+    def _generate_idempotency_key(symbol: str, side: str, qty: int,
+                                   strategy: str) -> str:
+        """BUG-012: Auto-generate idempotency key from order parameters.
+
+        Uses a 5-second timestamp bucket so that identical orders within the
+        same 5-second window are treated as duplicates.
+        """
+        import time
+        timestamp_bucket = int(time.time()) // 5
+        return f"{symbol}_{side}_{qty}_{strategy}_{timestamp_bucket}"
+
     def create_order(self, symbol: str, strategy: str, side: str,
                      order_type: str, qty: int, limit_price: float = 0.0,
                      take_profit: float = 0.0, stop_loss: float = 0.0,
                      pair_id: str = "", idempotency_key: str = "") -> Order:
         """Create and register a new order."""
         with self._lock:
+            # BUG-012: Auto-generate idempotency key if empty/missing
+            if not idempotency_key:
+                idempotency_key = self._generate_idempotency_key(
+                    symbol, side, qty, strategy
+                )
+                logger.debug(f"OMS: Auto-generated idempotency_key={idempotency_key}")
+
             # Check idempotency
-            if idempotency_key and idempotency_key in self._idempotency:
+            if idempotency_key in self._idempotency:
                 existing_id = self._idempotency[idempotency_key]
                 logger.info(f"Duplicate order blocked (idempotency_key={idempotency_key})")
                 return self._orders[existing_id]
@@ -54,8 +73,7 @@ class OrderManager:
 
             self._orders[order.oms_id] = order
             self._by_symbol.setdefault(symbol, []).append(order.oms_id)
-            if idempotency_key:
-                self._idempotency[idempotency_key] = order.oms_id
+            self._idempotency[idempotency_key] = order.oms_id
 
             self._log_transition(order, None, OrderState.PENDING)
             logger.info(f"OMS: Created order {order.oms_id} {side} {qty} {symbol} ({strategy})")

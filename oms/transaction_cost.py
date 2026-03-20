@@ -68,6 +68,31 @@ def estimate_round_trip_cost(
     }
 
 
+def _get_strategy_win_rate(strategy: str, default_win_rate: float = 0.55,
+                           min_trades: int = 30) -> float:
+    """BUG-026: Fetch per-strategy win rate from trade database.
+
+    Falls back to default_win_rate if fewer than min_trades exist for
+    the strategy.
+    """
+    if not strategy:
+        return default_win_rate
+
+    try:
+        import database
+        trades = database.get_recent_trades_by_strategy(strategy, days=90)
+        if len(trades) >= min_trades:
+            wins = sum(1 for t in trades if t.get('pnl', 0) > 0)
+            db_win_rate = wins / len(trades)
+            logger.debug(f"BUG-026: Strategy {strategy} win rate from DB: "
+                        f"{db_win_rate:.1%} ({wins}/{len(trades)} trades)")
+            return db_win_rate
+    except Exception as e:
+        logger.debug(f"BUG-026: Failed to fetch win rate for {strategy}: {e}")
+
+    return default_win_rate
+
+
 def is_trade_profitable_after_costs(
     entry_price: float,
     take_profit: float,
@@ -75,6 +100,7 @@ def is_trade_profitable_after_costs(
     qty: int,
     side: str = "buy",
     win_rate: float = 0.55,
+    strategy: str = "",
 ) -> tuple[bool, dict]:
     """Check if a trade has positive expected value after transaction costs.
 
@@ -85,10 +111,15 @@ def is_trade_profitable_after_costs(
         qty: Position size
         side: "buy" or "sell"
         win_rate: Historical win rate for this strategy (default 55%)
+        strategy: BUG-026: Strategy name for per-strategy win rate lookup
 
     Returns:
         (is_profitable, details_dict)
     """
+    # BUG-026: Use strategy-specific win rate if available
+    if strategy:
+        win_rate = _get_strategy_win_rate(strategy, default_win_rate=win_rate)
+
     costs = estimate_round_trip_cost(entry_price, qty, side)
 
     if side == "buy":

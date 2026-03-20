@@ -1,0 +1,110 @@
+# =============================================================
+# Risk Management Parameters — ARCH-006
+#
+# Loaded by ConfigManager.  Hot-reload supported.
+# =============================================================
+
+# --- Position Sizing ---
+position_sizing:
+  risk_per_trade_pct:    0.008
+  max_position_pct:      0.08
+  min_position_value:    100
+  max_positions:         12
+  max_portfolio_deploy:  0.55
+
+# --- Daily P&L Controls ---
+daily_pnl:
+  loss_halt:             -0.04
+  gain_lock_pct:         0.015
+  loss_halt_pct:         -0.010
+  gain_lock_size_mult:   0.30
+
+# --- Volatility Targeting ---
+vol_targeting:
+  target_daily:          0.01
+  target_max:            0.015
+  scalar_min:            0.3
+  scalar_max:            1.5
+
+# --- Kelly Criterion ---
+kelly:
+  enabled:               true
+  min_trades:            30
+  lookback:              100
+  fraction_mult:         0.5
+  min_risk:              0.003
+  max_risk:              0.02
+
+# --- VIX Scaling ---
+vix:
+  risk_scaling_enabled:  true
+  halt_threshold:        40
+  cache_seconds:         300
+
+# --- Beta Neutralization ---
+beta:
+  max_abs:               0.3
+  check_interval_min:    15
+  skip_first_minutes:    15
+
+# --- Market Regime ---
+regime:
+  check_interval_min:    30
+  ema_period:            20
+  bearish_size_cut:      0.40
+
+# --- HMM Regime Detection ---
+hmm:
+  enabled:               true
+  n_states:              5
+  retrain_day:           sunday
+  training_years:        3
+  min_probability:       0.4
+
+# --- Portfolio Heat & Correlation ---
+portfolio_heat:
+  enabled:               true
+  max_heat:              0.60
+  cluster_correlation_threshold: 0.70
+  cluster_max_heat:      0.20
+  correlation_lookback:  20
+  correlation_threshold: 0.92
+
+# --- Short Selling ---
+short:
+  size_multiplier:       0.75
+  hard_stop_pct:         0.04
+  trailing_stop_pct:     0.02
+
+# --- Adaptive Allocation ---
+adaptive_allocation:
+  enabled:               true
+  min_weight:            0.03
+  max_weight:            0.60
+  max_daily_change:      0.10
+  sortino_lookback:      30
+  sortino_weight:        0.40
+  regime_weight:         0.30
+  correlation_weight:    0.30
+
+# --- Monte Carlo ---
+monte_carlo:
+  enabled:               true
+  simulations:           10000
+  horizon_days:          21
+  cvar_limit:            -0.08
+  deleverage_pct:        0.20
+
+# --- Circuit Breaker Tiers (loss %) ---
+circuit_breaker:
+  yellow:                -0.01
+  orange:                -0.02
+  red:                   -0.03
+  black:                 -0.04
+
+# --- Slippage Modeling ---
+slippage:
+  model:                 volume
+  fixed_bps:             1.0
+  base_bps:              0.5
+  volume_factor:         0.1

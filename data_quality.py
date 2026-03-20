@@ -12,6 +12,7 @@ from datetime import datetime
 import pandas as pd
 
 import config
+from tz_utils import now_et, ensure_et
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +59,18 @@ def check_bar_quality(bars: pd.DataFrame, symbol: str,
         result.add_issue(f"{symbol}: Only {len(bars)} bars (need {min_bars})")
 
     # 2. Stale data check
-    if now is not None and hasattr(bars.index, 'tz'):
+    # BUG-009: Normalize both sides to ET-aware datetimes before comparing
+    if now is not None:
         try:
             last_bar_time = bars.index[-1]
             if hasattr(last_bar_time, 'timestamp'):
-                age = (now - last_bar_time).total_seconds()
+                now_aware = ensure_et(now) if now.tzinfo else now_et()
+                if hasattr(last_bar_time, 'tzinfo') and last_bar_time.tzinfo is not None:
+                    last_bar_aware = last_bar_time.to_pydatetime() if hasattr(last_bar_time, 'to_pydatetime') else last_bar_time
+                else:
+                    # Naive bar timestamp — assume ET
+                    last_bar_aware = ensure_et(last_bar_time.to_pydatetime() if hasattr(last_bar_time, 'to_pydatetime') else last_bar_time)
+                age = (now_aware - last_bar_aware).total_seconds()
                 if age > max_staleness_sec:
                     result.add_issue(f"{symbol}: Stale data, last bar {age:.0f}s old")
         except Exception:

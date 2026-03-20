@@ -9,6 +9,14 @@ from risk.beta_neutralizer import BetaNeutralizer
 from risk.kelly import KellyEngine
 from risk.portfolio_heat import PortfolioHeatTracker
 
+# V10 advanced risk modules
+from risk.factor_model import FactorRiskModel
+from risk.hrp import HierarchicalRiskParity
+from risk.stress_testing import StressTestFramework
+from risk.intraday_controls import IntradayRiskControls
+from risk.gap_risk import GapRiskManager
+from risk.correlation import DynamicCorrelation
+
 # Backward compatibility: re-export RiskManager, TradeRecord, VIX functions
 from risk.risk_manager import (
     RiskManager,
@@ -26,6 +34,13 @@ __all__ = [
     # V8
     "KellyEngine",
     "PortfolioHeatTracker",
+    # V10 advanced risk
+    "FactorRiskModel",
+    "HierarchicalRiskParity",
+    "StressTestFramework",
+    "IntradayRiskControls",
+    "GapRiskManager",
+    "DynamicCorrelation",
     # V1-V5 backward compat
     "RiskManager",
     "TradeRecord",

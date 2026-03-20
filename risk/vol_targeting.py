@@ -10,6 +10,7 @@ import logging
 import numpy as np
 
 import config
+from utils import safe_divide
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +117,9 @@ class VolatilityTargetingRiskEngine:
         if risk_per_share < 0.001:
             return 0
 
-        shares = risk_dollars / risk_per_share
+        shares = safe_divide(risk_dollars, risk_per_share, default=0.0)
+        if shares <= 0:
+            return 0
         position_value = shares * entry_price
 
         # 3. Apply volatility targeting scalar
@@ -147,7 +150,7 @@ class VolatilityTargetingRiskEngine:
         if position_value < min_position:
             return 0
 
-        qty = int(position_value / entry_price)
+        qty = int(safe_divide(position_value, entry_price, default=0.0))
         return max(qty, 0)
 
     @property

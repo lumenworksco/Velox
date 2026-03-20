@@ -165,8 +165,9 @@ class StatMeanReversion:
                 close = bars["close"]
                 price = close.iloc[-1]
 
-                # Refit OU on intraday data for more accurate z-score
-                intraday_ou = fit_ou_params(close)
+                # BUG-020: Refit OU on intraday data EXCLUDING current bar
+                # to prevent look-ahead bias in parameter estimation
+                intraday_ou = fit_ou_params(close.iloc[:-1])
                 if intraday_ou:
                     mu = intraday_ou['mu']
                     sigma = intraday_ou['sigma']

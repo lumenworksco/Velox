@@ -9,6 +9,7 @@ from datetime import datetime
 
 import config
 import database
+from utils import safe_divide
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +42,16 @@ class KellyEngine:
 
                 win_rate = len(wins) / len(trades) if trades else 0
                 avg_win = sum(abs(t.get("pnl_pct", 0)) for t in wins) / len(wins) if wins else 0
-                avg_loss = sum(abs(t.get("pnl_pct", 0)) for t in losses) / len(losses) if losses else 1e-6
+                avg_loss = safe_divide(
+                    sum(abs(t.get("pnl_pct", 0)) for t in losses),
+                    len(losses),
+                    default=1e-6,
+                )
 
                 if avg_loss < 1e-8:
                     avg_loss = 1e-6
 
-                win_loss_ratio = avg_win / avg_loss
+                win_loss_ratio = safe_divide(avg_win, avg_loss, default=0.0)
 
                 # Guard against near-zero win/loss ratio
                 if win_loss_ratio < 1e-6:
@@ -55,7 +60,7 @@ class KellyEngine:
                     continue
 
                 # Kelly fraction = win_rate - ((1 - win_rate) / win_loss_ratio)
-                kelly_f = win_rate - ((1 - win_rate) / win_loss_ratio)
+                kelly_f = win_rate - safe_divide(1 - win_rate, win_loss_ratio, default=0.0)
 
                 # Half-Kelly for safety
                 half_kelly = kelly_f * config.KELLY_FRACTION_MULT

@@ -44,6 +44,9 @@ class BarCache:
                  fetch_fn=None, **fetch_kwargs) -> pd.DataFrame | None:
         """Get cached bars or fetch fresh ones.
 
+        BUG-010: Hold lock for the entire get-check-move operation to prevent
+        race conditions between LRU eviction and move_to_end().
+
         Args:
             symbol: Ticker symbol
             timeframe: String representation (e.g., "1Min", "5Min", "1Day")
@@ -55,6 +58,7 @@ class BarCache:
             DataFrame of bars, or None if unavailable
         """
         key = (symbol, timeframe)
+        need_fetch = False
 
         with self._lock:
             if key in self._cache:
@@ -68,8 +72,12 @@ class BarCache:
                     self._hits += 1
                     return entry["bars"].copy() if entry["bars"] is not None else None
 
-        # Cache miss or stale
-        self._misses += 1
+            # Cache miss or stale — record under lock
+            self._misses += 1
+            need_fetch = True
+
+        if not need_fetch:
+            return None
 
         if bars is not None:
             # Caller provided bars directly
@@ -87,7 +95,7 @@ class BarCache:
         else:
             return None
 
-        # Store in cache
+        # Store in cache — hold lock for store + move_to_end + eviction atomically
         with self._lock:
             self._cache[key] = {
                 "bars": result,
@@ -145,13 +153,16 @@ class BarCache:
             }
 
 
-# Module-level singleton
+# Module-level singleton (BUG-010: thread-safe creation)
 _bar_cache: BarCache | None = None
+_bar_cache_lock = threading.Lock()
 
 
 def get_bar_cache() -> BarCache:
-    """Get or create the global bar cache singleton."""
+    """Get or create the global bar cache singleton (thread-safe)."""
     global _bar_cache
     if _bar_cache is None:
-        _bar_cache = BarCache(max_size=500)
+        with _bar_cache_lock:
+            if _bar_cache is None:
+                _bar_cache = BarCache(max_size=500)
     return _bar_cache

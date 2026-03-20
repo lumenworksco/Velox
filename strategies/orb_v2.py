@@ -15,6 +15,7 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 import config
 from data import get_intraday_bars, get_snapshot
 from strategies.base import Signal
+from utils import safe_divide
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ class ORBStrategyV2:
         orb_low = bars_930_1000["low"].min()
         orb_mid = (orb_high + orb_low) / 2
         # V10 BUG-033: Use orb_low as divisor (standard range calculation)
-        range_pct = (orb_high - orb_low) / orb_low if orb_low > 0 else 0
+        range_pct = safe_divide(orb_high - orb_low, orb_low, default=0.0)
 
         # V10 BUG-010: Gap calculation using previous day's close from snapshot
         first_open = bars_930_1000["open"].iloc[0]

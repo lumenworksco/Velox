@@ -89,10 +89,17 @@ class KalmanPairsTrader:
         top_pairs = all_candidates[:config.PAIRS_MAX_ACTIVE]
 
         for pair in top_pairs:
+            # BUG-014: Explicitly cast hedge_ratio to scalar float before
+            # initializing Kalman state to prevent dimension mismatch
+            hedge_ratio = float(pair['hedge_ratio'])
+            assert np.isfinite(hedge_ratio), (
+                f"Non-finite hedge_ratio for {pair['symbol1']}/{pair['symbol2']}: {hedge_ratio}"
+            )
+
             # Initialize Kalman state
             pair_key = f"{pair['symbol1']}_{pair['symbol2']}"
             self.kalman_state[pair_key] = {
-                'theta': np.array([pair['hedge_ratio'], 0.0]),  # [hedge_ratio, intercept]
+                'theta': np.array([hedge_ratio, 0.0]),  # [hedge_ratio, intercept]
                 'P': np.eye(2) * 1.0,  # Covariance matrix
                 'spread_mean': pair['spread_mean'],
                 'spread_std': pair['spread_std'],
@@ -130,6 +137,14 @@ class KalmanPairsTrader:
             return 10.0  # Not mean-reverting, return max
         return max(1.0, -np.log(2) / beta)
 
+    @staticmethod
+    def _has_corporate_action(close: pd.Series, threshold: float = 0.20) -> bool:
+        """BUG-019: Detect large overnight price changes (>20%) suggesting corporate actions."""
+        if len(close) < 2:
+            return False
+        pct_changes = close.pct_change().dropna()
+        return bool((pct_changes.abs() > threshold).any())
+
     def _test_pair(self, sym1: str, sym2: str, sector_group: str = "unknown") -> dict | None:
         """Test if two symbols form a cointegrated pair."""
         bars1 = get_daily_bars(sym1, days=60)
@@ -144,6 +159,11 @@ class KalmanPairsTrader:
         close1 = bars1["close"]
         close2 = bars2["close"]
 
+        # BUG-019: Skip pairs with suspected corporate actions (>20% overnight move)
+        if self._has_corporate_action(close1) or self._has_corporate_action(close2):
+            logger.info(f"Pair {sym1}/{sym2} skipped: suspected corporate action (>20% move)")
+            return None
+
         # Ensure same length (take the shorter)
         min_len = min(len(close1), len(close2))
         close1 = close1.iloc[-min_len:]
@@ -157,8 +177,9 @@ class KalmanPairsTrader:
         # 2. OLS hedge ratio: close1 = beta * close2 + alpha + epsilon
         X = np.column_stack([close2.values, np.ones(len(close2))])
         params = np.linalg.lstsq(X, close1.values, rcond=None)[0]
-        hedge_ratio = params[0]
-        intercept = params[1]
+        # BUG-014: Ensure hedge_ratio is scalar float (lstsq can return array elements)
+        hedge_ratio = float(params[0])
+        intercept = float(params[1])
 
         # 3. Compute spread
         spread = close1.values - hedge_ratio * close2.values - intercept
@@ -243,6 +264,16 @@ class KalmanPairsTrader:
         if np.any(eigvals < 0):
             P += np.eye(P.shape[0]) * (abs(min(eigvals)) + 1e-8)
 
+        # BUG-014: Assert dimensions after Kalman update to catch corruption early
+        assert theta.shape == (2,), (
+            f"Kalman theta dimension mismatch for {pair_key}: "
+            f"expected (2,), got {theta.shape}"
+        )
+        assert P.shape == (2, 2), (
+            f"Kalman P dimension mismatch for {pair_key}: "
+            f"expected (2, 2), got {P.shape}"
+        )
+
         # Store updated state
         state['theta'] = theta
         state['P'] = P
@@ -296,7 +327,7 @@ class KalmanPairsTrader:
                 zscore = self._update_kalman(pair_key, price1, price2)
 
                 state = self.kalman_state.get(pair_key, {})
-                hedge_ratio = state.get('theta', [1.0, 0.0])[0]
+                hedge_ratio = float(state.get('theta', [1.0, 0.0])[0])
 
                 # --- Spread too wide (z > entry): short sym1, long sym2
                 if zscore > config.PAIRS_ZSCORE_ENTRY:

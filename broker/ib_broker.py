@@ -33,6 +33,10 @@ class IBBroker(Broker):
     """
 
     def __init__(self, host: str = None, port: int = None, client_id: int = None):
+        raise NotImplementedError(
+            "IB broker not yet implemented for production use. "
+            "Use the Alpaca broker adapter instead."
+        )
         self._host = host or IB_HOST
         self._port = port or IB_PORT
         self._client_id = client_id or IB_CLIENT_ID

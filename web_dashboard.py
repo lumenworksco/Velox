@@ -10,7 +10,7 @@ import logging
 import time as _time
 from datetime import datetime
 
-from fastapi import FastAPI, Query, Depends, HTTPException
+from fastapi import FastAPI, Query, Depends, HTTPException, Body
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -138,8 +138,12 @@ def _check_rate_limit(ip: str) -> bool:
 
 # V10: Login endpoint for JWT token
 @app.post("/api/login")
-async def login(request: Request, username: str = Query(...), password: str = Query(...)):
-    """Authenticate and return a JWT token."""
+async def login(request: Request, username: str = Body(...), password: str = Body(...)):
+    """Authenticate and return a JWT token.
+
+    BUG-015: Credentials are accepted via POST body (not URL query params)
+    to prevent passwords from appearing in server logs and browser history.
+    """
     if not AUTH_ENABLED:
         return {"token": "auth_disabled", "message": "Authentication is not configured"}
 

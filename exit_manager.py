@@ -1,6 +1,8 @@
 """Advanced exit mechanics — scaled TP, trailing stops, ATR trailing, volatility exits."""
 
+import copy
 import logging
+import threading
 from datetime import datetime
 
 import pandas_ta as ta
@@ -48,10 +50,15 @@ class ExitManager:
         return actions
 
     def _evaluate_trade(self, trade, risk_manager, now: datetime) -> dict | None:
-        """Evaluate a single trade for exit conditions."""
+        """Evaluate a single trade for exit conditions.
+
+        Thread-safety: reads trade state under the risk_manager lock, then
+        evaluates on a local snapshot so concurrent WebSocket updates to
+        highest_price_seen / lowest_price_seen cannot cause torn reads.
+        """
         symbol = trade.symbol
 
-        # Get current price data
+        # Get current price data (I/O — done outside lock)
         try:
             from data import get_snapshot
             snap = get_snapshot(symbol)
@@ -65,12 +72,30 @@ class ExitManager:
         if current_price <= 0:
             return None
 
-        # Update price extremes for trailing stops
-        if trade.side == "buy" and current_price > trade.highest_price_seen:
-            trade.highest_price_seen = current_price
-        elif trade.side == "sell":
-            if trade.lowest_price_seen == 0 or current_price < trade.lowest_price_seen:
-                trade.lowest_price_seen = current_price
+        # V10 BUG-006: Snapshot mutable trade fields under lock, then update
+        # price extremes atomically so concurrent WebSocket updates cannot
+        # interleave with this evaluation.
+        lock = getattr(risk_manager, '_lock', None)
+        if lock is not None:
+            lock.acquire()
+        try:
+            # Update price extremes for trailing stops
+            if trade.side == "buy" and current_price > trade.highest_price_seen:
+                trade.highest_price_seen = current_price
+            elif trade.side == "sell":
+                if trade.lowest_price_seen == 0 or current_price < trade.lowest_price_seen:
+                    trade.lowest_price_seen = current_price
+
+            # Snapshot mutable fields for evaluation outside lock
+            snap_highest = trade.highest_price_seen
+            snap_lowest = trade.lowest_price_seen
+            snap_stop_loss = trade.stop_loss
+            snap_qty = trade.qty
+            snap_partial_exits = trade.partial_exits
+            snap_partial_closed_qty = trade.partial_closed_qty
+        finally:
+            if lock is not None:
+                lock.release()
 
         # Guard against invalid entry price
         if trade.entry_price <= 0:
@@ -110,8 +135,15 @@ class ExitManager:
 
         return None
 
+    # Maximum number of partial take-profit levels
+    MAX_PARTIAL_LEVELS = 2
+
     def _check_scaled_tp(self, trade, current_price: float, risk_manager, now: datetime) -> dict | None:
         """Check scaled take profit levels."""
+        # Guard: skip if all partial levels already taken
+        if trade.partial_exits >= self.MAX_PARTIAL_LEVELS:
+            return None
+
         entry = trade.entry_price
         target = trade.take_profit
 
@@ -125,20 +157,21 @@ class ExitManager:
                 qty_to_close = max(1, int(trade.qty * 0.33))
                 self._execute_partial(risk_manager, trade.symbol, qty_to_close,
                                      current_price, now, "partial_tp_1")
-                trade._partial_closed_qty = getattr(trade, '_partial_closed_qty', 0) + qty_to_close
+                trade.partial_closed_qty = trade.partial_closed_qty + qty_to_close
+                trade.partial_exits += 1
                 return {"symbol": trade.symbol, "action": "partial_tp_1", "qty": qty_to_close}
 
             # Level 2: 50% of remaining at 2/3 of target
             if current_price >= entry + target_range * 0.66 and trade.partial_exits == 1:
-                _already_closed = getattr(trade, '_partial_closed_qty', 0)
-                remaining_qty = trade.qty - _already_closed
+                remaining_qty = trade.qty - trade.partial_closed_qty
                 qty_to_close = max(1, int(remaining_qty * 0.50))
                 # Move stop to breakeven
                 if config.BREAKEVEN_STOP_ENABLED:
                     trade.stop_loss = entry * 1.001
                 self._execute_partial(risk_manager, trade.symbol, qty_to_close,
                                      current_price, now, "partial_tp_2")
-                trade._partial_closed_qty = _already_closed + qty_to_close
+                trade.partial_closed_qty = trade.partial_closed_qty + qty_to_close
+                trade.partial_exits += 1
                 return {"symbol": trade.symbol, "action": "partial_tp_2", "qty": qty_to_close}
 
         elif trade.side == "sell":
@@ -150,18 +183,19 @@ class ExitManager:
                 qty_to_close = max(1, int(trade.qty * 0.33))
                 self._execute_partial(risk_manager, trade.symbol, qty_to_close,
                                      current_price, now, "partial_tp_1")
-                trade._partial_closed_qty = getattr(trade, '_partial_closed_qty', 0) + qty_to_close
+                trade.partial_closed_qty = trade.partial_closed_qty + qty_to_close
+                trade.partial_exits += 1
                 return {"symbol": trade.symbol, "action": "partial_tp_1", "qty": qty_to_close}
 
             if current_price <= entry - target_range * 0.66 and trade.partial_exits == 1:
-                _already_closed = getattr(trade, '_partial_closed_qty', 0)
-                remaining_qty = trade.qty - _already_closed
+                remaining_qty = trade.qty - trade.partial_closed_qty
                 qty_to_close = max(1, int(remaining_qty * 0.50))
                 if config.BREAKEVEN_STOP_ENABLED:
                     trade.stop_loss = entry * 0.999
                 self._execute_partial(risk_manager, trade.symbol, qty_to_close,
                                      current_price, now, "partial_tp_2")
-                trade._partial_closed_qty = _already_closed + qty_to_close
+                trade.partial_closed_qty = trade.partial_closed_qty + qty_to_close
+                trade.partial_exits += 1
                 return {"symbol": trade.symbol, "action": "partial_tp_2", "qty": qty_to_close}
 
         return None
@@ -305,12 +339,23 @@ class ExitManager:
         risk_manager.partial_close(symbol, qty, price, now, reason)
 
     def update_highest_prices(self, risk_manager, quotes: dict):
-        """Update price extremes from live quote data (called by WebSocket handler)."""
-        for symbol, price in quotes.items():
-            if symbol in risk_manager.open_trades:
-                trade = risk_manager.open_trades[symbol]
-                if trade.side == "buy" and price > trade.highest_price_seen:
-                    trade.highest_price_seen = price
-                elif trade.side == "sell":
-                    if trade.lowest_price_seen == 0 or price < trade.lowest_price_seen:
-                        trade.lowest_price_seen = price
+        """Update price extremes from live quote data (called by WebSocket handler).
+
+        V10 BUG-006: Acquire risk_manager lock to prevent race with
+        _evaluate_trade reading the same fields concurrently.
+        """
+        lock = getattr(risk_manager, '_lock', None)
+        if lock is not None:
+            lock.acquire()
+        try:
+            for symbol, price in quotes.items():
+                if symbol in risk_manager.open_trades:
+                    trade = risk_manager.open_trades[symbol]
+                    if trade.side == "buy" and price > trade.highest_price_seen:
+                        trade.highest_price_seen = price
+                    elif trade.side == "sell":
+                        if trade.lowest_price_seen == 0 or price < trade.lowest_price_seen:
+                            trade.lowest_price_seen = price
+        finally:
+            if lock is not None:
+                lock.release()

@@ -7,19 +7,21 @@ from datetime import datetime
 from pathlib import Path
 
 import config
+from tz_utils import ensure_et
 
 logger = logging.getLogger(__name__)
 
 
 def _to_iso(dt) -> str | None:
-    """V10 BUG-046: Standardize all datetime serialization to ISO format with timezone."""
+    """V10 BUG-046: Standardize all datetime serialization to ISO format with timezone.
+
+    BUG-009: Uses ensure_et() to properly handle naive datetimes (assumes ET)
+    and convert aware datetimes to ET before serializing.
+    """
     if dt is None:
         return None
     if hasattr(dt, 'isoformat'):
-        # Ensure timezone-aware
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=config.ET)
-        return dt.isoformat()
+        return ensure_et(dt).isoformat()
     return str(dt)
 
 import threading

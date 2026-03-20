@@ -24,45 +24,76 @@ def daily_reset(
     overnight_manager=None, news_sentiment=None, llm_scorer=None,
     tiered_cb=None,
 ):
-    """Reset all strategies and risk engines for a new trading day."""
+    """Reset all strategies and risk engines for a new trading day.
+
+    BUG-022: Each strategy's reset_daily() is wrapped in try/except so that
+    a failure in one strategy does not prevent others from resetting.
+    All failures are collected and reported in a summary log.
+    """
     logger.info("New trading day -- resetting state")
 
-    stat_mr.reset_daily()
-    micro_mom.reset_daily()
-    vwap_strategy.reset_daily()
-    pnl_lock.reset_daily()
-    beta_neutral.reset_daily()
+    # BUG-022: Track all reset failures
+    reset_failures: list[str] = []
+
+    for name, obj in [
+        ("stat_mr", stat_mr),
+        ("micro_mom", micro_mom),
+        ("vwap_strategy", vwap_strategy),
+        ("pnl_lock", pnl_lock),
+        ("beta_neutral", beta_neutral),
+    ]:
+        try:
+            obj.reset_daily()
+        except Exception as e:
+            logger.error(f"Daily reset failed for {name}: {e}", exc_info=True)
+            reset_failures.append(name)
 
     if tiered_cb:
-        tiered_cb.reset_daily()
+        try:
+            tiered_cb.reset_daily()
+        except Exception as e:
+            logger.error(f"Daily reset failed for tiered_cb: {e}", exc_info=True)
+            reset_failures.append("tiered_cb")
 
     if orb_strategy:
-        orb_strategy.reset_daily()
-        orb_strategy._ranges_recorded_today = False
+        try:
+            orb_strategy.reset_daily()
+            orb_strategy._ranges_recorded_today = False
+        except Exception as e:
+            logger.error(f"Daily reset failed for orb_strategy: {e}", exc_info=True)
+            reset_failures.append("orb_strategy")
 
     if news_sentiment:
         try:
             news_sentiment.clear_daily_cache()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Daily reset failed for news_sentiment: {e}", exc_info=True)
+            reset_failures.append("news_sentiment")
 
     if llm_scorer:
         try:
             llm_scorer.reset_daily()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Daily reset failed for llm_scorer: {e}", exc_info=True)
+            reset_failures.append("llm_scorer")
 
     if pead_strategy:
         try:
             pead_strategy.reset_daily()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Daily reset failed for pead_strategy: {e}", exc_info=True)
+            reset_failures.append("pead_strategy")
 
     if overnight_manager:
         try:
             overnight_manager.reset_daily()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Daily reset failed for overnight_manager: {e}", exc_info=True)
+            reset_failures.append("overnight_manager")
+
+    # BUG-022: Report summary of all failures
+    if reset_failures:
+        logger.warning(f"Daily reset completed with {len(reset_failures)} failure(s): {reset_failures}")
 
     # Reset risk manager with fresh account data
     try:

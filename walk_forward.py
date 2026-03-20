@@ -103,9 +103,14 @@ class WalkForwardValidator:
     # ------------------------------------------------------------------ #
 
     def run_weekly_validation(
-        self, strategies: list[str],
+        self, strategies: list[str] | None = None,
     ) -> dict[str, dict]:
         """Run walk-forward validation for each strategy.
+
+        BUG-021: Includes ALL strategies found in recent trades (including
+        demoted ones) to avoid survivorship bias. The `strategies` parameter
+        provides a baseline list; any additional strategies found in the trade
+        history are also validated. Demotion status is tracked separately.
 
         Fetches the last 30 days of trades from the database, validates
         each strategy, logs results, and returns a mapping of
@@ -114,10 +119,19 @@ class WalkForwardValidator:
         trades_30d = database.get_recent_trades(days=30)
         results: dict[str, dict] = {}
 
-        for strat in strategies:
+        # BUG-021: Discover all strategies in trade history, not just active ones
+        strategies_in_trades = {t.get('strategy') for t in trades_30d if t.get('strategy')}
+        all_strategies = set(strategies or []) | strategies_in_trades
+
+        for strat in sorted(all_strategies):
             result = self.validate_strategy(strat, trades_30d)
+            # BUG-021: Track whether strategy is currently active or demoted
+            result['is_active'] = strat in (strategies or [])
             results[strat] = result
 
-        logger.info("Walk-forward validation complete for %d strategies",
-                     len(results))
+        active_count = sum(1 for r in results.values() if r.get('is_active'))
+        demoted_count = len(results) - active_count
+        logger.info("Walk-forward validation complete for %d strategies "
+                     "(%d active, %d demoted/historical)",
+                     len(results), active_count, demoted_count)
         return results
