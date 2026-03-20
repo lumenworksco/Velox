@@ -10,6 +10,8 @@ import config
 import database
 from analytics.metrics import compute_sharpe as _compute_sharpe_fn
 
+from engine.event_log import log_event, EventType
+
 logger = logging.getLogger(__name__)
 
 # --- VIX Risk Scaling ---
@@ -127,6 +129,9 @@ class RiskManager:
                     f"CIRCUIT BREAKER ACTIVATED: Day P&L {self.day_pnl:.2%} "
                     f"hit limit of {config.DAILY_LOSS_HALT:.2%}"
                 )
+                log_event(EventType.CIRCUIT_BREAKER, "risk_manager",
+                          details=f"day_pnl={self.day_pnl:.2%} limit={config.DAILY_LOSS_HALT:.2%}",
+                          severity="WARNING")
             self.circuit_breaker_active = True
             return True
         return False
@@ -138,36 +143,6 @@ class RiskManager:
 
         if len(self.open_trades) >= config.MAX_POSITIONS:
             return False, f"Max positions ({config.MAX_POSITIONS}) reached"
-
-        # Check momentum-specific limit
-        if strategy == "MOMENTUM":
-            momentum_count = sum(1 for t in self.open_trades.values() if t.strategy == "MOMENTUM")
-            if momentum_count >= config.MAX_MOMENTUM_POSITIONS:
-                return False, f"Max momentum positions ({config.MAX_MOMENTUM_POSITIONS}) reached"
-
-        # V3: Check Gap & Go limit
-        if strategy == "GAP_GO":
-            gap_count = sum(1 for t in self.open_trades.values() if t.strategy == "GAP_GO")
-            if gap_count >= config.GAP_MAX_POSITIONS:
-                return False, f"Max Gap & Go positions ({config.GAP_MAX_POSITIONS}) reached"
-
-        # V4: Check Sector Rotation limit
-        if strategy == "SECTOR_ROTATION":
-            sector_count = sum(1 for t in self.open_trades.values() if t.strategy == "SECTOR_ROTATION")
-            if sector_count >= config.MAX_SECTOR_POSITIONS:
-                return False, f"Max sector positions ({config.MAX_SECTOR_POSITIONS}) reached"
-
-        # V4: Check Pairs Trading limit
-        if strategy == "PAIRS":
-            pairs_count = len({t.pair_id for t in self.open_trades.values() if t.strategy == "PAIRS" and t.pair_id})
-            if pairs_count >= config.MAX_PAIRS_POSITIONS:
-                return False, f"Max pairs positions ({config.MAX_PAIRS_POSITIONS}) reached"
-
-        # V5: Check EMA Scalp limit
-        if strategy == "EMA_SCALP":
-            scalp_count = sum(1 for t in self.open_trades.values() if t.strategy == "EMA_SCALP")
-            if scalp_count >= config.EMA_SCALP_MAX_POSITIONS:
-                return False, f"Max EMA scalp positions ({config.EMA_SCALP_MAX_POSITIONS}) reached"
 
         # V4: VIX halt check
         if config.VIX_RISK_SCALING_ENABLED and get_vix_risk_scalar() == 0.0:
@@ -239,10 +214,6 @@ class RiskManager:
         if vix_scalar < 1.0:
             position_value *= vix_scalar
 
-        # V4: Sector rotation uses fixed sizing (5% of portfolio)
-        if strategy == "SECTOR_ROTATION":
-            position_value = self.current_equity * config.SECTOR_POSITION_SIZE_PCT
-
         # Check we don't exceed max deployment
         deployed = sum(t.entry_price * t.qty for t in self.open_trades.values())
         remaining_deploy = self.current_equity * config.MAX_PORTFOLIO_DEPLOY - deployed
@@ -289,6 +260,9 @@ class RiskManager:
             f"Trade closed: {trade.symbol} ({trade.strategy}) "
             f"P&L=${trade.pnl:+.2f} ({pnl_pct:.1%}) reason={exit_reason}"
         )
+        log_event(EventType.POSITION_CLOSED, "risk_manager",
+                  symbol=trade.symbol, strategy=trade.strategy,
+                  details=f"pnl={trade.pnl:+.2f} pnl_pct={pnl_pct:.1%} reason={exit_reason}")
 
         # Log to database
         try:
@@ -307,6 +281,15 @@ class RiskManager:
             )
         except Exception as e:
             logger.error(f"Failed to log trade to DB: {e}")
+
+        # V10: Record PDT if same-day close
+        try:
+            if (trade.hold_type == "day" and trade.entry_time
+                    and trade.entry_time.date() == now.date()):
+                if hasattr(self, '_pdt') and self._pdt:
+                    self._pdt.record_day_trade(trade.symbol, now.date())
+        except Exception:
+            pass  # Fail-open
 
     def partial_close(self, symbol: str, qty_to_close: int, exit_price: float,
                       now: datetime, exit_reason: str = "partial_tp"):
@@ -446,9 +429,7 @@ class RiskManager:
 
         try:
             sharpes = {}
-            strategies = ["ORB", "VWAP", "MOMENTUM"]
-            if config.GAP_GO_ENABLED:
-                strategies.append("GAP_GO")
+            strategies = list(config.STRATEGY_ALLOCATIONS.keys())
 
             for strategy in strategies:
                 trades = database.get_recent_trades_by_strategy(

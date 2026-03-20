@@ -22,7 +22,6 @@ if not os.getenv("TESTING") and not os.getenv("PYTEST_CURRENT_TEST"):
         raise RuntimeError("ALPACA_API_SECRET environment variable is required")
 
 ALLOW_SHORT = os.getenv("ALLOW_SHORT", "false") == "true"
-ASYNC_MODE = os.getenv("ASYNC_MODE", "false") == "true"
 
 BROKER_ABSTRACTION_ENABLED = True
 PAPER_BROKER_SPREAD_BPS = 5.0
@@ -236,6 +235,16 @@ PEAD_POSITION_SIZE_PCT = 0.02
 # ============================================================
 # RISK MANAGEMENT
 # ============================================================
+
+# --- Slippage Modeling (backtester only) ---
+SLIPPAGE_MODEL = "volume"  # "fixed", "volume", or "market_impact"
+SLIPPAGE_FIXED_BPS = 1.0
+SLIPPAGE_BASE_BPS = 0.5
+SLIPPAGE_VOLUME_FACTOR = 0.1
+
+# --- PDT Rule ---
+PDT_ENFORCEMENT_ENABLED = os.getenv("PDT_ENFORCEMENT", "true") == "true"
+PDT_EQUITY_THRESHOLD = 25_000.0
 
 # --- Position Sizing ---
 RISK_PER_TRADE_PCT = 0.008          # Risk 0.8% of portfolio per trade
@@ -511,22 +520,6 @@ PARAM_OPTIMIZER_MIN_IMPROVEMENT = 0.15   # 15% Sortino improvement required
 PARAM_OPTIMIZER_APPLY_AUTO = False       # Manual approval by default
 
 # ============================================================
-# LEGACY — deprecated, kept for backward-compat with risk_manager.py
-# TODO: Remove once dead strategy blocks in risk_manager.py are cleaned up
-# ============================================================
-
-MAX_MOMENTUM_POSITIONS = 4
-MAX_SECTOR_POSITIONS = 3
-MAX_PAIRS_POSITIONS = 5
-GAP_MAX_POSITIONS = 3
-GAP_GO_ENABLED = False
-SECTOR_ROTATION_ENABLED = False
-SECTOR_POSITION_SIZE_PCT = 0.05
-EMA_SCALP_MAX_POSITIONS = 3
-NEWS_FILTER_ENABLED = False
-NEWS_LOOKBACK_HOURS = 6
-
-# ============================================================
 # RUNTIME PARAMETERS
 # ============================================================
 
@@ -544,3 +537,53 @@ def set_param(key: str, value):
     """Set a runtime parameter (used by optimizer)."""
     with _runtime_lock:
         _runtime_params[key] = value
+
+
+def validate():
+    """Validate configuration at startup. Call from main.py before trading starts.
+
+    Raises RuntimeError if critical configuration errors are found.
+    """
+    import logging as _logging
+    _logger = _logging.getLogger("config")
+    errors = []
+
+    # API credentials (skip in test mode)
+    if not os.getenv("TESTING") and not os.getenv("PYTEST_CURRENT_TEST"):
+        if not API_KEY or not API_SECRET:
+            errors.append("ALPACA_API_KEY and ALPACA_API_SECRET must be set")
+
+    # Strategy allocations should sum to <= 1.0
+    total = sum(STRATEGY_ALLOCATIONS.values())
+    if total > 1.01:
+        errors.append(f"Strategy allocations sum to {total:.2%}, must be <= 100%")
+
+    # Kelly bounds
+    if KELLY_MIN_RISK >= KELLY_MAX_RISK:
+        errors.append(f"KELLY_MIN_RISK ({KELLY_MIN_RISK}) must be < KELLY_MAX_RISK ({KELLY_MAX_RISK})")
+
+    # Circuit breaker tiers (validate if module available)
+    try:
+        from risk.circuit_breaker import TieredCircuitBreaker
+        cb = TieredCircuitBreaker()
+        # Tiers are validated internally during construction
+    except Exception:
+        pass  # Module not yet available during early startup
+
+    # Scan interval
+    if SCAN_INTERVAL_SEC < 5:
+        errors.append(f"SCAN_INTERVAL_SEC ({SCAN_INTERVAL_SEC}) too low — minimum 5s")
+
+    # Position sizing sanity
+    if RISK_PER_TRADE_PCT <= 0 or RISK_PER_TRADE_PCT > 0.10:
+        errors.append(f"RISK_PER_TRADE_PCT ({RISK_PER_TRADE_PCT}) should be 0-10%")
+
+    if MAX_POSITION_PCT <= 0 or MAX_POSITION_PCT > 0.50:
+        errors.append(f"MAX_POSITION_PCT ({MAX_POSITION_PCT}) should be 0-50%")
+
+    if errors:
+        for e in errors:
+            _logger.error(f"CONFIG ERROR: {e}")
+        raise RuntimeError(f"Configuration validation failed with {len(errors)} error(s). See log.")
+
+    _logger.info("Configuration validated successfully")

@@ -215,7 +215,7 @@ class MarketReplay:
         """Fetch real 1-minute bars from Alpaca for all replay symbols."""
         try:
             from data import get_intraday_bars
-            from alpaca.data.timeframe import TimeFrame
+            from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
         except ImportError as e:
             logger.error(f"Cannot import data module for replay: {e}")
             return {}
@@ -227,7 +227,7 @@ class MarketReplay:
         bars_by_symbol: dict[str, pd.DataFrame] = {}
         for symbol in self._symbols:
             try:
-                df = get_intraday_bars(symbol, TimeFrame.Minute, market_open, market_close)
+                df = get_intraday_bars(symbol, TimeFrame(1, TimeFrameUnit.Minute), market_open, market_close)
                 if df is not None and not df.empty:
                     bars_by_symbol[symbol] = df
             except Exception as e:

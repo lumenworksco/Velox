@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start the trading bot in the background
+# Start the Velox V10 trading bot in the background
 cd "$(dirname "$0")"
 
 if pgrep -f "python3 main.py" > /dev/null; then
@@ -7,7 +7,11 @@ if pgrep -f "python3 main.py" > /dev/null; then
     exit 1
 fi
 
-echo "Starting Algo Trading Bot V2..."
+# Pre-launch backup
+echo "Running pre-launch backup..."
+bash scripts/backup.sh || echo "Backup skipped"
+
+echo "Starting Velox V10 Trading Bot..."
 nohup python3 main.py "$@" > /dev/null 2>&1 &
 echo "Bot started with PID $!"
 echo $! > .bot.pid

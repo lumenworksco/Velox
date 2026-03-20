@@ -49,30 +49,5 @@ class TestSignalDataclass:
         assert sig.hold_type == "swing"
 
 
-class TestSectorRotation:
-    def test_sector_rotation_disabled(self, override_config):
-        """Returns empty when SECTOR_ROTATION_ENABLED=False."""
-        with override_config(SECTOR_ROTATION_ENABLED=False):
-            try:
-                from strategies.sector_rotation import SectorRotationStrategy
-                sr = SectorRotationStrategy()
-                from datetime import datetime
-                from conftest import ET
-                signals = sr.scan([], datetime(2026, 3, 13, 10, 30, tzinfo=ET))
-                assert signals == []
-            except ImportError:
-                pytest.skip("sector_rotation not available")
 
-    def test_sector_rotation_scanned_today_skips(self, override_config):
-        """Returns empty if already scanned today."""
-        with override_config(SECTOR_ROTATION_ENABLED=True):
-            try:
-                from strategies.sector_rotation import SectorRotationStrategy
-                sr = SectorRotationStrategy()
-                sr.scanned_today = True
-                from datetime import datetime
-                from conftest import ET
-                signals = sr.scan([], datetime(2026, 3, 13, 10, 30, tzinfo=ET))
-                assert signals == []
-            except ImportError:
-                pytest.skip("sector_rotation not available")
+# TestSectorRotation removed — strategy archived in V10

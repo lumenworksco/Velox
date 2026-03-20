@@ -258,6 +258,20 @@ def init_db():
             fill_rate REAL
         );
         CREATE INDEX IF NOT EXISTS idx_exec_strategy ON execution_analytics(strategy);
+
+        -- V10: Structured event log for audit trail
+        CREATE TABLE IF NOT EXISTS event_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            source TEXT,
+            symbol TEXT,
+            strategy TEXT,
+            details TEXT,
+            severity TEXT DEFAULT 'INFO'
+        );
+        CREATE INDEX IF NOT EXISTS idx_event_ts ON event_log(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_event_type ON event_log(event_type);
     """)
     conn.commit()
 
@@ -281,6 +295,34 @@ def init_db():
         conn.execute("COMMIT")
     except Exception as e:
         logger.warning(f"V4 schema migration note: {e}")
+
+    # V10: Migrate event_log if old schema (from OMS SQLAlchemy) exists
+    try:
+        cursor = conn.execute("PRAGMA table_info(event_log)")
+        existing_cols = {row["name"] for row in cursor.fetchall()}
+        if "symbol" not in existing_cols:
+            # Old schema had: id, timestamp, event_type, source, data_json
+            # New schema adds: symbol, strategy, details, severity
+            logger.info("Migrating event_log table to V10 schema...")
+            conn.execute("DROP TABLE IF EXISTS event_log")
+            conn.execute("""
+                CREATE TABLE event_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    source TEXT,
+                    symbol TEXT,
+                    strategy TEXT,
+                    details TEXT,
+                    severity TEXT DEFAULT 'INFO'
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_event_ts ON event_log(timestamp)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_event_type ON event_log(event_type)")
+            conn.commit()
+            logger.info("event_log table migrated to V10 schema")
+    except Exception as e:
+        logger.warning(f"event_log migration note: {e}")
 
     logger.info("Database initialized")
 
@@ -995,5 +1037,36 @@ def get_execution_analytics(strategy: str | None = None, days: int = 30) -> list
             """SELECT * FROM execution_analytics
                WHERE submitted_at >= datetime('now', ?) ORDER BY submitted_at DESC""",
             (f"-{days} days",),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# --- V10: Event log ---
+
+def insert_event_log(event_type: str, source: str, symbol: str | None = None,
+                     strategy: str | None = None, details: str | None = None,
+                     severity: str = "INFO"):
+    """Insert a structured event into the event log."""
+    conn = _get_conn()
+    conn.execute(
+        """INSERT INTO event_log (timestamp, event_type, source, symbol, strategy, details, severity)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (_to_iso(datetime.now(config.ET)), event_type, source, symbol, strategy, details, severity),
+    )
+    conn.commit()
+
+
+def get_event_log(event_type: str | None = None, limit: int = 100) -> list[dict]:
+    """Get recent event log entries, optionally filtered by type."""
+    conn = _get_conn()
+    if event_type:
+        rows = conn.execute(
+            "SELECT * FROM event_log WHERE event_type = ? ORDER BY timestamp DESC LIMIT ?",
+            (event_type, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM event_log ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
         ).fetchall()
     return [dict(r) for r in rows]

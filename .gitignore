@@ -29,6 +29,7 @@ state.json.bak
 data/
 logs/
 models/
+backups/
 
 # Testing
 .pytest_cache/

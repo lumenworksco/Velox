@@ -7,7 +7,7 @@ import pandas_ta as ta
 
 import config
 from data import get_intraday_bars
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,11 @@ class ExitManager:
             if trade.lowest_price_seen == 0 or current_price < trade.lowest_price_seen:
                 trade.lowest_price_seen = current_price
 
+        # Guard against invalid entry price
+        if trade.entry_price <= 0:
+            logger.warning(f"Exit manager: invalid entry_price for {trade.symbol}")
+            return None
+
         # Calculate current P&L
         if trade.side == "buy":
             pnl_pct = (current_price - trade.entry_price) / trade.entry_price
@@ -120,16 +125,20 @@ class ExitManager:
                 qty_to_close = max(1, int(trade.qty * 0.33))
                 self._execute_partial(risk_manager, trade.symbol, qty_to_close,
                                      current_price, now, "partial_tp_1")
+                trade._partial_closed_qty = getattr(trade, '_partial_closed_qty', 0) + qty_to_close
                 return {"symbol": trade.symbol, "action": "partial_tp_1", "qty": qty_to_close}
 
             # Level 2: 50% of remaining at 2/3 of target
             if current_price >= entry + target_range * 0.66 and trade.partial_exits == 1:
-                qty_to_close = max(1, int(trade.qty * 0.50))
+                _already_closed = getattr(trade, '_partial_closed_qty', 0)
+                remaining_qty = trade.qty - _already_closed
+                qty_to_close = max(1, int(remaining_qty * 0.50))
                 # Move stop to breakeven
                 if config.BREAKEVEN_STOP_ENABLED:
                     trade.stop_loss = entry * 1.001
                 self._execute_partial(risk_manager, trade.symbol, qty_to_close,
                                      current_price, now, "partial_tp_2")
+                trade._partial_closed_qty = _already_closed + qty_to_close
                 return {"symbol": trade.symbol, "action": "partial_tp_2", "qty": qty_to_close}
 
         elif trade.side == "sell":
@@ -141,14 +150,18 @@ class ExitManager:
                 qty_to_close = max(1, int(trade.qty * 0.33))
                 self._execute_partial(risk_manager, trade.symbol, qty_to_close,
                                      current_price, now, "partial_tp_1")
+                trade._partial_closed_qty = getattr(trade, '_partial_closed_qty', 0) + qty_to_close
                 return {"symbol": trade.symbol, "action": "partial_tp_1", "qty": qty_to_close}
 
             if current_price <= entry - target_range * 0.66 and trade.partial_exits == 1:
-                qty_to_close = max(1, int(trade.qty * 0.50))
+                _already_closed = getattr(trade, '_partial_closed_qty', 0)
+                remaining_qty = trade.qty - _already_closed
+                qty_to_close = max(1, int(remaining_qty * 0.50))
                 if config.BREAKEVEN_STOP_ENABLED:
                     trade.stop_loss = entry * 0.999
                 self._execute_partial(risk_manager, trade.symbol, qty_to_close,
                                      current_price, now, "partial_tp_2")
+                trade._partial_closed_qty = _already_closed + qty_to_close
                 return {"symbol": trade.symbol, "action": "partial_tp_2", "qty": qty_to_close}
 
         return None
@@ -232,7 +245,7 @@ class ExitManager:
         """Exit if RSI is extremely overbought/oversold and trade is profitable."""
         try:
             market_open = datetime(now.year, now.month, now.day, 9, 30, tzinfo=config.ET)
-            bars = get_intraday_bars(trade.symbol, TimeFrame.Minute, start=market_open, end=now)
+            bars = get_intraday_bars(trade.symbol, TimeFrame(1, TimeFrameUnit.Minute), start=market_open, end=now)
             if bars.empty or len(bars) < 20:
                 return None
 
@@ -261,7 +274,7 @@ class ExitManager:
 
         try:
             market_open = datetime(now.year, now.month, now.day, 9, 30, tzinfo=config.ET)
-            bars = get_intraday_bars(trade.symbol, TimeFrame.Minute, start=market_open, end=now)
+            bars = get_intraday_bars(trade.symbol, TimeFrame(1, TimeFrameUnit.Minute), start=market_open, end=now)
             if bars.empty or len(bars) < 20:
                 return None
 

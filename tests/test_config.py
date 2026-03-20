@@ -96,20 +96,6 @@ class TestMaxPositions:
         assert config.MAX_POSITIONS > 0
         assert isinstance(config.MAX_POSITIONS, int)
 
-    def test_max_momentum_positions_positive(self):
-        """MAX_MOMENTUM_POSITIONS must be positive."""
-        import config
-        assert config.MAX_MOMENTUM_POSITIONS > 0
-
-    def test_max_pairs_positions_positive(self):
-        """MAX_PAIRS_POSITIONS must be positive."""
-        import config
-        assert config.MAX_PAIRS_POSITIONS > 0
-
-    def test_max_sector_positions_positive(self):
-        """MAX_SECTOR_POSITIONS must be positive."""
-        import config
-        assert config.MAX_SECTOR_POSITIONS > 0
 
 
 class TestMarketHours:

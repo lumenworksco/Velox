@@ -79,7 +79,7 @@ class Watchdog:
         except Exception as e:
             logger.error(f"Watchdog.check_health itself failed: {e}")
             return HealthStatus(
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(config.ET),
                 overall_healthy=False,
                 checks={},
                 issues=[f"watchdog_internal_error: {e}"],
@@ -107,7 +107,7 @@ class Watchdog:
         checks: dict = {}
         issues: list[str] = []
         recoveries: list[str] = []
-        now = datetime.utcnow()
+        now = datetime.now(config.ET)
 
         # 1. Main scan loop freshness
         checks["scan_loop"] = self._check_scan_loop(now)
@@ -157,14 +157,15 @@ class Watchdog:
             if last_scan is None:
                 return {"healthy": False, "detail": "scan loop has never run",
                         "last_ok": self._last_ok.get("scan_loop")}
-            # Use a timezone-naive comparison
-            last_naive = last_scan.replace(tzinfo=None) if last_scan.tzinfo else last_scan
-            stale = (now - last_naive) > timedelta(
+            # Ensure both are timezone-aware for comparison
+            if last_scan.tzinfo is None:
+                last_scan = last_scan.replace(tzinfo=config.ET)
+            stale = (now - last_scan) > timedelta(
                 seconds=config.WATCHDOG_CHECK_INTERVAL
             )
             if stale:
                 return {"healthy": False,
-                        "detail": f"last scan {last_naive.isoformat()} is stale",
+                        "detail": f"last scan {last_scan.isoformat()} is stale",
                         "last_ok": self._last_ok.get("scan_loop")}
             return {"healthy": True, "detail": "ok", "last_ok": now}
         except Exception as e:
@@ -360,7 +361,7 @@ class PositionReconciler:
         except Exception as e:
             logger.error(f"PositionReconciler.reconcile failed: {e}")
             return ReconciliationResult(
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(config.ET),
                 positions_checked=0,
                 all_reconciled=False,
             )
@@ -368,7 +369,7 @@ class PositionReconciler:
     def _reconcile_inner(self) -> ReconciliationResult:
         import database
 
-        now = datetime.utcnow()
+        now = datetime.now(config.ET)
         phantoms: list[str] = []
         unknowns: list[str] = []
         mismatches: list[str] = []
@@ -519,7 +520,7 @@ class AuditTrail:
             return
         try:
             entry = {
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(config.ET).isoformat(),
                 "trace_id": trace_id,
                 "event_type": event_type,
                 "data": data,
@@ -565,4 +566,4 @@ class AuditTrail:
         try:
             return f"T-{uuid.uuid4().hex[:12]}"
         except Exception:
-            return f"T-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+            return f"T-{datetime.now(config.ET).strftime('%Y%m%d%H%M%S')}"

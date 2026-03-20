@@ -65,45 +65,6 @@ class TestCanOpenTrade:
             assert allowed is False
             assert "Max positions" in reason
 
-    def test_can_open_trade_momentum_limit(self, override_config):
-        """Momentum-specific limit blocks additional momentum trades."""
-        with override_config(MAX_POSITIONS=10, MAX_MOMENTUM_POSITIONS=1,
-                             VIX_RISK_SCALING_ENABLED=False):
-            rm = RiskManager(current_equity=100_000)
-            rm.open_trades["NVDA"] = _make_trade(symbol="NVDA", strategy="MOMENTUM")
-
-            allowed, reason = rm.can_open_trade(strategy="MOMENTUM")
-
-            assert allowed is False
-            assert "momentum" in reason.lower()
-
-    def test_can_open_trade_sector_limit(self, override_config):
-        """V4: sector rotation limit blocks additional sector trades."""
-        with override_config(MAX_POSITIONS=10, MAX_SECTOR_POSITIONS=1,
-                             VIX_RISK_SCALING_ENABLED=False):
-            rm = RiskManager(current_equity=100_000)
-            rm.open_trades["XLK"] = _make_trade(symbol="XLK", strategy="SECTOR_ROTATION")
-
-            allowed, reason = rm.can_open_trade(strategy="SECTOR_ROTATION")
-
-            assert allowed is False
-            assert "sector" in reason.lower()
-
-    def test_can_open_trade_pairs_limit(self, override_config):
-        """V4: pairs trading limit blocks additional pairs."""
-        with override_config(MAX_POSITIONS=10, MAX_PAIRS_POSITIONS=1,
-                             VIX_RISK_SCALING_ENABLED=False):
-            rm = RiskManager(current_equity=100_000)
-            rm.open_trades["AAPL"] = _make_trade(
-                symbol="AAPL", strategy="PAIRS", pair_id="pair-001")
-            rm.open_trades["MSFT"] = _make_trade(
-                symbol="MSFT", strategy="PAIRS", pair_id="pair-001")
-
-            allowed, reason = rm.can_open_trade(strategy="PAIRS")
-
-            assert allowed is False
-            assert "pairs" in reason.lower()
-
     def test_can_open_trade_vix_halt(self, override_config):
         """Returns False when VIX scalar is 0.0 (VIX above halt threshold)."""
         with override_config(MAX_POSITIONS=10, VIX_RISK_SCALING_ENABLED=True,
@@ -198,24 +159,6 @@ class TestPositionSize:
 
             # Base capped to 200 shares ($20k), VIX * 0.5 = $10k => 100 shares
             assert qty == 100
-
-    def test_position_size_sector_fixed(self, override_config):
-        """Sector rotation uses fixed 5% sizing (SECTOR_POSITION_SIZE_PCT)."""
-        with override_config(RISK_PER_TRADE_PCT=0.01, MAX_POSITION_PCT=0.20,
-                             MIN_POSITION_VALUE=100, BEARISH_SIZE_CUT=0.40,
-                             VIX_RISK_SCALING_ENABLED=False,
-                             DYNAMIC_ALLOCATION=False,
-                             MAX_PORTFOLIO_DEPLOY=0.90,
-                             SECTOR_POSITION_SIZE_PCT=0.05,
-                             SHORT_SIZE_MULTIPLIER=0.75):
-            rm = RiskManager(current_equity=100_000)
-
-            qty = rm.calculate_position_size(
-                entry_price=200.0, stop_price=190.0, regime="BULLISH",
-                strategy="SECTOR_ROTATION")
-
-            # 100_000 * 0.05 = $5,000 => 5000/200 = 25 shares
-            assert qty == 25
 
     def test_position_size_zero_risk_per_share(self):
         """Returns 0 when entry == stop (division by zero guard)."""

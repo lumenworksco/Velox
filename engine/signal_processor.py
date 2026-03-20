@@ -17,6 +17,8 @@ from execution import submit_bracket_order, close_position, can_short
 from earnings import has_earnings_soon
 from correlation import is_too_correlated
 
+from engine.event_log import log_event, EventType
+
 logger = logging.getLogger(__name__)
 
 # Lazy-loaded optional modules
@@ -195,6 +197,24 @@ def _process_single_signal(
         skip_reason = "already_in_position"
         database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
         return
+
+    # 1b. PDT rule check for day trades
+    if signal.hold_type == "day":
+        try:
+            from risk.pdt_tracker import PDTTracker
+            # Access global PDT tracker via risk manager or create check
+            if not getattr(risk, '_pdt', None):
+                risk._pdt = PDTTracker()
+            if not risk._pdt.can_day_trade(risk.current_equity):
+                skip_reason = "pdt_limit"
+                logger.warning(f"PDT: Blocked day trade for {signal.symbol} — at limit")
+                log_event(EventType.PDT_BLOCKED, "signal_processor",
+                          symbol=signal.symbol, strategy=signal.strategy,
+                          details=f"Day trade blocked — PDT limit reached")
+                database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
+                return
+        except Exception:
+            pass  # Fail-open: don't block trades if PDT module has issues
 
     # 2. Earnings filter
     if has_earnings_soon(signal.symbol):
@@ -397,6 +417,9 @@ def _process_single_signal(
         _order_manager.update_state(oms_order.oms_id, OrderState.SUBMITTED, broker_order_id=broker_id)
     _emit_event(EventTypes.ORDER_SUBMITTED if _EVENTS_AVAILABLE else "order.submitted",
                 {"symbol": signal.symbol, "strategy": signal.strategy, "qty": qty, "order_id": str(order_id)})
+    log_event(EventType.ORDER_SUBMITTED, "signal_processor",
+              symbol=signal.symbol, strategy=signal.strategy,
+              details=f"qty={qty} side={signal.side} order_id={order_id}")
 
     # 8. Register trade with time stops / max hold
     time_stop = None

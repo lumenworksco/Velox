@@ -5,6 +5,8 @@ from datetime import datetime
 
 import config
 
+from engine.event_log import log_event, EventType
+
 logger = logging.getLogger(__name__)
 
 
@@ -38,6 +40,8 @@ class KillSwitch:
         self.activated_at = datetime.now(config.ET)
         self.reason = reason
         logger.critical(f"KILL SWITCH ACTIVATED: {reason}")
+        log_event(EventType.KILL_SWITCH, "kill_switch",
+                  details=f"reason={reason}", severity="CRITICAL")
 
         # 1. Cancel all pending/active orders
         if order_manager:

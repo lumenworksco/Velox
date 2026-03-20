@@ -303,6 +303,9 @@ def main():
 
     console.print("[bold cyan]Starting Velox V10 Trading Bot...[/bold cyan]\n")
 
+    # Validate configuration
+    config.validate()
+
     # Initialize database
     database.init_db()
     database.migrate_from_json()
@@ -330,6 +333,10 @@ def main():
     pnl_lock = engines["pnl_lock"]
     beta_neutral = engines["beta_neutral"]
     regime_detector = engines["regime_detector"]
+
+    # V10: PDT rule enforcement
+    from risk.pdt_tracker import PDTTracker
+    pdt = PDTTracker()
 
     mods = initialize_optional_modules()
     news_sentiment = mods["news_sentiment"]
@@ -380,7 +387,7 @@ def main():
     latest_consistency_score = 0.0
 
     # Feature flags
-    features = ["MR50%", "VWAP20%", "PAIRS20%", "ORB5%", "MICRO5%"]
+    features = ["MR40%", "VWAP20%", "PAIRS20%", "PEAD10%", "ORB5%", "MICRO5%"]
     if config.ALLOW_SHORT:
         features.append("Short")
     if config.TELEGRAM_ENABLED:
@@ -533,12 +540,12 @@ def main():
                     if orb_strategy and current_time >= time(10, 0) and not getattr(orb_strategy, '_ranges_recorded_today', False):
                         try:
                             from data import get_intraday_bars
-                            from alpaca.data.timeframe import TimeFrame
+                            from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
                             market_open = datetime(current.year, current.month, current.day, 9, 30, tzinfo=config.ET)
                             orb_10am = datetime(current.year, current.month, current.day, 10, 0, tzinfo=config.ET)
                             for symbol in config.STANDARD_SYMBOLS[:config.ORB_SCAN_SYMBOLS]:
                                 try:
-                                    bars_930_1000 = get_intraday_bars(symbol, TimeFrame.Minute, start=market_open, end=orb_10am)
+                                    bars_930_1000 = get_intraday_bars(symbol, TimeFrame(1, TimeFrameUnit.Minute), start=market_open, end=orb_10am)
                                     if bars_930_1000 is not None and not bars_930_1000.empty:
                                         orb_strategy.record_opening_range(symbol, bars_930_1000)
                                 except Exception:

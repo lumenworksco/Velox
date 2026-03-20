@@ -5,6 +5,7 @@ import os
 import tempfile
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch, PropertyMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -25,7 +26,7 @@ from watchdog import (
 class TestHealthStatus:
 
     def test_creation_healthy(self):
-        now = datetime.utcnow()
+        now = datetime.now(ZoneInfo("America/New_York"))
         hs = HealthStatus(
             timestamp=now,
             overall_healthy=True,
@@ -37,7 +38,7 @@ class TestHealthStatus:
         assert hs.recoveries_attempted == []
 
     def test_creation_unhealthy(self):
-        now = datetime.utcnow()
+        now = datetime.now(ZoneInfo("America/New_York"))
         hs = HealthStatus(
             timestamp=now,
             overall_healthy=False,
@@ -51,7 +52,7 @@ class TestHealthStatus:
 
     def test_default_lists(self):
         hs = HealthStatus(
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(ZoneInfo("America/New_York")),
             overall_healthy=True,
             checks={},
         )
@@ -59,7 +60,7 @@ class TestHealthStatus:
         assert hs.recoveries_attempted == []
         # Verify independent default instances
         hs2 = HealthStatus(
-            timestamp=datetime.utcnow(), overall_healthy=True, checks={}
+            timestamp=datetime.now(ZoneInfo("America/New_York")), overall_healthy=True, checks={}
         )
         hs.issues.append("test")
         assert hs2.issues == []
@@ -73,7 +74,7 @@ class TestReconciliationResult:
 
     def test_creation(self):
         rr = ReconciliationResult(
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(ZoneInfo("America/New_York")),
             positions_checked=5,
             phantoms_removed=["AAPL"],
             unknowns_found=["TSLA"],
@@ -85,7 +86,7 @@ class TestReconciliationResult:
 
     def test_defaults(self):
         rr = ReconciliationResult(
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(ZoneInfo("America/New_York")),
             positions_checked=0,
         )
         assert rr.phantoms_removed == []
@@ -102,7 +103,7 @@ class TestWatchdog:
 
     def test_check_health_all_healthy(self, in_memory_db):
         """All checks pass when everything is nominal."""
-        now = datetime.utcnow()
+        now = datetime.now(ZoneInfo("America/New_York"))
         wd = Watchdog(
             last_scan_time_fn=lambda: now - timedelta(seconds=30),
             trading_client_fn=None,  # skip API/orphan checks
@@ -115,7 +116,7 @@ class TestWatchdog:
 
     def test_scan_loop_stale(self, in_memory_db):
         """Detect a stale scan loop."""
-        stale_time = datetime.utcnow() - timedelta(minutes=10)
+        stale_time = datetime.now(ZoneInfo("America/New_York")) - timedelta(minutes=10)
         wd = Watchdog(
             last_scan_time_fn=lambda: stale_time,
             trading_client_fn=None,
@@ -206,7 +207,7 @@ class TestWatchdog:
     def test_overall_healthy_flag(self, in_memory_db):
         """Overall healthy is True when all checks pass."""
         wd = Watchdog(
-            last_scan_time_fn=lambda: datetime.utcnow(),
+            last_scan_time_fn=lambda: datetime.now(ZoneInfo("America/New_York")),
             trading_client_fn=None,
         )
         status = wd.check_health()

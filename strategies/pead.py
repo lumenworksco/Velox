@@ -165,6 +165,8 @@ class PEADStrategy:
                     current_price = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
                 except Exception:
                     current_price = trade.entry_price
+                if trade.entry_price <= 0:
+                    continue
                 if trade.side == "buy":
                     pnl_pct = (current_price - trade.entry_price) / trade.entry_price
                     if pnl_pct >= config.PEAD_TAKE_PROFIT:
