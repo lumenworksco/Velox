@@ -251,6 +251,7 @@ class TestFlightToSafety:
 class TestSizeReduction:
     """Held positions have size_reduction = OVERNIGHT_SIZE_REDUCTION."""
 
+    @patch("strategies.overnight._gap_risk_manager", None)
     @patch("earnings.has_earnings_soon", return_value=False)
     def test_hold_has_correct_size_reduction(self, _mock_earnings):
         from strategies.overnight import OvernightManager

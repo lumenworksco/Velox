@@ -242,6 +242,40 @@ class CloseResult:
     failed_symbols: list[str] = field(default_factory=list)
 
 
+def _validate_bracket_params(signal: Signal) -> tuple[bool, str]:
+    """MED-032: Validate bracket order parameters before submission.
+
+    Checks that stop_loss and take_profit are on the correct side of entry_price
+    for the given trade direction.
+
+    Returns:
+        (valid, reason) tuple.
+    """
+    entry = signal.entry_price
+    sl = signal.stop_loss
+    tp = signal.take_profit
+
+    if entry <= 0:
+        return False, f"Invalid entry price: {entry}"
+    if sl <= 0 or tp <= 0:
+        return False, f"Invalid SL={sl} or TP={tp} (must be > 0)"
+
+    if signal.side == "buy":
+        # Long: stop_loss must be below entry, take_profit must be above entry
+        if sl >= entry:
+            return False, f"Long SL={sl} >= entry={entry}"
+        if tp <= entry:
+            return False, f"Long TP={tp} <= entry={entry}"
+    elif signal.side == "sell":
+        # Short: stop_loss must be above entry, take_profit must be below entry
+        if sl <= entry:
+            return False, f"Short SL={sl} <= entry={entry}"
+        if tp >= entry:
+            return False, f"Short TP={tp} >= entry={entry}"
+
+    return True, ""
+
+
 def _submit_order(signal: Signal, qty: int, client=None):
     """Internal: submit a single order. Returns order object.
 
@@ -253,9 +287,14 @@ def _submit_order(signal: Signal, qty: int, client=None):
     if client is None:
         client = get_trading_client()
 
+    # MED-032: Validate bracket parameters before submission
+    valid, reason = _validate_bracket_params(signal)
+    if not valid:
+        raise ValueError(f"Bracket order validation failed for {signal.symbol}: {reason}")
+
     side = OrderSide.BUY if signal.side == "buy" else OrderSide.SELL
 
-    # --- V6 strategies ---------------------------------------------------
+    # --- CRIT-014: if/elif/elif/else chain (was if/if/if causing fallthrough) ---
     if signal.strategy in ("STAT_MR", "KALMAN_PAIRS"):
         # Mean-reversion: limit order, not time-sensitive
         return client.submit_order(
@@ -271,7 +310,7 @@ def _submit_order(signal: Signal, qty: int, client=None):
             )
         )
 
-    if signal.strategy in ("MICRO_MOM", "BETA_HEDGE"):
+    elif signal.strategy in ("MICRO_MOM", "BETA_HEDGE"):
         # Momentum / hedge: market order, speed matters
         return client.submit_order(
             MarketOrderRequest(
@@ -285,8 +324,7 @@ def _submit_order(signal: Signal, qty: int, client=None):
             )
         )
 
-    # V10: Removed dead MOMENTUM routing (strategy no longer exists)
-    if signal.strategy == "ORB":
+    elif signal.strategy == "ORB":
         # ORB uses limit order at breakout price (day only)
         return client.submit_order(
             LimitOrderRequest(
@@ -300,6 +338,22 @@ def _submit_order(signal: Signal, qty: int, client=None):
                 stop_loss={"stop_price": round(signal.stop_loss, 2)},
             )
         )
+
+    elif signal.strategy == "PEAD":
+        # CRIT-014: PEAD: limit order (swing trade, not time-sensitive)
+        return client.submit_order(
+            LimitOrderRequest(
+                symbol=signal.symbol,
+                qty=qty,
+                side=side,
+                time_in_force=TimeInForce.DAY,
+                limit_price=round(signal.entry_price, 2),
+                order_class=OrderClass.BRACKET,
+                take_profit={"limit_price": round(signal.take_profit, 2)},
+                stop_loss={"stop_price": round(signal.stop_loss, 2)},
+            )
+        )
+
     else:
         # VWAP and others: market order (speed matters, day only)
         return client.submit_order(

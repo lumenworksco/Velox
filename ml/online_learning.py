@@ -5,6 +5,7 @@ monitoring, and shadow model comparison for safe model swaps.
 """
 
 import logging
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -138,6 +139,11 @@ class OnlineLearner:
         self._last_retrain_time: float = 0.0
         self._last_drift_report: Optional[DriftReport] = None
 
+        # HIGH-020: Log-space expert weights for numerical stability
+        # log_weights[model_id] = log(weight); normalized via log-sum-exp
+        self._expert_log_weights: Dict[str, float] = {}
+        self._weight_normalize_interval: int = 100  # Normalize every N updates
+
         # Shadow models
         self._shadows: Dict[str, Any] = {}
         self._shadow_stats: Dict[str, ShadowModelStats] = {}
@@ -181,8 +187,10 @@ class OnlineLearner:
                 pred = self._predict_single(self.production_model, features)
                 error = float(abs(pred - label))
 
-                # Exponential decay weight
-                weight = self.decay_factor ** max(0, self._total_updates - 1)
+                # HIGH-020: Use log-space decay to prevent underflow
+                # log(weight) = (total_updates - 1) * log(decay_factor)
+                log_weight = max(0, self._total_updates - 1) * math.log(self.decay_factor)
+                weight = math.exp(log_weight) if log_weight > -700 else 0.0  # Prevent underflow
                 self._errors.append(error)
                 self._weighted_errors.append(error * weight)
             except Exception as e:
@@ -190,7 +198,7 @@ class OnlineLearner:
                 self._errors.append(0.0)
                 self._weighted_errors.append(0.0)
 
-        # --- Shadow model predictions ---
+        # --- Shadow model predictions + expert weight updates ---
         for model_id, shadow_model in list(self._shadows.items()):
             try:
                 shadow_pred = self._predict_single(shadow_model, features)
@@ -202,8 +210,18 @@ class OnlineLearner:
                 # Keep recent_errors bounded
                 if len(stats.recent_errors) > 200:
                     stats.recent_errors = stats.recent_errors[-200:]
+
+                # HIGH-020: Update expert log-weights using multiplicative
+                # weights update in log-space: log_w -= learning_rate * error
+                if model_id not in self._expert_log_weights:
+                    self._expert_log_weights[model_id] = 0.0
+                self._expert_log_weights[model_id] -= 0.1 * shadow_error
             except Exception as e:
                 logger.debug("Shadow model %s prediction failed: %s", model_id, e)
+
+        # HIGH-020: Periodically normalize expert weights to prevent drift
+        if self._total_updates % self._weight_normalize_interval == 0:
+            self._normalize_expert_weights()
 
         return error
 
@@ -404,6 +422,42 @@ class OnlineLearner:
         except Exception as e:
             logger.error("Retraining failed: %s", e)
             return False
+
+    # ------------------------------------------------------------------
+    # Expert weight normalization (HIGH-020)
+    # ------------------------------------------------------------------
+
+    def _normalize_expert_weights(self) -> None:
+        """Normalize expert log-weights using log-sum-exp to prevent underflow.
+
+        Shifts all log-weights so the maximum is 0, which keeps values in a
+        numerically stable range without changing relative ordering.
+        """
+        if not self._expert_log_weights:
+            return
+        max_lw = max(self._expert_log_weights.values())
+        for model_id in self._expert_log_weights:
+            self._expert_log_weights[model_id] -= max_lw
+        logger.debug("Normalized %d expert log-weights (shifted by %.2f)",
+                      len(self._expert_log_weights), max_lw)
+
+    def get_expert_weights(self) -> Dict[str, float]:
+        """Return normalized expert weights (probability distribution).
+
+        Uses log-sum-exp for numerical stability.
+        """
+        if not self._expert_log_weights:
+            return {}
+        max_lw = max(self._expert_log_weights.values())
+        exp_weights = {
+            k: math.exp(v - max_lw)
+            for k, v in self._expert_log_weights.items()
+        }
+        total = sum(exp_weights.values())
+        if total > 0:
+            return {k: v / total for k, v in exp_weights.items()}
+        n = len(exp_weights)
+        return {k: 1.0 / n for k in exp_weights}
 
     # ------------------------------------------------------------------
     # Exponential decay weighting

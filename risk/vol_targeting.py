@@ -7,6 +7,8 @@ Target: 1% daily portfolio volatility.
 """
 
 import logging
+import threading
+
 import numpy as np
 
 import config
@@ -28,14 +30,16 @@ class VolatilityTargetingRiskEngine:
         self._last_scalar = 1.0
         self._kelly_engine = None
         self._adaptive_weights: dict[str, float] | None = None
+        self._weights_lock = threading.Lock()  # MED-005: protect _adaptive_weights
 
     def set_kelly_engine(self, kelly_engine):
         """Set the Kelly engine for dynamic risk sizing."""
         self._kelly_engine = kelly_engine
 
     def set_adaptive_weights(self, weights: dict[str, float]):
-        """Store current adaptive allocation weights for position sizing."""
-        self._adaptive_weights = dict(weights)
+        """Store current adaptive allocation weights for position sizing (thread-safe)."""
+        with self._weights_lock:
+            self._adaptive_weights = dict(weights)
 
     def compute_vol_scalar(
         self,
@@ -126,14 +130,21 @@ class VolatilityTargetingRiskEngine:
         position_value *= vol_scalar
 
         # 4. Apply strategy allocation weight
+        # MED-005: snapshot adaptive weights under lock
+        with self._weights_lock:
+            _aw_snapshot = dict(self._adaptive_weights) if self._adaptive_weights else None
         if (getattr(config, "ADAPTIVE_ALLOCATION_ENABLED", False)
-                and self._adaptive_weights
-                and strategy in self._adaptive_weights):
-            allocation = self._adaptive_weights[strategy]
+                and _aw_snapshot
+                and strategy in _aw_snapshot):
+            allocation = _aw_snapshot[strategy]
         else:
-            allocation = config.STRATEGY_ALLOCATIONS.get(strategy, 0.33)
-        # Normalize: if equal weight would be 0.33, scale by allocation / 0.33
-        position_value *= allocation / 0.33
+            active_strategies = config.STRATEGY_ALLOCATIONS
+            equal_weight = 1.0 / len(active_strategies) if active_strategies else 1.0
+            allocation = active_strategies.get(strategy, equal_weight)
+        # Normalize: scale by allocation relative to equal weight
+        active_strategies = config.STRATEGY_ALLOCATIONS
+        equal_weight = 1.0 / len(active_strategies) if active_strategies else 1.0
+        position_value *= allocation / equal_weight
 
         # 5. Apply PnL lock multiplier
         position_value *= pnl_lock_mult

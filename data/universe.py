@@ -172,14 +172,29 @@ class DynamicUniverse:
             if asset_class and asset_class not in ("us_equity",):
                 continue
 
+            # MED-019: Improved ETF detection — use multiple signals
+            # Exchange-only detection misclassifies SPACs on ARCA as ETFs
+            # and misses ETFs on other exchanges.
+            _exchange = getattr(asset, "exchange", "")
+            _name = getattr(asset, "name", "").upper()
+            _sym = asset.symbol
+            # Known ETF set from config (leveraged ETFs, sector ETFs, broad market)
+            _known_etfs = set(getattr(config, "SECTOR_ETFS", [])) | getattr(config, "LEVERAGED_ETFS", set())
+            _known_etfs.update({"SPY", "QQQ", "IWM", "DIA", "GLD", "SLV", "TLT", "ARKK"})
+            _is_etf = (
+                _sym in _known_etfs
+                or "ETF" in _name
+                or "TRUST" in _name and "FUND" in _name
+                or (_exchange in ("ARCA", "BATS") and not any(kw in _name for kw in ("ACQUISITION", "SPAC", "HOLDINGS")))
+            )
+
             info = AssetInfo(
                 symbol=asset.symbol,
                 name=getattr(asset, "name", ""),
-                exchange=getattr(asset, "exchange", ""),
+                exchange=_exchange,
                 listed_date=str(getattr(asset, "listdate", "")) if hasattr(asset, "listdate") else None,
                 is_shortable=getattr(asset, "shortable", False),
-                is_etf=getattr(asset, "asset_class", "") == "us_equity"
-                        and getattr(asset, "exchange", "") in ("ARCA", "BATS"),
+                is_etf=_is_etf,
                 status="active",
             )
             results.append(info)

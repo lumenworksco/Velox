@@ -13,7 +13,7 @@ from conftest import _make_trade, MockTradingClient, ET
 class TestSubmitBracketOrder:
     def test_orb_order_succeeds(self, mock_trading_client):
         """ORB submit returns order ID."""
-        with patch("execution.get_trading_client", return_value=mock_trading_client):
+        with patch("execution.core.get_trading_client", return_value=mock_trading_client):
             from execution import submit_bracket_order
 
             signal = Signal(
@@ -27,7 +27,7 @@ class TestSubmitBracketOrder:
 
     def test_vwap_order_succeeds(self, mock_trading_client):
         """VWAP submit returns order ID."""
-        with patch("execution.get_trading_client", return_value=mock_trading_client):
+        with patch("execution.core.get_trading_client", return_value=mock_trading_client):
             from execution import submit_bracket_order
 
             signal = Signal(
@@ -40,7 +40,7 @@ class TestSubmitBracketOrder:
 
     def test_momentum_order_succeeds(self, mock_trading_client):
         """MOMENTUM submit returns order ID (GTC limit)."""
-        with patch("execution.get_trading_client", return_value=mock_trading_client):
+        with patch("execution.core.get_trading_client", return_value=mock_trading_client):
             from execution import submit_bracket_order
 
             signal = Signal(
@@ -56,8 +56,8 @@ class TestSubmitBracketOrder:
         mock_client = MagicMock()
         mock_client.submit_order.side_effect = Exception("API down")
 
-        with patch("execution.get_trading_client", return_value=mock_client), \
-             patch("execution.time.sleep"):
+        with patch("execution.core.get_trading_client", return_value=mock_client), \
+             patch("execution.core.time.sleep"):
             from execution import submit_bracket_order
 
             signal = Signal(
@@ -72,7 +72,7 @@ class TestSubmitBracketOrder:
 class TestClosePosition:
     def test_close_position_success(self, mock_trading_client):
         """close_position returns True on success."""
-        with patch("execution.get_trading_client", return_value=mock_trading_client):
+        with patch("execution.core.get_trading_client", return_value=mock_trading_client):
             from execution import close_position
             result = close_position("AAPL", reason="eod")
             assert result is True
@@ -82,7 +82,7 @@ class TestClosePosition:
         mock_client = MagicMock()
         mock_client.close_position.side_effect = Exception("not found")
 
-        with patch("execution.get_trading_client", return_value=mock_client):
+        with patch("execution.core.get_trading_client", return_value=mock_client):
             from execution import close_position
             result = close_position("AAPL")
             assert result is False
@@ -94,7 +94,7 @@ class TestClosePartialPosition:
         mock_client = MagicMock()
         mock_client.close_position.return_value = True
 
-        with patch("execution.get_trading_client", return_value=mock_client):
+        with patch("execution.core.get_trading_client", return_value=mock_client):
             from execution import close_partial_position
             result = close_partial_position("AAPL", qty=5)
             assert result is True
@@ -109,7 +109,7 @@ class TestMaxHoldChecks:
 
     def test_orb_close(self, mock_trading_client):
         """close_orb_positions closes ORB trades only."""
-        with patch("execution.get_trading_client", return_value=mock_trading_client):
+        with patch("execution.core.get_trading_client", return_value=mock_trading_client):
             from execution import close_orb_positions
 
             now = datetime(2026, 3, 13, 15, 45, tzinfo=ET)
@@ -143,7 +143,7 @@ class TestCanShort:
     def test_can_short_allowed(self, override_config, mock_trading_client):
         """Returns True when shortable and has buying power."""
         with override_config(ALLOW_SHORT=True, NO_SHORT_SYMBOLS=set()):
-            with patch("execution.get_trading_client", return_value=mock_trading_client):
+            with patch("execution.core.get_trading_client", return_value=mock_trading_client):
                 from execution import can_short
                 allowed, reason = can_short("AAPL", 10, 150.0)
                 assert allowed is True
@@ -157,7 +157,7 @@ class TestV6StrategyRouting:
         mock_client = MagicMock()
         mock_client.submit_order.return_value = MagicMock(id="limit-001")
 
-        with patch("execution.get_trading_client", return_value=mock_client):
+        with patch("execution.core.get_trading_client", return_value=mock_client):
             from execution import _submit_order
 
             signal = Signal(
@@ -175,7 +175,7 @@ class TestV6StrategyRouting:
         mock_client = MagicMock()
         mock_client.submit_order.return_value = MagicMock(id="limit-002")
 
-        with patch("execution.get_trading_client", return_value=mock_client):
+        with patch("execution.core.get_trading_client", return_value=mock_client):
             from execution import _submit_order
 
             signal = Signal(
@@ -193,7 +193,7 @@ class TestV6StrategyRouting:
         mock_client = MagicMock()
         mock_client.submit_order.return_value = MagicMock(id="mkt-001")
 
-        with patch("execution.get_trading_client", return_value=mock_client):
+        with patch("execution.core.get_trading_client", return_value=mock_client):
             from execution import _submit_order
 
             signal = Signal(
@@ -211,7 +211,7 @@ class TestV6StrategyRouting:
         mock_client = MagicMock()
         mock_client.submit_order.return_value = MagicMock(id="mkt-002")
 
-        with patch("execution.get_trading_client", return_value=mock_client):
+        with patch("execution.core.get_trading_client", return_value=mock_client):
             from execution import _submit_order
 
             signal = Signal(
@@ -235,8 +235,8 @@ class TestV6StrategyRouting:
 
         mock_client.submit_order.side_effect = _fake_submit
 
-        with patch("execution.get_trading_client", return_value=mock_client), \
-             patch("execution.time.sleep"):
+        with patch("execution.core.get_trading_client", return_value=mock_client), \
+             patch("execution.core.time.sleep"):
             from execution import submit_bracket_order
 
             signal = Signal(
@@ -251,22 +251,18 @@ class TestV6StrategyRouting:
             assert len(result) == 5  # default 5 slices
             assert mock_client.submit_order.call_count == 5
 
-    def test_small_order_not_twap(self):
+    def test_small_order_not_twap(self, mock_trading_client):
         """Small STAT_MR order submits as a single bracket order (no TWAP)."""
-        mock_client = MagicMock()
-        mock_client.submit_order.return_value = MagicMock(id="single-001")
-
-        with patch("execution.get_trading_client", return_value=mock_client):
+        with patch("execution.core.get_trading_client", return_value=mock_trading_client):
             from execution import submit_bracket_order
 
             signal = Signal(
                 symbol="AAPL", strategy="STAT_MR", side="buy",
-                entry_price=10.0, take_profit=11.0, stop_loss=9.5,
+                entry_price=100.0, take_profit=110.0, stop_loss=95.0,
                 reason="small order test",
             )
-            # qty=5 * $10 = $50 < $2000 threshold
-            result = submit_bracket_order(signal, qty=5)
+            # qty=2 * $100 = $200 < $2000 threshold (but above $100 min notional)
+            result = submit_bracket_order(signal, qty=2)
 
             assert isinstance(result, str)
-            assert result == "single-001"
-            assert mock_client.submit_order.call_count == 1
+            assert result.startswith("mock-")

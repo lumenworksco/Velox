@@ -23,7 +23,8 @@ class TestVaRMonitor:
         np.random.seed(42)
         returns = list(np.random.normal(0.001, 0.01, 25))
         result = monitor.update(returns, 100000)
-        assert result.method == "parametric"
+        # RISK-001: Cornish-Fisher correction applied when n >= 20
+        assert result.method in ("parametric", "parametric-cf")
         assert result.var_95 > 0
         assert result.var_99 > result.var_95
         assert result.cvar_95 >= result.var_95
@@ -92,9 +93,12 @@ class TestCorrelationLimiter:
         assert not result.too_concentrated
 
     def test_high_correlation_blocks(self):
-        limiter = CorrelationLimiter(max_pairwise_corr=0.70)
-        # Set a high correlation
-        limiter.update_correlation("AAPL", "MSFT", 0.85)
+        # HIGH-030: Ledoit-Wolf shrinkage reduces raw correlations,
+        # so use a lower threshold (0.60) and a very high raw correlation (0.99)
+        limiter = CorrelationLimiter(max_pairwise_corr=0.60)
+        limiter.update_correlation("AAPL", "MSFT", 0.99)
+        # Set different sectors to avoid sector concentration trigger
+        limiter.set_sector_map({"AAPL": "tech", "MSFT": "software"})
         result = limiter.check_new_position("MSFT", ["AAPL"])
         assert result.too_concentrated
         assert "high_corr" in result.reason

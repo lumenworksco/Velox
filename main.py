@@ -28,8 +28,10 @@ import asyncio
 import logging
 import signal
 import sys
+import threading
 import time as time_mod
 from datetime import datetime, time, timedelta
+from pathlib import Path
 
 from rich.live import Live
 
@@ -357,6 +359,7 @@ def now_et() -> datetime:
 
 
 _market_open_cache: tuple[float, bool] | None = None  # (timestamp, is_open)
+_market_open_cache_lock = threading.Lock()  # MED-002: protect concurrent market-open cache access
 
 def is_market_hours(t: time) -> bool:
     """Check if market is open, using Alpaca clock API for holiday detection."""
@@ -366,23 +369,27 @@ def is_market_hours(t: time) -> bool:
     # V10 BUG-025: Check actual market status (holidays, early close) via API
     # Cache for 60 seconds to avoid API spam
     now_ts = _time.time()
-    if _market_open_cache and (now_ts - _market_open_cache[0]) < 60:
-        return _market_open_cache[1]
+    with _market_open_cache_lock:
+        if _market_open_cache and (now_ts - _market_open_cache[0]) < 60:
+            return _market_open_cache[1]
 
     # Wall-clock check first (fast path for obviously closed times)
     if not (config.MARKET_OPEN <= t <= config.MARKET_CLOSE):
-        _market_open_cache = (now_ts, False)
+        with _market_open_cache_lock:
+            _market_open_cache = (now_ts, False)
         return False
 
     # API check for holidays and early closes
     try:
         clock = get_clock()
         is_open = clock.is_open
-        _market_open_cache = (now_ts, is_open)
+        with _market_open_cache_lock:
+            _market_open_cache = (now_ts, is_open)
         return is_open
     except Exception:
         # Fallback to wall-clock if API fails
-        _market_open_cache = (now_ts, True)
+        with _market_open_cache_lock:
+            _market_open_cache = (now_ts, True)
         return True
 
 
@@ -471,16 +478,124 @@ def main():
         walk_forward_test()
         return
 
-    # Register SIGTERM handler for graceful Docker shutdown
+    # IMPL-006: Graceful shutdown sequence with proper signal handling
     _shutdown_requested = False
 
-    def _sigterm_handler(signum, frame):
+    def _graceful_shutdown(signame: str = "unknown"):
+        """Execute graceful shutdown sequence.
+
+        IMPL-006 shutdown steps:
+        1. Set BLACK circuit breaker level (halt all new trading)
+        2. Cancel all open orders at broker
+        3. Wait for pending fills (up to 10 seconds)
+        4. Save full state (positions, analytics, config snapshot)
+        5. Flush all log handlers
+        6. Exit cleanly
+        """
         nonlocal _shutdown_requested
+        if _shutdown_requested:
+            # Already shutting down, don't re-enter
+            return
         _shutdown_requested = True
-        logger.info("SIGTERM received — initiating graceful shutdown")
-        raise KeyboardInterrupt()  # Reuse existing shutdown path
+
+        console.print(f"\n[yellow]Signal {signame} received — starting graceful shutdown...[/yellow]")
+        logger.info(f"Graceful shutdown initiated (signal={signame})")
+
+        # Step 1: Activate BLACK circuit breaker (halt all trading)
+        try:
+            if kill_switch and hasattr(kill_switch, 'activate'):
+                kill_switch.activate(
+                    reason=f"graceful_shutdown_{signame}",
+                    risk_manager=risk,
+                    order_manager=order_manager,
+                )
+                console.print("[yellow]  1/6 Kill switch activated (BLACK breaker)[/yellow]")
+            elif tiered_cb and hasattr(tiered_cb, 'trip'):
+                tiered_cb.trip("BLACK", reason=f"graceful_shutdown_{signame}")
+                console.print("[yellow]  1/6 Circuit breaker tripped to BLACK[/yellow]")
+            else:
+                console.print("[yellow]  1/6 No circuit breaker available — skipping[/yellow]")
+        except Exception as e:
+            logger.warning(f"Shutdown step 1 (kill switch) failed: {e}")
+
+        # Step 2: Cancel all open orders
+        try:
+            if order_manager and hasattr(order_manager, 'cancel_all'):
+                cancelled = order_manager.cancel_all(reason="graceful_shutdown")
+                console.print(f"[yellow]  2/6 Cancelled open orders: {cancelled}[/yellow]")
+            else:
+                from execution import cancel_all_orders
+                try:
+                    cancel_all_orders()
+                    console.print("[yellow]  2/6 Cancelled all open orders via broker[/yellow]")
+                except Exception:
+                    console.print("[yellow]  2/6 Order cancellation skipped (no OMS)[/yellow]")
+        except Exception as e:
+            logger.warning(f"Shutdown step 2 (cancel orders) failed: {e}")
+
+        # Step 3: Wait for pending fills (up to 10 seconds)
+        try:
+            console.print("[yellow]  3/6 Waiting for pending fills (up to 10s)...[/yellow]")
+            for _ in range(10):
+                time_mod.sleep(1)
+                # Check if there are any open orders remaining
+                try:
+                    if order_manager and hasattr(order_manager, 'get_active_orders'):
+                        active = order_manager.get_active_orders()
+                        if not active:
+                            break
+                except Exception:
+                    break
+            console.print("[yellow]  3/6 Fill wait complete[/yellow]")
+        except Exception as e:
+            logger.warning(f"Shutdown step 3 (wait fills) failed: {e}")
+
+        # Step 4: Save state
+        try:
+            database.save_open_positions(risk.open_trades)
+            console.print("[yellow]  4/6 State saved to database[/yellow]")
+        except Exception as e:
+            logger.error(f"Shutdown step 4 (save state) failed: {e}")
+            console.print(f"[red]  4/6 State save failed: {e}[/red]")
+
+        # Also save a config snapshot and DB backup
+        try:
+            from ops.disaster_recovery import DisasterRecovery
+            dr = DisasterRecovery(data_dir=str(Path(__file__).resolve().parent))
+            dr.save_config_snapshot()
+            dr.create_backup("bot.db")
+            console.print("[yellow]  4b/6 Config snapshot and DB backup saved[/yellow]")
+        except Exception as e:
+            logger.debug(f"Shutdown backup failed (non-critical): {e}")
+
+        # Step 5: Stop websocket monitor
+        try:
+            if ws_monitor:
+                ws_monitor.stop()
+            console.print("[yellow]  5/6 WebSocket monitor stopped[/yellow]")
+        except Exception as e:
+            logger.warning(f"Shutdown step 5 (websocket) failed: {e}")
+
+        # Step 6: Flush all log handlers
+        try:
+            for handler in logging.root.handlers:
+                handler.flush()
+            console.print("[yellow]  6/6 Logs flushed[/yellow]")
+        except Exception as e:
+            logger.debug(f"Shutdown step 6 (flush logs) failed: {e}")
+
+        console.print("[green]Graceful shutdown complete. Bot stopped.[/green]")
+
+    def _sigterm_handler(signum, frame):
+        _graceful_shutdown("SIGTERM")
+        sys.exit(0)
+
+    def _sigint_handler(signum, frame):
+        _graceful_shutdown("SIGINT")
+        sys.exit(0)
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
+    signal.signal(signal.SIGINT, _sigint_handler)
 
     console.print("[bold cyan]Starting Velox V10 Trading Bot...[/bold cyan]\n")
 
@@ -493,6 +608,18 @@ def main():
 
     # Startup checks
     info = startup_checks()
+
+    # WIRE-013: Disaster recovery state validation at boot (fail-open)
+    try:
+        if DisasterRecovery is not None:
+            _dr = DisasterRecovery()
+            _dr_status = _dr.get_status()
+            if _dr_status:
+                logger.info("WIRE-013: Disaster recovery status: %s", _dr_status)
+            _dr.check_heartbeat()
+            _dr.update_heartbeat()
+    except Exception as e:
+        logger.info("WIRE-013: Disaster recovery check skipped (fail-open): %s", e)
 
     # V10: Consolidated initialization via engine/startup.py
     from engine.startup import (
@@ -578,189 +705,73 @@ def main():
     if config.WEBSOCKET_MONITORING:
         features.append("WS")
 
-    # --- V11: Initialize new institutional-grade modules ---
-    v11_modules = {}
+    # --- V11: Initialize modules via Container (ARCH-011) ---
+    # All V11 modules are registered as lazy factories in Container.
+    # We eagerly resolve each one here to detect import/init errors at startup.
+    # The fail-open pattern is preserved: each module is individually wrapped.
+    from container import Container as _Container
+    _ctr = _Container.instance()
 
-    # V11: Intraday risk controls (RISK-005)
-    if IntradayRiskControls:
+    _V11_MODULE_FEATURES = [
+        # (container_key, feature_tag)
+        ("intraday_controls", "IntradayRisk"),
+        ("factor_model", "FactorRisk"),
+        ("stress_test", "StressTest"),
+        ("gap_risk", "GapRisk"),
+        ("drawdown_risk", "DrawdownRisk"),
+        ("fill_analytics", "FillAnalytics"),
+        ("slippage_model", "SlippageModel"),
+        ("vpin", "VPIN"),
+        ("feature_store", "FeatureStore"),
+        ("feature_engine", "ML-Features"),
+        ("alert_manager", "Alerting"),
+        ("latency_tracker", "LatencyMon"),
+        ("metrics_pipeline", "MetricsPipe"),
+        ("audit_trail", "AuditTrail"),
+        ("pdt_compliance", "PDTv11"),
+        ("surveillance", "Surveillance"),
+        ("bocpd", "BOCPD"),
+        ("enhanced_seasonality", "SeasonV11"),
+        ("data_quality", "DQv11"),
+        ("v11_reconciler", "ReconV11"),
+        # V11.1 new modules
+        ("batch_inference", "BatchInference"),
+        ("model_registry", "ModelRegistry"),
+        ("watchdog", "Watchdog"),
+        ("shadow_trader", "ShadowTrader"),
+        ("dynamic_hedger", "DynHedge"),
+        ("margin_monitor", "MarginMon"),
+        ("corporate_actions", "CorpActions"),
+        ("conformal_stops", "ConfStops"),
+    ]
+
+    v11_active = 0
+    for _key, _feat in _V11_MODULE_FEATURES:
         try:
-            v11_modules["intraday_controls"] = IntradayRiskControls()
-            features.append("IntradayRisk")
+            _ctr.get(_key)
+            features.append(_feat)
+            v11_active += 1
         except Exception as e:
-            logger.warning(f"V11 IntradayRiskControls init failed: {e}")
+            logger.warning(f"V11 {_key} init failed: {e}")
 
-    # V11: Factor risk model (RISK-001)
-    if FactorRiskModel:
+    # Disaster recovery gets special treatment — run state recovery on startup
+    try:
+        dr = _ctr.get("disaster_recovery")
         try:
-            v11_modules["factor_model"] = FactorRiskModel()
-            features.append("FactorRisk")
+            dr.recover_state()
         except Exception as e:
-            logger.warning(f"V11 FactorRiskModel init failed: {e}")
+            logger.warning(f"V11 state recovery incomplete: {e}")
+        features.append("DR")
+        v11_active += 1
+    except Exception as e:
+        logger.warning(f"V11 disaster_recovery init failed: {e}")
 
-    # V11: Stress testing (RISK-003)
-    if StressTestFramework:
-        try:
-            v11_modules["stress_test"] = StressTestFramework()
-            features.append("StressTest")
-        except Exception as e:
-            logger.warning(f"V11 StressTestFramework init failed: {e}")
-
-    # V11: Gap risk (RISK-006)
-    if GapRiskManager:
-        try:
-            v11_modules["gap_risk"] = GapRiskManager()
-            features.append("GapRisk")
-        except Exception as e:
-            logger.warning(f"V11 GapRiskManager init failed: {e}")
-
-    # V11: Drawdown risk (OPS-002)
-    if DrawdownRiskManager:
-        try:
-            v11_modules["drawdown_risk"] = DrawdownRiskManager()
-            features.append("DrawdownRisk")
-        except Exception as e:
-            logger.warning(f"V11 DrawdownRiskManager init failed: {e}")
-
-    # V11: Fill analytics (EXEC-004)
-    if FillAnalytics:
-        try:
-            v11_modules["fill_analytics"] = FillAnalytics()
-            features.append("FillAnalytics")
-        except Exception as e:
-            logger.warning(f"V11 FillAnalytics init failed: {e}")
-
-    # V11: Slippage model (EXEC-003)
-    if SlippageModel:
-        try:
-            v11_modules["slippage_model"] = SlippageModel()
-            features.append("SlippageModel")
-        except Exception as e:
-            logger.warning(f"V11 SlippageModel init failed: {e}")
-
-    # V11: VPIN microstructure (MICRO-001)
-    if VPIN:
-        try:
-            v11_modules["vpin"] = VPIN()
-            features.append("VPIN")
-        except Exception as e:
-            logger.warning(f"V11 VPIN init failed: {e}")
-
-    # V11: Feature store (DATA-002)
-    if FeatureStore:
-        try:
-            v11_modules["feature_store"] = FeatureStore()
-            features.append("FeatureStore")
-        except Exception as e:
-            logger.warning(f"V11 FeatureStore init failed: {e}")
-
-    # V11: Feature engine (ML-001)
-    if FeatureEngine:
-        try:
-            v11_modules["feature_engine"] = FeatureEngine()
-            features.append("ML-Features")
-        except Exception as e:
-            logger.warning(f"V11 FeatureEngine init failed: {e}")
-
-    # V11: Alerting (MON-003)
-    if AlertManager:
-        try:
-            v11_modules["alert_manager"] = AlertManager()
-            features.append("Alerting")
-        except Exception as e:
-            logger.warning(f"V11 AlertManager init failed: {e}")
-
-    # V11: Latency tracking (MON-004)
-    if LatencyTracker:
-        try:
-            v11_modules["latency_tracker"] = LatencyTracker()
-            features.append("LatencyMon")
-        except Exception as e:
-            logger.warning(f"V11 LatencyTracker init failed: {e}")
-
-    # V11: Metrics pipeline (MON-002)
-    if MetricsPipeline:
-        try:
-            v11_modules["metrics_pipeline"] = MetricsPipeline()
-            features.append("MetricsPipe")
-        except Exception as e:
-            logger.warning(f"V11 MetricsPipeline init failed: {e}")
-
-    # V11: Audit trail (COMPLY-001)
-    if V11AuditTrail:
-        try:
-            v11_modules["audit_trail"] = V11AuditTrail()
-            features.append("AuditTrail")
-        except Exception as e:
-            logger.warning(f"V11 AuditTrail init failed: {e}")
-
-    # V11: PDT compliance (COMPLY-004)
-    if PDTCompliance:
-        try:
-            v11_modules["pdt_compliance"] = PDTCompliance()
-            features.append("PDTv11")
-        except Exception as e:
-            logger.warning(f"V11 PDTCompliance init failed: {e}")
-
-    # V11: Self-surveillance (COMPLY-002)
-    if SelfSurveillance:
-        try:
-            v11_modules["surveillance"] = SelfSurveillance()
-            features.append("Surveillance")
-        except Exception as e:
-            logger.warning(f"V11 SelfSurveillance init failed: {e}")
-
-    # V11: Disaster recovery (OPS-004)
-    if DisasterRecovery:
-        try:
-            dr = DisasterRecovery()
-            v11_modules["disaster_recovery"] = dr
-            # Run state recovery on startup
-            try:
-                dr.recover_state()
-            except Exception as e:
-                logger.warning(f"V11 state recovery incomplete: {e}")
-            features.append("DR")
-        except Exception as e:
-            logger.warning(f"V11 DisasterRecovery init failed: {e}")
-
-    # V11: BOCPD regime detection (ADVML-003)
-    if BayesianChangePointDetector:
-        try:
-            v11_modules["bocpd"] = BayesianChangePointDetector()
-            features.append("BOCPD")
-        except Exception as e:
-            logger.warning(f"V11 BOCPD init failed: {e}")
-
-    # V11: Enhanced seasonality (ALPHA-006)
-    if EnhancedSeasonality:
-        try:
-            v11_modules["enhanced_seasonality"] = EnhancedSeasonality()
-            features.append("SeasonV11")
-        except Exception as e:
-            logger.warning(f"V11 EnhancedSeasonality init failed: {e}")
-
-    # V11: Data quality framework (DATA-005)
-    if DataQualityFramework:
-        try:
-            v11_modules["data_quality"] = DataQualityFramework()
-            features.append("DQv11")
-        except Exception as e:
-            logger.warning(f"V11 DataQualityFramework init failed: {e}")
-
-    # V11: Position reconciler (MON-005)
-    if V11Reconciler:
-        try:
-            v11_modules["v11_reconciler"] = V11Reconciler()
-            features.append("ReconV11")
-        except Exception as e:
-            logger.warning(f"V11 Reconciler init failed: {e}")
-
-    logger.info(f"V11 modules initialized: {len(v11_modules)} active")
+    logger.info(f"V11 modules initialized: {v11_active} active (via Container)")
 
     features_str = ", ".join(features)
     console.print(f"\n[bold green]Velox V11 is running. Press Ctrl+C to stop.[/bold green]")
     console.print(f"[dim]Strategies: STAT_MR + VWAP + KALMAN_PAIRS + ORB + MICRO_MOM + PEAD[/dim]")
-    console.print(f"[dim]V11 Modules: {len(v11_modules)} active[/dim]")
+    console.print(f"[dim]V11 Modules: {v11_active} active[/dim]")
     console.print(f"[dim]Features: {features_str}[/dim]\n")
 
     # -----------------------------------------------------------------------
@@ -800,9 +811,20 @@ def main():
         # Load existing pairs from DB into memory
         try:
             db_pairs = database.get_active_kalman_pairs()
-            kalman_pairs.active_pairs = [
-                (p['symbol1'], p['symbol2']) for p in db_pairs
-            ]
+            # CRIT-011: Keep as dicts (scan() expects dict with 'symbol1'/'symbol2' keys)
+            kalman_pairs.active_pairs = db_pairs
+            # Restore Kalman state from DB values
+            import numpy as _np
+            for p in db_pairs:
+                pair_key = f"{p['symbol1']}_{p['symbol2']}"
+                hr = float(p.get('hedge_ratio', 1.0))
+                kalman_pairs.kalman_state[pair_key] = {
+                    'theta': _np.array([hr, 0.0]),
+                    'P': _np.eye(2) * 1.0,
+                    'spread_mean': float(p.get('spread_mean', 0.0)),
+                    'spread_std': max(0.001, float(p.get('spread_std', 1.0))),
+                }
+            kalman_pairs._pairs_ready = True
             console.print(f"[green]Kalman pairs loaded from DB: {len(kalman_pairs.active_pairs)} pairs[/green]")
         except Exception as e:
             console.print(f"[yellow]Failed to load Kalman pairs from DB: {e}[/yellow]")
@@ -849,7 +871,8 @@ def main():
                 if (current.weekday() == 6 and current_time >= time(0, 0)
                         and last_sunday_task != current.date()):
                     last_sunday_task = current.date()
-                    weekly_tasks(current, kalman_pairs, param_optimizer, walk_forward)
+                    weekly_tasks(current, kalman_pairs, param_optimizer, walk_forward,
+                                hmm_detector=regime_detector)
 
                 # -------------------------------------------------------
                 # Update regime
@@ -1103,7 +1126,9 @@ def main():
                     # V9: Adaptive allocation rebalance at EOD
                     if adaptive_allocator:
                         try:
-                            new_weights = adaptive_allocator.compute_weights(
+                            # HIGH-015: Use eod_rebalance which fetches trade history
+                            # and converts regime detector probs automatically
+                            new_weights = adaptive_allocator.eod_rebalance(
                                 regime=regime,
                                 regime_detector=regime_detector,
                             )
@@ -1240,23 +1265,23 @@ def main():
                     time_mod.sleep(1)
 
     except KeyboardInterrupt:
-        console.print("\n[yellow]Shutting down gracefully...[/yellow]")
-        if ws_monitor:
-            ws_monitor.stop()
-        try:
-            database.save_open_positions(risk.open_trades)
-        except Exception:
-            pass
-        console.print("[green]State saved. Bot stopped.[/green]")
+        # IMPL-006: Signal handlers call _graceful_shutdown, but in case
+        # KeyboardInterrupt propagates from time_mod.sleep or other blocking
+        # calls before the signal handler runs, catch it here as fallback.
+        if not _shutdown_requested:
+            _graceful_shutdown("KeyboardInterrupt")
     except Exception as e:
         logger.exception(f"Unexpected error: {e}")
-        if ws_monitor:
-            ws_monitor.stop()
-        try:
-            database.save_open_positions(risk.open_trades)
-        except Exception:
-            pass
         console.print(f"[bold red]Bot crashed: {e}[/bold red]")
+        # Emergency state save on crash
+        try:
+            _graceful_shutdown("CRASH")
+        except Exception:
+            # Last resort: just save positions
+            try:
+                database.save_open_positions(risk.open_trades)
+            except Exception:
+                pass
         console.print("[yellow]State saved. Restart with: python main.py[/yellow]")
         sys.exit(1)
 

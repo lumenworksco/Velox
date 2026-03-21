@@ -15,7 +15,7 @@ Constraints:
 """
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -345,6 +345,44 @@ class AdaptiveAllocator:
             capped = {s: w / total for s, w in capped.items()}
 
         return capped
+
+    def eod_rebalance(
+        self,
+        regime: str = "UNKNOWN",
+        regime_detector: Any = None,
+    ) -> dict[str, float]:
+        """HIGH-015: Convenience entry point for the EOD routine in main.py.
+
+        Fetches trade history from the database and converts the regime
+        detector's probabilities into the format ``compute_weights`` expects.
+
+        Args:
+            regime: Current regime label (unused directly, kept for logging).
+            regime_detector: Object with a ``get_state_probabilities()`` method.
+
+        Returns:
+            dict mapping strategy name to weight (sums to 1.0).
+        """
+        import database
+
+        # Build trade history DataFrame from recent trades
+        recent = database.get_recent_trades(days=30)
+        if recent:
+            trade_history = pd.DataFrame(recent)
+        else:
+            trade_history = pd.DataFrame(columns=["strategy", "pnl"])
+
+        # Extract regime probabilities if available
+        regime_probs = None
+        if regime_detector is not None:
+            try:
+                regime_probs = regime_detector.get_state_probabilities()
+            except Exception:
+                pass
+
+        weights = self.compute_weights(trade_history, regime_probs)
+        logger.info("EOD adaptive rebalance (regime=%s): %s", regime, weights)
+        return weights
 
     def get_allocation_change_reason(self) -> str:
         """Return a human-readable explanation of the latest weight changes."""

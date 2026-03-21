@@ -29,6 +29,52 @@ try:
 except ImportError:
     IntradaySeasonality = None
 
+# WIRE-001: Feature store integration (fail-open)
+try:
+    from data.feature_store import get_feature_store as _get_feature_store
+    _FEATURE_STORE_AVAILABLE = True
+except ImportError:
+    _FEATURE_STORE_AVAILABLE = False
+
+# WIRE-002: ML model integration (fail-open)
+_ml_model = None
+_ml_model_load_attempted = False
+_ml_model_lock = threading.Lock()
+
+def _get_ml_model():
+    """Lazy-load the most recent trained ML model (singleton, fail-open)."""
+    global _ml_model, _ml_model_load_attempted
+    if _ml_model_load_attempted:
+        return _ml_model
+    with _ml_model_lock:
+        if _ml_model_load_attempted:
+            return _ml_model
+        _ml_model_load_attempted = True
+        try:
+            import glob
+            import os
+            from ml.training import ModelTrainer
+            model_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
+            model_files = sorted(glob.glob(os.path.join(model_dir, "model_*.pkl")))
+            if model_files:
+                _ml_model = ModelTrainer.load_model(model_files[-1])
+                logger.info("WIRE-002: ML model loaded: %s", model_files[-1])
+            else:
+                logger.info("WIRE-002: No trained ML model found in %s", model_dir)
+        except Exception as e:
+            logger.info("WIRE-002: ML model load skipped (fail-open): %s", e)
+    return _ml_model
+
+# WIRE-003: VPIN integration (fail-open)
+try:
+    from microstructure.vpin import VPIN as _VPIN_Class
+    _VPIN_AVAILABLE = True
+except ImportError:
+    _VPIN_AVAILABLE = False
+
+_vpin_instances: dict[str, object] = {}
+_vpin_lock = threading.Lock()
+
 # V10 BUG-042: Singleton IntradaySeasonality (created once, not per-signal)
 # BUG-008: Thread-safe singleton creation via double-checked locking
 _seasonality_instance = None
@@ -61,18 +107,112 @@ except ImportError:
 _notifications = None
 _order_manager = None
 
-# BUG-024: Halted symbol detection — symbols with zero volume over 5+ consecutive bars
+# BUG-024 + RISK-005: Halted/delisted symbol blocklist with Alpaca asset status
 _halted_symbols: dict[str, float] = {}  # symbol -> expiry timestamp
 _HALT_BLOCKLIST_TTL_SEC = 300  # Block for 5 minutes after detection
+_pair_lock = threading.Lock()  # CRIT-009: Lock for atomic pair trade submission
+
+# RISK-005: Alpaca asset status blocklist — refreshed every 5 minutes
+_asset_status_blocklist: dict[str, float] = {}  # symbol -> expiry timestamp
+_asset_status_lock = threading.Lock()
+_ASSET_STATUS_REFRESH_SEC = 300  # Refresh every 5 minutes
+_last_asset_status_refresh: float = 0.0
+
+
+def _refresh_asset_status_blocklist() -> None:
+    """RISK-005: Refresh the halted/delisted blocklist from Alpaca asset status API.
+
+    Called automatically when the blocklist is stale (> 5 minutes old).
+    Fail-open: if the API call fails, the stale blocklist is kept.
+    """
+    global _last_asset_status_refresh
+
+    current_ts = _time.time()
+    with _asset_status_lock:
+        if (current_ts - _last_asset_status_refresh) < _ASSET_STATUS_REFRESH_SEC:
+            return  # Still fresh
+
+    try:
+        from broker.alpaca_client import get_trading_client
+
+        client = get_trading_client()
+        # Fetch the full set of open-position symbols + recently seen symbols
+        # to check their tradability status
+        symbols_to_check = set(_halted_symbols.keys()) | set(_asset_status_blocklist.keys())
+
+        new_blocklist: dict[str, float] = {}
+        expiry = current_ts + _ASSET_STATUS_REFRESH_SEC
+
+        for symbol in symbols_to_check:
+            try:
+                asset = client.get_asset(symbol)
+                if not asset.tradable or asset.status == "inactive":
+                    new_blocklist[symbol] = expiry
+                    logger.info(f"RISK-005: {symbol} is not tradable (status={asset.status}), blocking")
+            except Exception:
+                pass  # If we can't check a specific asset, skip it
+
+        with _asset_status_lock:
+            _asset_status_blocklist.update(new_blocklist)
+            _last_asset_status_refresh = current_ts
+
+        logger.debug(f"RISK-005: Asset status blocklist refreshed, {len(new_blocklist)} blocked symbols")
+
+    except Exception as e:
+        logger.warning(f"RISK-005: Asset status refresh failed (fail-open): {e}")
+        with _asset_status_lock:
+            _last_asset_status_refresh = current_ts  # Don't retry immediately
+
+
+def _is_asset_blocked(symbol: str) -> bool:
+    """RISK-005: Check if a symbol is blocked due to Alpaca asset status (halted/delisted).
+
+    Also checks the symbol on-demand if not in the blocklist, to catch newly halted symbols.
+    Fail-open: returns False if the check fails.
+    """
+    current_ts = _time.time()
+
+    # Trigger periodic refresh
+    _refresh_asset_status_blocklist()
+
+    # Check blocklist
+    with _asset_status_lock:
+        if symbol in _asset_status_blocklist:
+            if current_ts < _asset_status_blocklist[symbol]:
+                return True
+            else:
+                del _asset_status_blocklist[symbol]
+
+    # On-demand check for symbols not in blocklist
+    try:
+        from broker.alpaca_client import get_trading_client
+
+        client = get_trading_client()
+        asset = client.get_asset(symbol)
+
+        if not asset.tradable or asset.status == "inactive":
+            with _asset_status_lock:
+                _asset_status_blocklist[symbol] = current_ts + _ASSET_STATUS_REFRESH_SEC
+            logger.warning(f"RISK-005: {symbol} is not tradable (status={asset.status}), blocking")
+            return True
+
+    except Exception as e:
+        logger.debug(f"RISK-005: Asset status check failed for {symbol} (fail-open): {e}")
+
+    return False
 
 
 def _is_symbol_halted(symbol: str, now: datetime) -> bool:
-    """BUG-024: Check if a symbol appears halted (zero volume over 5+ bars).
+    """BUG-024 + RISK-005: Check if a symbol is halted or blocked.
 
-    Checks recent intraday bars for zero volume streaks. Adds halted
-    symbols to a temporary blocklist to avoid repeated data fetches.
+    Combines volume-based halt detection (BUG-024) with Alpaca asset
+    status checks (RISK-005). Fail-open on all checks.
     """
-    # Check blocklist first
+    # RISK-005: Check Alpaca asset status blocklist first (fast path)
+    if _is_asset_blocked(symbol):
+        return True
+
+    # BUG-024: Check volume-based blocklist
     current_ts = _time.time()
     if symbol in _halted_symbols:
         if current_ts < _halted_symbols[symbol]:
@@ -170,53 +310,66 @@ def process_signals(
                                var_monitor, corr_limiter)
 
     # Process pairs atomically (both legs or neither)
-    for pair_id, pair_signals in pair_groups.items():
-        if len(pair_signals) != 2:
-            logger.warning(f"Pair {pair_id} has {len(pair_signals)} signals, skipping")
-            continue
+    # CRIT-009: Lock around pair submission to prevent unhedged exposure
+    with _pair_lock:
+        for pair_id, pair_signals in pair_groups.items():
+            if len(pair_signals) != 2:
+                logger.warning(f"Pair {pair_id} has {len(pair_signals)} signals, skipping")
+                continue
 
-        all_ok = True
-        for sig in pair_signals:
-            if sig.symbol in risk.open_trades:
-                all_ok = False
-                break
-            allowed, reason = risk.can_open_trade(strategy=sig.strategy)
-            if not allowed:
-                all_ok = False
-                break
-
-        if all_ok:
-            # V10 BUG-030: Submit both legs with rollback if second fails
-            first_sig, second_sig = pair_signals[0], pair_signals[1]
-            _process_single_signal(first_sig, risk, regime, now, vol_engine, pnl_lock, ws_monitor,
-                                   news_sentiment, llm_scorer, regime_detector, cross_asset_monitor,
-                               var_monitor, corr_limiter)
-
-            if first_sig.symbol in risk.open_trades:
-                _process_single_signal(second_sig, risk, regime, now, vol_engine, pnl_lock, ws_monitor,
-                                       news_sentiment, llm_scorer, regime_detector, cross_asset_monitor,
-                               var_monitor, corr_limiter)
-
-                if second_sig.symbol not in risk.open_trades:
-                    logger.warning(f"Pair {pair_id}: second leg {second_sig.symbol} failed, closing first leg {first_sig.symbol}")
-                    rollback_ok = False
-                    for attempt in range(3):
-                        try:
-                            close_position(first_sig.symbol, reason="pair_rollback")
-                            trade = risk.open_trades.get(first_sig.symbol)
-                            if trade:
-                                risk.close_trade(first_sig.symbol, trade.entry_price, now, exit_reason="pair_rollback")
-                            rollback_ok = True
-                            break
-                        except Exception as e:
-                            logger.error(f"Pair rollback attempt {attempt+1}/3 failed for {first_sig.symbol}: {e}")
-                    if not rollback_ok:
-                        logger.critical(f"PAIR ROLLBACK FAILED after 3 attempts for {first_sig.symbol} — manual intervention required")
-            else:
-                database.log_signal(now, second_sig.symbol, second_sig.strategy, second_sig.side, False, "pair_first_leg_failed")
-        else:
+            all_ok = True
             for sig in pair_signals:
-                database.log_signal(now, sig.symbol, sig.strategy, sig.side, False, "pair_blocked")
+                if sig.symbol in risk.open_trades:
+                    all_ok = False
+                    break
+                allowed, reason = risk.can_open_trade(strategy=sig.strategy)
+                if not allowed:
+                    all_ok = False
+                    break
+
+            if all_ok:
+                # V10 BUG-030: Submit both legs with rollback if second fails
+                first_sig, second_sig = pair_signals[0], pair_signals[1]
+                _process_single_signal(first_sig, risk, regime, now, vol_engine, pnl_lock, ws_monitor,
+                                       news_sentiment, llm_scorer, regime_detector, cross_asset_monitor,
+                                       var_monitor, corr_limiter)
+
+                if first_sig.symbol in risk.open_trades:
+                    _process_single_signal(second_sig, risk, regime, now, vol_engine, pnl_lock, ws_monitor,
+                                           news_sentiment, llm_scorer, regime_detector, cross_asset_monitor,
+                                           var_monitor, corr_limiter)
+
+                    if second_sig.symbol not in risk.open_trades:
+                        logger.warning(f"Pair {pair_id}: second leg {second_sig.symbol} failed, closing first leg {first_sig.symbol}")
+                        rollback_ok = False
+                        for attempt in range(3):
+                            try:
+                                close_position(first_sig.symbol, reason="pair_rollback")
+                                trade = risk.open_trades.get(first_sig.symbol)
+                                if trade:
+                                    risk.close_trade(first_sig.symbol, trade.entry_price, now, exit_reason="pair_rollback")
+                                rollback_ok = True
+                                # CRIT-009: Verify fill after rollback
+                                _time.sleep(0.5)  # Brief wait for fill
+                                try:
+                                    from data import get_positions
+                                    broker_pos = {p.symbol: p for p in get_positions()}
+                                    if first_sig.symbol in broker_pos:
+                                        logger.warning(f"CRIT-009: Rollback position still exists at broker for {first_sig.symbol}")
+                                        rollback_ok = False
+                                        continue  # Retry
+                                except Exception:
+                                    pass  # If we can't verify, assume OK
+                                break
+                            except Exception as e:
+                                logger.error(f"Pair rollback attempt {attempt+1}/3 failed for {first_sig.symbol}: {e}")
+                        if not rollback_ok:
+                            logger.critical(f"PAIR ROLLBACK FAILED after 3 attempts for {first_sig.symbol} — manual intervention required")
+                else:
+                    database.log_signal(now, second_sig.symbol, second_sig.strategy, second_sig.side, False, "pair_first_leg_failed")
+            else:
+                for sig in pair_signals:
+                    database.log_signal(now, sig.symbol, sig.strategy, sig.side, False, "pair_blocked")
 
 
 def _process_single_signal(
@@ -393,8 +546,54 @@ def _process_single_signal(
         except Exception:
             var_mult = 1.0
 
+    # WIRE-001: Feature store — fetch features for ML/sizing enrichment (fail-open)
+    _signal_features = None
+    if _FEATURE_STORE_AVAILABLE:
+        try:
+            fs = _get_feature_store()
+            _signal_features = fs.get_all_features(signal.symbol)
+            if not _signal_features:
+                _signal_features = None
+        except Exception as e:
+            logger.debug("WIRE-001: Feature store lookup failed for %s (fail-open): %s", signal.symbol, e)
+
+    # WIRE-002: ML model confidence multiplier (fail-open)
+    ml_conf_mult = 1.0
+    if _signal_features:
+        try:
+            model = _get_ml_model()
+            if model is not None:
+                import pandas as _pd
+                feat_df = _pd.DataFrame([_signal_features])
+                prediction = model.predict(feat_df)
+                # prediction is array; use first element as confidence (0-1 for classification)
+                confidence = float(prediction[0]) if len(prediction) > 0 else 0.5
+                # Scale: confidence 0.5 = neutral (1.0x), 1.0 = high (1.3x), 0.0 = low (0.7x)
+                ml_conf_mult = 0.7 + 0.6 * confidence
+                ml_conf_mult = max(0.5, min(ml_conf_mult, 1.5))
+        except Exception as e:
+            logger.debug("WIRE-002: ML prediction failed for %s (fail-open): %s", signal.symbol, e)
+            ml_conf_mult = 1.0
+
+    # WIRE-003: VPIN toxicity check — reduce size by 50% when VPIN > 0.7 (fail-open)
+    vpin_mult = 1.0
+    if _VPIN_AVAILABLE:
+        try:
+            with _vpin_lock:
+                vpin_inst = _vpin_instances.get(signal.symbol)
+            if vpin_inst is not None:
+                vpin_value = vpin_inst.compute_vpin()
+                if vpin_value > 0.7:
+                    vpin_mult = 0.5
+                    logger.info("WIRE-003: VPIN=%.2f for %s — reducing size by 50%%", vpin_value, signal.symbol)
+        except Exception as e:
+            logger.debug("WIRE-003: VPIN check failed for %s (fail-open): %s", signal.symbol, e)
+
     # Apply all multipliers
-    qty = int(qty * news_mult * llm_mult * regime_mult * seasonality_mult * cross_asset_mult * var_mult)
+    # CRIT-008: Cap combined multipliers to prevent position size overflow (3x+ leverage)
+    combined_mult = news_mult * llm_mult * regime_mult * seasonality_mult * cross_asset_mult * var_mult * ml_conf_mult * vpin_mult
+    combined_mult = min(combined_mult, 2.0)  # Hard cap at 2x base size
+    qty = int(qty * combined_mult)
 
     if qty <= 0:
         skip_reason = "position_size_zero"

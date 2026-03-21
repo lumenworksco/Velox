@@ -94,8 +94,26 @@ class VaRMonitor:
 
         return result
 
+    @staticmethod
+    def _cornish_fisher_z(z: float, skew: float, excess_kurt: float) -> float:
+        """Cornish-Fisher expansion: adjust normal z-score for skewness/kurtosis.
+
+        HIGH-008: Corrects parametric VaR for non-normal return distributions.
+        z_cf = z + (z^2 - 1)*S/6 + (z^3 - 3*z)*K/24 - (2*z^3 - 5*z)*S^2/36
+        where S = skewness, K = excess kurtosis.
+        """
+        z_cf = (z
+                + (z**2 - 1) * skew / 6
+                + (z**3 - 3 * z) * excess_kurt / 24
+                - (2 * z**3 - 5 * z) * skew**2 / 36)
+        return z_cf
+
     def _parametric_var(self) -> VaRResult:
-        """Parametric VaR assuming normal distribution."""
+        """Parametric VaR with Cornish-Fisher skewness/kurtosis correction.
+
+        RISK-001: Uses Cornish-Fisher expansion to adjust both VaR and CVaR
+        z-scores for non-normal return distributions (skewness & kurtosis).
+        """
         returns = np.array(self._daily_returns)
         mu = float(np.mean(returns))
         sigma = float(np.std(returns, ddof=1))
@@ -103,22 +121,34 @@ class VaRMonitor:
         if sigma < 1e-10:
             return VaRResult(method="parametric")
 
-        # Z-scores: 1.645 for 95%, 2.326 for 99%
-        var_95_pct = -(mu - 1.645 * sigma)
-        var_99_pct = -(mu - 2.326 * sigma)
+        # RISK-001: Compute skewness and excess kurtosis for Cornish-Fisher
+        n = len(returns)
+        if n >= 20:
+            from scipy.stats import skew as _skew, kurtosis as _kurtosis
+            s = float(_skew(returns))
+            k = float(_kurtosis(returns))  # scipy returns excess kurtosis by default
+            z_95 = self._cornish_fisher_z(1.645, s, k)
+            z_99 = self._cornish_fisher_z(2.326, s, k)
+        else:
+            s = 0.0
+            k = 0.0
+            z_95 = 1.645
+            z_99 = 2.326
+
+        var_95_pct = -(mu - z_95 * sigma)
+        var_99_pct = -(mu - z_99 * sigma)
 
         var_95 = var_95_pct * self._portfolio_value
         var_99 = var_99_pct * self._portfolio_value
 
-        # CVaR (parametric): E[X | X < -VaR] for normal distribution
-        # CVaR_alpha = mu + sigma * phi(z_alpha) / alpha
+        # RISK-001: CVaR (Expected Shortfall) with Cornish-Fisher correction.
+        # Use the CF-adjusted z-scores for the CVaR pdf evaluation so that
+        # heavy tails / skew propagate into the expected-shortfall estimate.
         from math import exp, sqrt, pi
-        z_95 = 1.645
         phi_95 = exp(-z_95**2 / 2) / sqrt(2 * pi)
         cvar_95_pct = -(mu - sigma * phi_95 / 0.05)
         cvar_95 = cvar_95_pct * self._portfolio_value
 
-        z_99 = 2.326
         phi_99 = exp(-z_99**2 / 2) / sqrt(2 * pi)
         cvar_99_pct = -(mu - sigma * phi_99 / 0.01)
         cvar_99 = cvar_99_pct * self._portfolio_value
@@ -129,7 +159,7 @@ class VaRMonitor:
             cvar_95=max(0, cvar_95),
             cvar_99=max(0, cvar_99),
             var_95_pct=max(0, var_95_pct),
-            method="parametric",
+            method="parametric-cf" if n >= 20 else "parametric",
         )
 
     def _historical_var(self) -> VaRResult:
@@ -144,8 +174,9 @@ class VaRMonitor:
         var_99 = var_99_pct * self._portfolio_value
 
         # CVaR = mean of returns below VaR threshold
-        tail_5 = returns[returns <= np.percentile(returns, 5)]
-        tail_1 = returns[returns <= np.percentile(returns, 1)]
+        # HIGH-007: Use strict < to exclude the boundary observation from tail
+        tail_5 = returns[returns < np.percentile(returns, 5)]
+        tail_1 = returns[returns < np.percentile(returns, 1)]
 
         cvar_95_pct = -float(np.mean(tail_5)) if len(tail_5) > 0 else var_95_pct
         cvar_99_pct = -float(np.mean(tail_1)) if len(tail_1) > 0 else var_99_pct

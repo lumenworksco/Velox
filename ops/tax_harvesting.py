@@ -233,6 +233,11 @@ class TaxLossHarvester:
     def check_wash_sale(self, symbol: str, check_date: date) -> bool:
         """Check if a symbol is within the wash sale window.
 
+        IMPL-005: Enhanced wash sale enforcement covers:
+        1. Direct repurchase: same symbol bought within 30 days of loss sale
+        2. Substantially identical: substitute securities bought within window
+        3. Forward-looking: planned purchase would trigger wash sale on past loss
+
         The wash sale rule disallows claiming a loss if a "substantially
         identical" security was purchased within 30 days before or after
         the sale.
@@ -247,24 +252,62 @@ class TaxLossHarvester:
         window_start = check_date - timedelta(days=WASH_SALE_WINDOW_DAYS)
         window_end = check_date + timedelta(days=WASH_SALE_WINDOW_DAYS)
 
-        # Check sale history: was this symbol sold at a loss recently?
+        # Build set of "substantially identical" symbols for this security
+        substantially_identical = self._get_substantially_identical(symbol)
+
+        # Check 1: Was this symbol (or substantially identical) sold at a loss recently?
         for sale in self._sale_history:
-            if sale.symbol != symbol or not sale.was_loss:
+            if not sale.was_loss:
+                continue
+            if sale.symbol != symbol and sale.symbol not in substantially_identical:
                 continue
             if window_start <= sale.sale_date <= window_end:
                 return True
 
-        # Check purchase history: was this symbol purchased recently?
-        purchases = self._purchase_history.get(symbol, [])
-        for purchase_date in purchases:
-            if window_start <= purchase_date <= window_end:
-                # If we sold at a loss and repurchased within window
-                for sale in self._sale_history:
-                    if sale.symbol == symbol and sale.was_loss:
-                        if abs((sale.sale_date - purchase_date).days) <= WASH_SALE_WINDOW_DAYS:
-                            return True
+        # Check 2: Was this symbol (or substantially identical) purchased recently
+        # after a loss sale?
+        symbols_to_check = {symbol} | substantially_identical
+        for check_sym in symbols_to_check:
+            purchases = self._purchase_history.get(check_sym, [])
+            for purchase_date in purchases:
+                if window_start <= purchase_date <= window_end:
+                    # Check if there was a loss sale within window of this purchase
+                    for sale in self._sale_history:
+                        if sale.symbol in symbols_to_check and sale.was_loss:
+                            if abs((sale.sale_date - purchase_date).days) <= WASH_SALE_WINDOW_DAYS:
+                                return True
 
         return False
+
+    def _get_substantially_identical(self, symbol: str) -> Set[str]:
+        """Get the set of securities considered 'substantially identical' to a symbol.
+
+        IMPL-005: IRS considers these substantially identical:
+        - Same stock (obvious)
+        - Options on the same stock
+        - Convertible securities for the same stock
+        Note: Different ETFs tracking different indices are NOT substantially identical,
+        which is why we use ETF substitutes for sector exposure.
+        """
+        # For individual stocks, there are no substantially identical alternatives
+        # in our equity-only universe. This is used defensively to catch
+        # cases where the same symbol appears with different tickers (e.g., class shares).
+        identical: Set[str] = set()
+
+        # Check for share class variants
+        base = symbol.rstrip("AB")
+        share_classes = [f"{base}A", f"{base}B", f"{base}.A", f"{base}.B"]
+        for sc in share_classes:
+            if sc != symbol:
+                identical.add(sc)
+
+        # Google special case
+        if symbol in ("GOOGL", "GOOG"):
+            identical.add("GOOGL")
+            identical.add("GOOG")
+            identical.discard(symbol)
+
+        return identical
 
     def record_sale(
         self, symbol: str, sale_date: date, shares: float,
@@ -305,6 +348,136 @@ class TaxLossHarvester:
         self._purchase_history[symbol] = [
             d for d in self._purchase_history[symbol] if d > cutoff
         ]
+
+    def execute_harvest_with_substitute(
+        self,
+        action: HarvestAction,
+        broker_client: Any = None,
+    ) -> Dict[str, Any]:
+        """Execute a harvest action: sell the loss position and buy a substitute.
+
+        IMPL-005: After selling a position at a loss, immediately buys a
+        correlated but not substantially identical substitute to maintain
+        sector exposure. Records both the sale and the purchase for wash
+        sale tracking.
+
+        The substitute is selected from the action's substitute_symbols list.
+        The first available substitute that is NOT substantially identical
+        to the sold symbol and NOT itself in a wash sale window is used.
+
+        Args:
+            action: The HarvestAction to execute.
+            broker_client: Optional broker client for live execution.
+                If None, this is a dry-run that only records the transactions.
+
+        Returns:
+            Dict with keys: sold (bool), substitute_bought (str or None),
+            substitute_shares (float), wash_sale_clear_date (str),
+            estimated_tax_savings (float).
+        """
+        result = {
+            "sold": False,
+            "substitute_bought": None,
+            "substitute_shares": 0.0,
+            "wash_sale_clear_date": action.wash_sale_clear_date.isoformat(),
+            "estimated_tax_savings": 0.0,
+        }
+
+        today = date.today()
+
+        # Step 1: Verify no wash sale violation
+        if self.check_wash_sale(action.symbol, today):
+            logger.warning(
+                f"Tax harvest blocked: {action.symbol} is in wash sale window"
+            )
+            return result
+
+        # Step 2: Execute the sell (or simulate)
+        proceeds = action.current_price * action.shares_to_sell
+        cost_basis = action.cost_basis_per_share * action.shares_to_sell
+
+        if broker_client is not None:
+            try:
+                broker_client.submit_order(
+                    symbol=action.symbol,
+                    qty=action.shares_to_sell,
+                    side="sell",
+                    type="market",
+                    time_in_force="day",
+                )
+            except Exception as e:
+                logger.error(f"Tax harvest sell failed for {action.symbol}: {e}")
+                return result
+
+        # Record the sale
+        self.record_sale(
+            symbol=action.symbol,
+            sale_date=today,
+            shares=action.shares_to_sell,
+            proceeds=proceeds,
+            cost_basis=cost_basis,
+        )
+        result["sold"] = True
+
+        # Estimate tax savings (assuming 37% marginal rate for short-term, 20% long-term)
+        tax_rate = 0.37 if action.is_short_term else 0.20
+        result["estimated_tax_savings"] = round(abs(action.estimated_loss) * tax_rate, 2)
+
+        # Step 3: Buy substitute to maintain exposure
+        substantially_identical = self._get_substantially_identical(action.symbol)
+
+        for substitute in action.substitute_symbols:
+            # Skip if substantially identical (would trigger wash sale)
+            if substitute in substantially_identical:
+                logger.debug(
+                    f"Skipping substitute {substitute}: substantially identical to {action.symbol}"
+                )
+                continue
+
+            # Skip if substitute itself is in wash sale window
+            if self.check_wash_sale(substitute, today):
+                logger.debug(
+                    f"Skipping substitute {substitute}: in its own wash sale window"
+                )
+                continue
+
+            # Calculate shares of substitute to buy (match dollar exposure)
+            # In practice, we'd need the substitute's current price
+            substitute_shares = action.shares_to_sell  # Placeholder; equal shares
+
+            if broker_client is not None:
+                try:
+                    broker_client.submit_order(
+                        symbol=substitute,
+                        qty=substitute_shares,
+                        side="buy",
+                        type="market",
+                        time_in_force="day",
+                    )
+                except Exception as e:
+                    logger.error(f"Substitute buy failed for {substitute}: {e}")
+                    continue
+
+            # Record the substitute purchase
+            self.record_purchase(substitute, today)
+
+            result["substitute_bought"] = substitute
+            result["substitute_shares"] = substitute_shares
+
+            logger.info(
+                f"Tax harvest: sold {action.shares_to_sell} {action.symbol} "
+                f"(loss=${abs(action.estimated_loss):,.2f}), "
+                f"bought {substitute_shares} {substitute} as substitute"
+            )
+            break
+
+        if result["substitute_bought"] is None:
+            logger.warning(
+                f"Tax harvest: no suitable substitute found for {action.symbol}. "
+                f"Sector exposure gap until {action.wash_sale_clear_date}"
+            )
+
+        return result
 
     def _select_lots(
         self, tax_lots: List[TaxLot], current_price: float

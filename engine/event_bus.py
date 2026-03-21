@@ -173,12 +173,15 @@ class AsyncEventBus:
     a single asyncio event loop or via ``publish_sync()`` from threads.
     """
 
-    def __init__(self, max_history: int = 1000) -> None:
+    def __init__(self, max_history: int = 1000, max_dead_letters: int = 500) -> None:
         self._handlers: dict[type[BaseEvent], list[_PrioritizedHandler]] = {}
         self._wildcard_handlers: list[_PrioritizedHandler] = []
         self._lock = threading.Lock()
         self._history: list[BaseEvent] = []
         self._max_history = max_history
+        # HIGH-011: Dead letter queue for failed handler dispatches
+        self._dead_letters: list[dict] = []
+        self._max_dead_letters = max_dead_letters
 
     # ------------------------------------------------------------------
     # Subscribe
@@ -256,7 +259,8 @@ class AsyncEventBus:
             except Exception as exc:
                 name = getattr(entry.handler, "__name__", repr(entry.handler))
                 logger.error("AsyncEventBus: handler %s failed on %s: %s",
-                             name, type(event).__name__, exc)
+                             name, type(event).__name__, exc, exc_info=True)
+                self._record_dead_letter(event, name, exc)
 
     # ------------------------------------------------------------------
     # Publish (sync — for use from threads / non-async code)
@@ -285,7 +289,32 @@ class AsyncEventBus:
             except Exception as exc:
                 name = getattr(entry.handler, "__name__", repr(entry.handler))
                 logger.error("AsyncEventBus: handler %s failed on %s: %s",
-                             name, type(event).__name__, exc)
+                             name, type(event).__name__, exc, exc_info=True)
+                self._record_dead_letter(event, name, exc)
+
+    # ------------------------------------------------------------------
+    # Dead letter queue (HIGH-011)
+    # ------------------------------------------------------------------
+
+    def _record_dead_letter(self, event: BaseEvent, handler_name: str, exc: Exception) -> None:
+        """Record a failed event dispatch for later inspection."""
+        entry = {
+            "event_type": type(event).__name__,
+            "event": event,
+            "handler": handler_name,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "timestamp": now_et(),
+        }
+        with self._lock:
+            self._dead_letters.append(entry)
+            if len(self._dead_letters) > self._max_dead_letters:
+                self._dead_letters = self._dead_letters[-self._max_dead_letters:]
+
+    def get_dead_letters(self, limit: int = 50) -> list[dict]:
+        """Return recent dead letter entries."""
+        with self._lock:
+            return list(self._dead_letters[-limit:])
 
     # ------------------------------------------------------------------
     # History / introspection
@@ -314,6 +343,7 @@ class AsyncEventBus:
                     for et, handlers in self._handlers.items()
                 },
                 "wildcard_subscribers": len(self._wildcard_handlers),
+                "dead_letters": len(self._dead_letters),
             }
 
 

@@ -43,7 +43,7 @@ class TestScaledTP:
             mock_snap.latest_trade.price = 102.0
 
             with patch("data.get_snapshot", return_value=mock_snap), \
-                 patch("execution.get_trading_client") as mock_client:
+                 patch("execution.core.get_trading_client") as mock_client:
                 mock_client.return_value.close_position.return_value = True
                 actions = em.check_exits(rm, now)
 
@@ -73,7 +73,7 @@ class TestScaledTP:
             mock_snap.latest_trade.price = 104.0
 
             with patch("data.get_snapshot", return_value=mock_snap), \
-                 patch("execution.get_trading_client") as mock_client:
+                 patch("execution.core.get_trading_client") as mock_client:
                 mock_client.return_value.close_position.return_value = True
                 actions = em.check_exits(rm, now)
 

@@ -20,6 +20,14 @@ from strategies.base import Signal
 
 logger = logging.getLogger(__name__)
 
+# WIRE-004: Order book imbalance confirmation (fail-open)
+_order_book_analyzer = None
+try:
+    from microstructure.order_book import OrderBookAnalyzer as _OBA
+    _order_book_analyzer = _OBA()
+except ImportError:
+    _OBA = None
+
 
 # Beta table — sourced from config for tunability
 STOCK_BETAS = config.MICRO_BETA_TABLE
@@ -168,6 +176,25 @@ class IntradayMicroMomentum:
                     stop_loss = price * (1 + config.MICRO_STOP_PCT)
                     take_profit = price * (1 - config.MICRO_TARGET_PCT)
                     side = "sell"
+
+                # WIRE-004: Order book imbalance confirmation (fail-open)
+                # Skip signal if imbalance contradicts trade direction
+                _imbalance_ok = True
+                try:
+                    if _order_book_analyzer is not None:
+                        imb = _order_book_analyzer.get_rolling_imbalance(symbol)
+                        # For buys, require non-negative imbalance; for sells, non-positive
+                        if side == "buy" and imb < -0.3:
+                            _imbalance_ok = False
+                            logger.debug("WIRE-004: %s buy skipped — order book imbalance %.2f", symbol, imb)
+                        elif side == "sell" and imb > 0.3:
+                            _imbalance_ok = False
+                            logger.debug("WIRE-004: %s sell skipped — order book imbalance %.2f", symbol, imb)
+                except Exception as _e:
+                    logger.debug("WIRE-004: Order book check failed for %s (fail-open): %s", symbol, _e)
+
+                if not _imbalance_ok:
+                    continue
 
                 signals.append(Signal(
                     symbol=symbol,

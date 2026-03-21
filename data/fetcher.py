@@ -110,6 +110,41 @@ def get_bars(symbol: str, timeframe: TimeFrame, start: datetime, end: datetime |
     return df
 
 
+def get_bars_multi(symbols: list[str], timeframe: TimeFrame, start: datetime,
+                   end: datetime | None = None, max_workers: int = 5) -> dict[str, pd.DataFrame]:
+    """MED-036: Fetch bars for multiple symbols concurrently using ThreadPoolExecutor.
+
+    Args:
+        symbols: List of ticker symbols.
+        timeframe: Alpaca TimeFrame.
+        start: Start datetime.
+        end: Optional end datetime.
+        max_workers: Max concurrent threads (default 5 to stay within API rate limits).
+
+    Returns:
+        Dict mapping symbol -> DataFrame of bars.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results: dict[str, pd.DataFrame] = {}
+
+    def _fetch_one(sym: str) -> tuple[str, pd.DataFrame]:
+        return sym, get_bars(sym, timeframe, start=start, end=end)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_one, sym): sym for sym in symbols}
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                sym, df = future.result()
+                results[sym] = df
+            except Exception as e:
+                logger.warning(f"Failed to fetch bars for {sym}: {e}")
+                results[sym] = pd.DataFrame()
+
+    return results
+
+
 def get_daily_bars(symbol: str, days: int = 30) -> pd.DataFrame:
     """Get daily bars for the last N days."""
     start = datetime.now(config.ET) - timedelta(days=days + 5)  # buffer for weekends

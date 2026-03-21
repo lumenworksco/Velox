@@ -106,6 +106,20 @@ class _RateLimiter:
             else:
                 self._last_sent.clear()
 
+    def cleanup_expired(self, max_age_sec: float = 3600.0):
+        """MED-025: Remove stale suppression entries older than max_age_sec.
+
+        Prevents the _last_sent dict from growing unboundedly and ensures
+        alert suppression doesn't persist forever.
+        """
+        now = time.monotonic()
+        with self._lock:
+            expired = [k for k, ts in self._last_sent.items() if now - ts > max_age_sec]
+            for k in expired:
+                del self._last_sent[k]
+            if expired:
+                logger.debug("Rate limiter: cleaned up %d expired suppression entries", len(expired))
+
 
 # Rate limit intervals by level (seconds)
 _RATE_LIMITS = {
@@ -259,6 +273,9 @@ class AlertManager:
 
     def _send_inner(self, level: str | AlertLevel, message: str, source: str) -> Alert:
         """Core alert processing pipeline."""
+        # MED-025: Periodically clean up expired suppression entries
+        self._rate_limiter.cleanup_expired(max_age_sec=3600.0)
+
         # Normalize level
         if isinstance(level, str):
             level_enum = {

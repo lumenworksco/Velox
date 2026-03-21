@@ -1,10 +1,17 @@
-"""SQLite database — replaces state.json for persistence and adds trade/signal logging."""
+"""SQLite database — replaces state.json for persistence and adds trade/signal logging.
+
+PROD-005: Schema versioning with auto-migration framework.
+PROD-009: Connection pooling via queue-based pattern.
+"""
 
 import json
 import logging
+import queue
 import sqlite3
+import threading
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import config
 from tz_utils import ensure_et
@@ -24,10 +31,122 @@ def _to_iso(dt) -> str | None:
         return ensure_et(dt).isoformat()
     return str(dt)
 
-import threading
 
+# HIGH-013: RLock allows re-entrant locking for nested read-modify-write cycles
+_db_lock = threading.RLock()
+
+
+# =============================================================================
+# PROD-009: Connection Pool
+# =============================================================================
+
+class ConnectionPool:
+    """PROD-009: Queue-based SQLite connection pool.
+
+    Maintains a pool of pre-created connections to reduce connection overhead.
+    Connections are borrowed via `get()` and returned via `put()`, or used
+    as a context manager.
+
+    Note: SQLite has limited concurrency (WAL mode helps), so pool_size
+    should be kept small (default 3).
+    """
+
+    def __init__(self, db_path: str, pool_size: int = 3):
+        """Initialize the connection pool.
+
+        Args:
+            db_path: Path to the SQLite database file.
+            pool_size: Number of connections to maintain in the pool.
+        """
+        self._db_path = db_path
+        self._pool_size = pool_size
+        self._pool: queue.Queue[sqlite3.Connection] = queue.Queue(maxsize=pool_size)
+        self._lock = threading.Lock()
+        self._created = 0
+
+        # Pre-populate the pool
+        for _ in range(pool_size):
+            conn = self._create_connection()
+            self._pool.put(conn)
+            self._created += 1
+
+        logger.info("PROD-009: ConnectionPool initialized (size=%d, db=%s)", pool_size, db_path)
+
+    def _create_connection(self) -> sqlite3.Connection:
+        """Create a new SQLite connection with standard pragmas."""
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        return conn
+
+    def get(self, timeout: float = 5.0) -> sqlite3.Connection:
+        """Borrow a connection from the pool.
+
+        Args:
+            timeout: Max seconds to wait for an available connection.
+
+        Returns:
+            A SQLite connection.
+
+        Raises:
+            queue.Empty: If no connection is available within timeout.
+        """
+        try:
+            return self._pool.get(timeout=timeout)
+        except queue.Empty:
+            logger.warning("PROD-009: Connection pool exhausted, creating overflow connection")
+            return self._create_connection()
+
+    def put(self, conn: sqlite3.Connection):
+        """Return a connection to the pool."""
+        try:
+            self._pool.put_nowait(conn)
+        except queue.Full:
+            # Overflow connection — close it
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def close_all(self):
+        """Close all connections in the pool."""
+        while not self._pool.empty():
+            try:
+                conn = self._pool.get_nowait()
+                conn.close()
+            except (queue.Empty, Exception):
+                break
+        logger.info("PROD-009: Connection pool closed")
+
+    def stats(self) -> dict:
+        """Return pool statistics."""
+        return {
+            "pool_size": self._pool_size,
+            "available": self._pool.qsize(),
+            "created": self._created,
+            "db_path": self._db_path,
+        }
+
+
+# Module-level pool (initialized lazily)
+_connection_pool: Optional[ConnectionPool] = None
+_pool_lock = threading.Lock()
+
+
+def get_connection_pool() -> ConnectionPool:
+    """Get or create the global connection pool singleton."""
+    global _connection_pool
+    with _pool_lock:
+        if _connection_pool is None:
+            pool_size = int(getattr(config, "DB_POOL_SIZE", 3))
+            _connection_pool = ConnectionPool(config.DB_FILE, pool_size=pool_size)
+    return _connection_pool
+
+
+# Legacy single-connection support (backward compatible)
 _conn: sqlite3.Connection | None = None
-_db_lock = threading.Lock()
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -35,9 +154,108 @@ def _get_conn() -> sqlite3.Connection:
     if _conn is None:
         _conn = sqlite3.connect(config.DB_FILE, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
+        _conn.execute("PRAGMA busy_timeout = 5000")
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA synchronous=FULL")
     return _conn
+
+
+# =============================================================================
+# PROD-005: Schema Versioning & Migration Framework
+# =============================================================================
+
+# Current schema version — bump this when adding a new migration
+CURRENT_SCHEMA_VERSION = 1
+
+
+def _ensure_schema_version_table(conn: sqlite3.Connection):
+    """Create the schema_version table if it doesn't exist."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL,
+            description TEXT
+        )
+    """)
+    conn.commit()
+
+
+def _get_schema_version(conn: sqlite3.Connection) -> int:
+    """Get the current schema version from the database. Returns 0 if no migrations applied."""
+    _ensure_schema_version_table(conn)
+    row = conn.execute("SELECT MAX(version) as v FROM schema_version").fetchone()
+    return row["v"] if row and row["v"] is not None else 0
+
+
+def _record_migration(conn: sqlite3.Connection, version: int, description: str):
+    """Record that a migration was applied."""
+    conn.execute(
+        "INSERT INTO schema_version (version, applied_at, description) VALUES (?, ?, ?)",
+        (version, datetime.now(config.ET).isoformat(), description),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Migration functions — add new migrations here as `_migrate_N(conn)`
+# ---------------------------------------------------------------------------
+
+def _migrate_1(conn: sqlite3.Connection):
+    """Migration 1: Add schema_version tracking (baseline).
+
+    This is the initial migration that establishes the versioning system.
+    All existing tables are considered part of version 0 (pre-versioning).
+    """
+    # No schema changes needed — the schema_version table is created by
+    # _ensure_schema_version_table(). This migration just marks the baseline.
+    logger.info("PROD-005: Migration 1 applied — schema versioning baseline established")
+
+
+# Registry of all migrations: version -> (function, description)
+_MIGRATIONS: dict[int, tuple] = {
+    1: (_migrate_1, "Baseline schema versioning"),
+}
+
+
+def run_migrations():
+    """PROD-005: Check schema version and auto-run any pending migrations.
+
+    Call this after init_db() during startup. Migrations run in order and
+    each is recorded in the schema_version table.
+    """
+    conn = _get_conn()
+    _ensure_schema_version_table(conn)
+    current = _get_schema_version(conn)
+
+    if current >= CURRENT_SCHEMA_VERSION:
+        logger.debug("PROD-005: Schema is up to date (version=%d)", current)
+        return
+
+    pending = {v: m for v, m in _MIGRATIONS.items() if v > current}
+    if not pending:
+        return
+
+    logger.info(
+        "PROD-005: Running %d pending migration(s) (current=%d, target=%d)",
+        len(pending), current, CURRENT_SCHEMA_VERSION,
+    )
+
+    for version in sorted(pending.keys()):
+        migrate_fn, description = pending[version]
+        try:
+            logger.info("PROD-005: Applying migration %d: %s", version, description)
+            migrate_fn(conn)
+            _record_migration(conn, version, description)
+            logger.info("PROD-005: Migration %d applied successfully", version)
+        except Exception as e:
+            logger.error("PROD-005: Migration %d failed: %s", version, e)
+            raise RuntimeError(
+                f"Schema migration {version} failed: {e}. "
+                f"Database may be in an inconsistent state."
+            ) from e
+
+    final = _get_schema_version(conn)
+    logger.info("PROD-005: All migrations complete (version=%d)", final)
 
 
 def init_db():
@@ -278,9 +496,9 @@ def init_db():
     conn.commit()
 
     # V4+V10: Add new columns to open_positions if they don't exist (migration)
-    # V10 BUG-045: Use BEGIN EXCLUSIVE for thread-safe migration
+    # CRIT-016: Use BEGIN IMMEDIATE instead of BEGIN EXCLUSIVE to avoid deadlock
     try:
-        conn.execute("BEGIN EXCLUSIVE")
+        conn.execute("BEGIN IMMEDIATE")
         cursor = conn.execute("PRAGMA table_info(open_positions)")
         existing_cols = {row["name"] for row in cursor.fetchall()}
         v4_cols = {
@@ -296,6 +514,7 @@ def init_db():
                 logger.info(f"Added column {col} to open_positions")
         conn.execute("COMMIT")
     except Exception as e:
+        conn.execute("ROLLBACK")
         logger.warning(f"V4 schema migration note: {e}")
 
     # V10: Migrate event_log if old schema (from OMS SQLAlchemy) exists
@@ -341,7 +560,7 @@ def log_trade(symbol: str, strategy: str, side: str, entry_price: float,
            qty, entry_time, exit_time, exit_reason, pnl, pnl_pct)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (symbol, strategy, side, entry_price, exit_price, qty,
-         entry_time.isoformat(), exit_time.isoformat(), exit_reason, pnl, pnl_pct),
+         _to_iso(entry_time), _to_iso(exit_time), exit_reason, pnl, pnl_pct),
     )
     conn.commit()
 
@@ -355,7 +574,7 @@ def log_signal(timestamp: datetime, symbol: str, strategy: str,
     conn.execute(
         """INSERT INTO signals (timestamp, symbol, strategy, signal_type,
            acted_on, skip_reason) VALUES (?, ?, ?, ?, ?, ?)""",
-        (timestamp.isoformat(), symbol, strategy, signal_type,
+        (_to_iso(timestamp), symbol, strategy, signal_type,
          1 if acted_on else 0, skip_reason),
     )
     conn.commit()
@@ -724,30 +943,34 @@ def get_open_shadow_trades():
 
 
 def close_shadow_trade(trade_id, exit_price, exit_time, exit_reason):
-    """Close a shadow trade with simulated exit."""
+    """Close a shadow trade with simulated exit.
+
+    HIGH-013: Lock covers full read-modify-write cycle.
+    """
     conn = _get_conn()
-    row = conn.execute(
-        "SELECT entry_price, qty, side FROM shadow_trades WHERE id = ?",
-        (trade_id,)
-    ).fetchone()
-    if not row:
-        return
-    entry_price, qty, side = row["entry_price"], row["qty"], row["side"]
-    if side == "buy":
-        pnl = (exit_price - entry_price) * qty
-        pnl_pct = (exit_price - entry_price) / entry_price if entry_price else 0
-    else:
-        pnl = (entry_price - exit_price) * qty
-        pnl_pct = (entry_price - exit_price) / entry_price if entry_price else 0
-    conn.execute(
-        """UPDATE shadow_trades
-           SET exit_price = ?, exit_time = ?, exit_reason = ?, pnl = ?, pnl_pct = ?
-           WHERE id = ?""",
-        (exit_price,
-         exit_time.isoformat() if hasattr(exit_time, 'isoformat') else str(exit_time),
-         exit_reason, round(pnl, 2), round(pnl_pct, 4), trade_id),
-    )
-    conn.commit()
+    with _db_lock:
+        row = conn.execute(
+            "SELECT entry_price, qty, side FROM shadow_trades WHERE id = ?",
+            (trade_id,)
+        ).fetchone()
+        if not row:
+            return
+        entry_price, qty, side = row["entry_price"], row["qty"], row["side"]
+        if side == "buy":
+            pnl = (exit_price - entry_price) * qty
+            pnl_pct = (exit_price - entry_price) / entry_price if entry_price else 0
+        else:
+            pnl = (entry_price - exit_price) * qty
+            pnl_pct = (entry_price - exit_price) / entry_price if entry_price else 0
+        conn.execute(
+            """UPDATE shadow_trades
+               SET exit_price = ?, exit_time = ?, exit_reason = ?, pnl = ?, pnl_pct = ?
+               WHERE id = ?""",
+            (exit_price,
+             exit_time.isoformat() if hasattr(exit_time, 'isoformat') else str(exit_time),
+             exit_reason, round(pnl, 2), round(pnl_pct, 4), trade_id),
+        )
+        conn.commit()
 
 
 def get_shadow_performance(strategy=None, days=14):
@@ -852,34 +1075,38 @@ def get_mr_universe(date: str) -> list[dict]:
 def save_kalman_pair(symbol1: str, symbol2: str, hedge_ratio: float,
                      spread_mean: float, spread_std: float, correlation: float,
                      coint_pvalue: float, half_life: float, sector_group: str):
-    """Save or update a Kalman pair."""
+    """Save or update a Kalman pair.
+
+    HIGH-013: Lock covers full read-modify-write cycle to prevent races.
+    """
     conn = _get_conn()
-    # Check if pair exists
-    existing = conn.execute(
-        "SELECT id FROM kalman_pairs WHERE symbol1 = ? AND symbol2 = ? AND active = 1",
-        (symbol1, symbol2),
-    ).fetchone()
+    with _db_lock:
+        # Check if pair exists
+        existing = conn.execute(
+            "SELECT id FROM kalman_pairs WHERE symbol1 = ? AND symbol2 = ? AND active = 1",
+            (symbol1, symbol2),
+        ).fetchone()
 
-    now_str = _to_iso(datetime.now(config.ET))  # V10 BUG-044: timezone-aware
+        now_str = _to_iso(datetime.now(config.ET))  # V10 BUG-044: timezone-aware
 
-    if existing:
-        conn.execute(
-            """UPDATE kalman_pairs SET hedge_ratio=?, spread_mean=?, spread_std=?,
-               correlation=?, coint_pvalue=?, half_life=?, sector_group=?,
-               last_updated=? WHERE id=?""",
-            (hedge_ratio, spread_mean, spread_std, correlation, coint_pvalue,
-             half_life, sector_group, now_str, existing['id']),
-        )
-    else:
-        conn.execute(
-            """INSERT INTO kalman_pairs
-               (symbol1, symbol2, hedge_ratio, spread_mean, spread_std,
-                correlation, coint_pvalue, half_life, sector_group, last_updated)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (symbol1, symbol2, hedge_ratio, spread_mean, spread_std,
-             correlation, coint_pvalue, half_life, sector_group, now_str),
-        )
-    conn.commit()
+        if existing:
+            conn.execute(
+                """UPDATE kalman_pairs SET hedge_ratio=?, spread_mean=?, spread_std=?,
+                   correlation=?, coint_pvalue=?, half_life=?, sector_group=?,
+                   last_updated=? WHERE id=?""",
+                (hedge_ratio, spread_mean, spread_std, correlation, coint_pvalue,
+                 half_life, sector_group, now_str, existing['id']),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO kalman_pairs
+                   (symbol1, symbol2, hedge_ratio, spread_mean, spread_std,
+                    correlation, coint_pvalue, half_life, sector_group, last_updated)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (symbol1, symbol2, hedge_ratio, spread_mean, spread_std,
+                 correlation, coint_pvalue, half_life, sector_group, now_str),
+            )
+        conn.commit()
 
 
 def get_active_kalman_pairs() -> list[dict]:
@@ -1072,3 +1299,53 @@ def get_event_log(event_type: str | None = None, limit: int = 100) -> list[dict]
             (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# =============================================================================
+# MED-038: Batch insert helper (uses executemany for performance)
+# =============================================================================
+
+def batch_insert(table: str, columns: list[str], rows: list[tuple]):
+    """Insert multiple rows at once using executemany for better performance.
+
+    Args:
+        table: Table name.
+        columns: List of column names.
+        rows: List of tuples, each tuple is one row of values.
+
+    Example:
+        batch_insert("trades", ["symbol", "strategy", "pnl"],
+                      [("AAPL", "STAT_MR", 42.0), ("MSFT", "VWAP", -10.0)])
+    """
+    if not rows:
+        return
+    conn = _get_conn()
+    placeholders = ", ".join("?" for _ in columns)
+    col_str = ", ".join(columns)
+    sql = f"INSERT INTO {table} ({col_str}) VALUES ({placeholders})"
+    with _db_lock:
+        conn.executemany(sql, rows)
+        conn.commit()
+    logger.debug(f"Batch inserted {len(rows)} rows into {table}")
+
+
+def batch_log_trades(trades: list[dict]):
+    """MED-038: Batch-insert multiple trade records at once.
+
+    Each dict should have keys: symbol, strategy, side, entry_price, exit_price,
+    qty, entry_time, exit_time, exit_reason, pnl, pnl_pct.
+    """
+    columns = ["symbol", "strategy", "side", "entry_price", "exit_price",
+               "qty", "entry_time", "exit_time", "exit_reason", "pnl", "pnl_pct"]
+    rows = []
+    for t in trades:
+        entry_time = t.get("entry_time")
+        exit_time = t.get("exit_time")
+        rows.append((
+            t["symbol"], t["strategy"], t["side"],
+            t["entry_price"], t["exit_price"], t["qty"],
+            entry_time.isoformat() if hasattr(entry_time, 'isoformat') else str(entry_time),
+            exit_time.isoformat() if hasattr(exit_time, 'isoformat') else str(exit_time),
+            t.get("exit_reason", ""), t["pnl"], t["pnl_pct"],
+        ))
+    batch_insert("trades", columns, rows)

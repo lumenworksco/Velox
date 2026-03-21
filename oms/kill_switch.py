@@ -1,6 +1,7 @@
 """V10 OMS — Emergency kill switch: cancel all orders + close all positions."""
 
 import logging
+import time as _time
 from datetime import datetime
 
 import config
@@ -8,6 +9,10 @@ import config
 from engine.event_log import log_event, EventType
 
 logger = logging.getLogger(__name__)
+
+# MED-031: Batch size and delay for position closes to avoid API rate limits
+KILL_SWITCH_BATCH_SIZE = getattr(config, "KILL_SWITCH_BATCH_SIZE", 5)
+KILL_SWITCH_BATCH_DELAY_SEC = getattr(config, "KILL_SWITCH_BATCH_DELAY_SEC", 0.5)
 
 
 class KillSwitch:
@@ -48,24 +53,30 @@ class KillSwitch:
             cancelled = order_manager.cancel_all()
             logger.info(f"Kill switch: cancelled {len(cancelled)} orders")
 
-        # 2. Close all positions via broker
+        # 2. Close all positions via broker (MED-031: batch to avoid API rate limits)
         failed_closes = []
         if risk_manager:
             from execution import close_position
-            for symbol in list(risk_manager.open_trades.keys()):
-                try:
-                    close_position(symbol, reason="kill_switch")
-                    trade = risk_manager.open_trades.get(symbol)
-                    if trade:
-                        risk_manager.close_trade(
-                            symbol, trade.entry_price,
-                            datetime.now(config.ET),
-                            exit_reason="kill_switch",
-                        )
-                    logger.info(f"Kill switch: closed {symbol}")
-                except Exception as e:
-                    failed_closes.append(symbol)
-                    logger.error(f"Kill switch: failed to close {symbol}: {e}")
+            symbols = list(risk_manager.open_trades.keys())
+            for batch_start in range(0, len(symbols), KILL_SWITCH_BATCH_SIZE):
+                batch = symbols[batch_start:batch_start + KILL_SWITCH_BATCH_SIZE]
+                for symbol in batch:
+                    try:
+                        close_position(symbol, reason="kill_switch")
+                        trade = risk_manager.open_trades.get(symbol)
+                        if trade:
+                            risk_manager.close_trade(
+                                symbol, trade.entry_price,
+                                datetime.now(config.ET),
+                                exit_reason="kill_switch",
+                            )
+                        logger.info(f"Kill switch: closed {symbol}")
+                    except Exception as e:
+                        failed_closes.append(symbol)
+                        logger.error(f"Kill switch: failed to close {symbol}: {e}")
+                # Sleep between batches to avoid API rate limits (skip after last batch)
+                if batch_start + KILL_SWITCH_BATCH_SIZE < len(symbols):
+                    _time.sleep(KILL_SWITCH_BATCH_DELAY_SEC)
 
             if failed_closes:
                 logger.critical(

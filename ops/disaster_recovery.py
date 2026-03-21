@@ -592,6 +592,243 @@ class DisasterRecovery:
                 sha256.update(chunk)
         return sha256.hexdigest()
 
+    # ------------------------------------------------------------------ #
+    #  IMPL-004: Config backup, DB integrity validation, restore from backup
+    # ------------------------------------------------------------------ #
+
+    def save_config_snapshot(self, config_module: Any = None) -> str:
+        """Save a snapshot of the current configuration to disk.
+
+        Captures all non-private, non-callable config attributes and writes
+        them as JSON to the backup directory with a timestamp.
+
+        Args:
+            config_module: The config module (import config). If None, attempts
+                to import it.
+
+        Returns:
+            Path to the saved config snapshot file.
+        """
+        if config_module is None:
+            try:
+                import config as config_module
+            except ImportError:
+                raise RuntimeError("Cannot import config module for snapshot")
+
+        # Extract serializable config values
+        snapshot = {}
+        for attr_name in dir(config_module):
+            if attr_name.startswith("_"):
+                continue
+            val = getattr(config_module, attr_name)
+            if callable(val) and not isinstance(val, (int, float, str, bool)):
+                continue
+            # Only include JSON-serializable types
+            if isinstance(val, (str, int, float, bool, type(None))):
+                snapshot[attr_name] = val
+            elif isinstance(val, (list, tuple)):
+                try:
+                    json.dumps(val)
+                    snapshot[attr_name] = val
+                except (TypeError, ValueError):
+                    snapshot[attr_name] = str(val)
+            elif isinstance(val, dict):
+                try:
+                    json.dumps(val)
+                    snapshot[attr_name] = val
+                except (TypeError, ValueError):
+                    snapshot[attr_name] = str(val)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        snapshot_path = self.backup_dir / f"config_snapshot_{timestamp}.json"
+
+        with open(snapshot_path, "w") as f:
+            json.dump(snapshot, f, indent=2, default=str)
+
+        logger.info(f"Config snapshot saved: {snapshot_path} ({len(snapshot)} keys)")
+        return str(snapshot_path)
+
+    def validate_db_integrity(self, db_path: str) -> Dict[str, Any]:
+        """Validate SQLite database integrity.
+
+        Runs SQLite's built-in integrity check and verifies that key tables
+        exist and are queryable. Returns a report dict.
+
+        Args:
+            db_path: Path to the SQLite database file.
+
+        Returns:
+            Dict with keys: ok (bool), integrity_check (str), tables (list),
+            row_counts (dict), errors (list).
+        """
+        result = {
+            "ok": False,
+            "integrity_check": "NOT_RUN",
+            "tables": [],
+            "row_counts": {},
+            "errors": [],
+        }
+
+        source = Path(db_path)
+        if not source.exists():
+            result["errors"].append(f"Database file not found: {db_path}")
+            return result
+
+        conn = None
+        try:
+            conn = sqlite3.connect(str(source))
+            cursor = conn.cursor()
+
+            # 1. Run PRAGMA integrity_check
+            cursor.execute("PRAGMA integrity_check")
+            integrity = cursor.fetchone()
+            result["integrity_check"] = integrity[0] if integrity else "UNKNOWN"
+
+            if result["integrity_check"] != "ok":
+                result["errors"].append(
+                    f"Integrity check failed: {result['integrity_check']}"
+                )
+
+            # 2. List all tables
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            )
+            tables = [row[0] for row in cursor.fetchall()]
+            result["tables"] = tables
+
+            # 3. Row counts for each table
+            for table in tables:
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM [{table}]")
+                    count = cursor.fetchone()[0]
+                    result["row_counts"][table] = count
+                except Exception as e:
+                    result["errors"].append(f"Cannot query table {table}: {e}")
+
+            # 4. Check required tables exist
+            required_tables = {"trades", "positions"}
+            missing = required_tables - set(tables)
+            if missing:
+                result["errors"].append(f"Missing required tables: {missing}")
+
+            result["ok"] = (
+                result["integrity_check"] == "ok"
+                and len(result["errors"]) == 0
+            )
+
+        except Exception as e:
+            result["errors"].append(f"Database connection failed: {e}")
+            logger.error(f"DB integrity validation error: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+        log_fn = logger.info if result["ok"] else logger.warning
+        log_fn(
+            f"DB integrity check: {'PASS' if result['ok'] else 'FAIL'} "
+            f"({len(result['tables'])} tables, {len(result['errors'])} errors)"
+        )
+        return result
+
+    def restore_from_backup(
+        self, db_path: str, backup_path: Optional[str] = None
+    ) -> bool:
+        """Restore the database from a backup.
+
+        If backup_path is not specified, uses the most recent backup.
+        Validates the backup's integrity before restoring. The current
+        (potentially corrupted) database is moved aside as .corrupt.
+
+        Args:
+            db_path: Path to the database file to restore.
+            backup_path: Optional specific backup to restore from. If None,
+                uses the most recent backup in the backup directory.
+
+        Returns:
+            True if restore succeeded, False otherwise.
+        """
+        target = Path(db_path)
+
+        # Find backup to restore from
+        if backup_path is None:
+            # Use most recent backup
+            backups = sorted(
+                self.backup_dir.glob("*.db"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if not backups:
+                logger.error("No backups found for restore")
+                return False
+            backup_source = backups[0]
+        else:
+            backup_source = Path(backup_path)
+
+        if not backup_source.exists():
+            logger.error(f"Backup file not found: {backup_source}")
+            return False
+
+        # Validate backup integrity before restoring
+        logger.info(f"Validating backup before restore: {backup_source}")
+        validation = self.validate_db_integrity(str(backup_source))
+        if not validation["ok"]:
+            logger.error(
+                f"Backup integrity check failed: {validation['errors']}. "
+                f"Skipping this backup."
+            )
+            return False
+
+        # Verify checksum if metadata exists
+        meta_path = backup_source.with_suffix(".meta.json")
+        if meta_path.exists():
+            try:
+                with open(meta_path, "r") as f:
+                    meta = json.load(f)
+                expected_checksum = meta.get("checksum_sha256", "")
+                actual_checksum = self._file_checksum(backup_source)
+                if expected_checksum and expected_checksum != actual_checksum:
+                    logger.error(
+                        f"Backup checksum mismatch: expected={expected_checksum[:12]}..., "
+                        f"actual={actual_checksum[:12]}..."
+                    )
+                    return False
+            except Exception as e:
+                logger.warning(f"Could not verify backup checksum: {e}")
+
+        try:
+            # Move current (corrupt) DB aside
+            if target.exists():
+                corrupt_path = target.with_suffix(".corrupt")
+                # If a .corrupt file already exists, remove it
+                if corrupt_path.exists():
+                    corrupt_path.unlink()
+                target.rename(corrupt_path)
+                logger.info(f"Moved corrupt DB to {corrupt_path}")
+
+            # Restore via SQLite backup API for safety
+            src_conn = sqlite3.connect(str(backup_source))
+            dst_conn = sqlite3.connect(str(target))
+            with dst_conn:
+                src_conn.backup(dst_conn)
+            src_conn.close()
+            dst_conn.close()
+
+            # Final validation of restored DB
+            final_check = self.validate_db_integrity(str(target))
+            if not final_check["ok"]:
+                logger.error("Restored DB failed integrity check!")
+                return False
+
+            logger.info(
+                f"Database restored from {backup_source} "
+                f"({final_check['row_counts']})"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"Restore failed: {e}", exc_info=True)
+            return False
+
     def get_status(self) -> Dict[str, Any]:
         """Get current disaster recovery system status."""
         heartbeat_ok = self.check_heartbeat()

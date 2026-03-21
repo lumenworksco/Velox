@@ -64,25 +64,36 @@ class KalmanPairsTrader:
 
         all_candidates = []
 
+        # MED-039: Collect all pairs to test, then run cointegration tests in parallel
+        all_pairs_to_test: list[tuple[str, str, str]] = []  # (sym1, sym2, group_name)
         for group_name, members in config.SECTOR_GROUPS.items():
-            # Handle ETF pairs (already tuples)
             if group_name == 'etf_pairs':
-                pairs_to_test = members  # Already (sym1, sym2) tuples
+                pairs_to_test = members
             else:
-                # Generate all pairs within group
                 pairs_to_test = [
                     (members[i], members[j])
                     for i in range(len(members))
                     for j in range(i + 1, len(members))
                 ]
-
             for sym1, sym2 in pairs_to_test:
-                try:
-                    result = self._test_pair(sym1, sym2, group_name)
-                    if result:
-                        all_candidates.append(result)
-                except Exception as e:
-                    logger.debug(f"Pair test error {sym1}/{sym2}: {e}")
+                all_pairs_to_test.append((sym1, sym2, group_name))
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _test_one(args: tuple[str, str, str]) -> dict | None:
+            sym1, sym2, group = args
+            try:
+                return self._test_pair(sym1, sym2, group)
+            except Exception as e:
+                logger.debug(f"Pair test error {sym1}/{sym2}: {e}")
+                return None
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {executor.submit(_test_one, p): p for p in all_pairs_to_test}
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    all_candidates.append(result)
 
         # Sort by cointegration quality (low p-value)
         all_candidates.sort(key=lambda c: c['coint_pvalue'])
@@ -96,17 +107,37 @@ class KalmanPairsTrader:
                 f"Non-finite hedge_ratio for {pair['symbol1']}/{pair['symbol2']}: {hedge_ratio}"
             )
 
-            # Initialize Kalman state
+            # IMPL-009: Fit OU parameters via MLE for each selected pair
+            spread = pair.get('_spread')
+            ou_params = {}
+            if spread is not None and len(spread) >= 10:
+                ou_params = self._fit_ou_parameters(spread)
+                logger.info(
+                    f"Pair {pair['symbol1']}/{pair['symbol2']} OU calibration: "
+                    f"theta={ou_params.get('theta', 0):.4f}, "
+                    f"mu={ou_params.get('mu', 0):.4f}, "
+                    f"sigma={ou_params.get('sigma', 0):.4f}, "
+                    f"half_life={ou_params.get('half_life', 0):.1f}d"
+                )
+
+            # Initialize Kalman state, using OU-calibrated spread stats if available
             pair_key = f"{pair['symbol1']}_{pair['symbol2']}"
             self.kalman_state[pair_key] = {
                 'theta': np.array([hedge_ratio, 0.0]),  # [hedge_ratio, intercept]
                 'P': np.eye(2) * 1.0,  # Covariance matrix
-                'spread_mean': pair['spread_mean'],
-                'spread_std': pair['spread_std'],
+                'spread_mean': ou_params.get('mu', pair['spread_mean']),
+                'spread_std': ou_params.get('sigma', pair['spread_std']) if ou_params.get('sigma', 0) > 0 else pair['spread_std'],
+                'ou_params': ou_params,  # Store full calibration for reference
             }
 
-            # Estimate half-life from spread autocorrelation
-            half_life = self._estimate_half_life(pair.get('_spread'))
+            # Use OU half-life if available, otherwise estimate from autocorrelation
+            half_life = ou_params.get('half_life', 0.0)
+            if half_life <= 0 or half_life > 100:
+                half_life = self._estimate_half_life(spread)
+
+            # Store calibration results in the pair dict for downstream use
+            pair['ou_params'] = ou_params
+            pair['half_life'] = half_life
 
             # Save to DB
             save_kalman_pair(
@@ -136,6 +167,100 @@ class KalmanPairsTrader:
         if beta >= 0:
             return 10.0  # Not mean-reverting, return max
         return max(1.0, -np.log(2) / beta)
+
+    @staticmethod
+    def _fit_ou_parameters(spread: np.ndarray) -> dict:
+        """Fit Ornstein-Uhlenbeck parameters to a spread series via MLE.
+
+        IMPL-009: Maximum Likelihood Estimation of OU process parameters:
+            dS = theta * (mu - S) * dt + sigma * dW
+
+        Parameters:
+            theta (kappa): Speed of mean reversion
+            mu: Long-run mean of the spread
+            sigma: Volatility of the spread
+
+        Also computes derived quantities:
+            half_life: -ln(2) / ln(1 - theta*dt)
+            equilibrium_variance: sigma^2 / (2 * theta)
+
+        Args:
+            spread: Array of spread values (log-prices or raw prices).
+
+        Returns:
+            Dict with keys: theta, mu, sigma, half_life, eq_variance, log_likelihood.
+        """
+        n = len(spread)
+        if n < 10:
+            return {
+                "theta": 0.0, "mu": 0.0, "sigma": 0.0,
+                "half_life": 10.0, "eq_variance": 0.0, "log_likelihood": 0.0,
+            }
+
+        dt = 1.0  # Daily frequency
+
+        # MLE for OU process (exact discrete-time formulation):
+        # S_{t+1} = a + b * S_t + eps, where eps ~ N(0, sigma_eps^2)
+        # a = mu * (1 - exp(-theta*dt))
+        # b = exp(-theta*dt)
+        # sigma_eps = sigma * sqrt((1 - exp(-2*theta*dt)) / (2*theta))
+
+        # OLS regression: S_{t+1} = a + b * S_t
+        s_t = spread[:-1]
+        s_tp1 = spread[1:]
+
+        n_obs = len(s_t)
+        if n_obs < 5:
+            return {
+                "theta": 0.0, "mu": float(np.mean(spread)), "sigma": float(np.std(spread)),
+                "half_life": 10.0, "eq_variance": 0.0, "log_likelihood": 0.0,
+            }
+
+        # Fit OLS: s_{t+1} = a + b * s_t
+        X = np.column_stack([np.ones(n_obs), s_t])
+        params = np.linalg.lstsq(X, s_tp1, rcond=None)[0]
+        a_hat = float(params[0])
+        b_hat = float(params[1])
+
+        # Residual variance
+        residuals = s_tp1 - (a_hat + b_hat * s_t)
+        sigma_eps_sq = float(np.var(residuals, ddof=2))
+
+        # Recover OU parameters from discrete-time estimates
+        if b_hat <= 0 or b_hat >= 1.0:
+            # Not mean-reverting or degenerate
+            theta = 0.0
+            mu = float(np.mean(spread))
+            sigma = float(np.std(spread))
+            half_life = 10.0
+        else:
+            theta = -np.log(b_hat) / dt
+            mu = a_hat / (1.0 - b_hat)
+            # sigma from sigma_eps: sigma_eps^2 = sigma^2 * (1 - exp(-2*theta*dt)) / (2*theta)
+            denom = (1.0 - np.exp(-2.0 * theta * dt)) / (2.0 * theta)
+            if denom > 0:
+                sigma = float(np.sqrt(sigma_eps_sq / denom))
+            else:
+                sigma = float(np.sqrt(sigma_eps_sq))
+            half_life = float(np.log(2) / theta) if theta > 0 else 10.0
+
+        # Equilibrium variance
+        eq_variance = (sigma ** 2) / (2.0 * theta) if theta > 0 else sigma ** 2
+
+        # Log-likelihood (Gaussian)
+        if sigma_eps_sq > 0:
+            log_lik = -0.5 * n_obs * (np.log(2 * np.pi * sigma_eps_sq) + 1.0)
+        else:
+            log_lik = 0.0
+
+        return {
+            "theta": round(float(theta), 6),
+            "mu": round(float(mu), 6),
+            "sigma": round(float(sigma), 6),
+            "half_life": round(float(half_life), 2),
+            "eq_variance": round(float(eq_variance), 6),
+            "log_likelihood": round(float(log_lik), 2),
+        }
 
     @staticmethod
     def _has_corporate_action(close: pd.Series, threshold: float = 0.20) -> bool:
@@ -256,6 +381,8 @@ class KalmanPairsTrader:
 
         # Update step
         theta = theta + K * e
+        # CRIT-010: Clip hedge ratio to prevent divergence
+        theta[0] = np.clip(theta[0], 0.1, 10.0)
         P = P - np.outer(K, x) @ P
 
         # V10: Enforce P symmetry and positive semi-definiteness

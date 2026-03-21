@@ -325,12 +325,93 @@ class PDTCompliance:
 
     @staticmethod
     def _is_business_day(d: date) -> bool:
-        """Check if a date is a business day (Mon-Fri, no major holidays).
+        """Check if a date is a NYSE trading day (weekday + not a market holiday).
 
-        Uses a simplified check: weekdays only.  For production, integrate
-        with a market calendar (e.g. exchange_calendars or pandas_market_calendars).
+        HIGH-004: Uses NYSE holiday calendar instead of basic weekday check.
+        Covers all standard NYSE closures: New Year's, MLK Day, Presidents' Day,
+        Good Friday, Memorial Day, Juneteenth, Independence Day, Labor Day,
+        Thanksgiving, Christmas.
         """
-        return d.weekday() < 5  # Monday=0, Friday=4
+        # Weekend check
+        if d.weekday() >= 5:
+            return False
+
+        year = d.year
+
+        # --- Fixed holidays (with Sat->Fri / Sun->Mon observed rules) ---
+        def _observed(holiday: date) -> date:
+            """Shift to nearest weekday if holiday falls on weekend."""
+            if holiday.weekday() == 5:  # Saturday -> Friday
+                return holiday - timedelta(days=1)
+            elif holiday.weekday() == 6:  # Sunday -> Monday
+                return holiday + timedelta(days=1)
+            return holiday
+
+        # New Year's Day — Jan 1
+        new_years = _observed(date(year, 1, 1))
+
+        # Juneteenth — Jun 19 (NYSE holiday since 2022)
+        juneteenth = _observed(date(year, 6, 19)) if year >= 2022 else None
+
+        # Independence Day — Jul 4
+        independence = _observed(date(year, 7, 4))
+
+        # Christmas — Dec 25
+        christmas = _observed(date(year, 12, 25))
+
+        fixed_holidays = {new_years, independence, christmas}
+        if juneteenth:
+            fixed_holidays.add(juneteenth)
+
+        # --- Floating holidays (Nth weekday of month) ---
+        def _nth_weekday(yr: int, month: int, weekday: int, n: int) -> date:
+            """Return the nth occurrence of weekday in given month/year."""
+            first = date(yr, month, 1)
+            # Days until first target weekday
+            delta = (weekday - first.weekday()) % 7
+            first_occ = first + timedelta(days=delta)
+            return first_occ + timedelta(weeks=n - 1)
+
+        # MLK Day — 3rd Monday in January
+        mlk = _nth_weekday(year, 1, 0, 3)
+
+        # Presidents' Day — 3rd Monday in February
+        presidents = _nth_weekday(year, 2, 0, 3)
+
+        # Memorial Day — last Monday in May
+        memorial = date(year, 5, 31)
+        while memorial.weekday() != 0:
+            memorial -= timedelta(days=1)
+
+        # Labor Day — 1st Monday in September
+        labor = _nth_weekday(year, 9, 0, 1)
+
+        # Thanksgiving — 4th Thursday in November
+        thanksgiving = _nth_weekday(year, 11, 3, 4)
+
+        floating_holidays = {mlk, presidents, memorial, labor, thanksgiving}
+
+        # --- Good Friday (Easter-based) ---
+        def _easter(yr: int) -> date:
+            """Compute Easter Sunday via the Anonymous Gregorian algorithm."""
+            a = yr % 19
+            b, c = divmod(yr, 100)
+            d, e = divmod(b, 4)
+            f = (b + 8) // 25
+            g = (b - f + 1) // 3
+            h = (19 * a + b - d - g + 15) % 30
+            i, k = divmod(c, 4)
+            l = (32 + 2 * e + 2 * i - h - k) % 7
+            m = (a + 11 * h + 22 * l) // 451
+            month = (h + l - 7 * m + 114) // 31
+            day = ((h + l - 7 * m + 114) % 31) + 1
+            return date(yr, month, day)
+
+        good_friday = _easter(year) - timedelta(days=2)
+
+        all_holidays = fixed_holidays | floating_holidays | {good_friday}
+
+        return d not in all_holidays
 
     def _count_trades_in_window(self, window_start: date, window_end: date) -> int:
         """Count day trades within the rolling window."""

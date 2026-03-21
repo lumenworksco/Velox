@@ -312,8 +312,9 @@ class TestRuntimeParams:
         import config
         config.set_param("test_key_abc", 99)
         assert config.get_param("test_key_abc") == 99
-        # Cleanup
-        config._runtime_params.pop("test_key_abc", None)
+        # Cleanup via config.settings (underscore names not exported by wildcard import)
+        import config.settings as _settings
+        _settings._runtime_params.pop("test_key_abc", None)
 
     def test_get_param_returns_none_default(self):
         """get_param default is None when not specified."""

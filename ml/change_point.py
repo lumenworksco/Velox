@@ -508,5 +508,207 @@ def detect_volatility_regime_change(
     return cp_probs, change_points
 
 
+# ---------------------------------------------------------------------------
+# COMP-012: O(1) Online BOCPD Extension
+# ---------------------------------------------------------------------------
+
+
+class OnlineBOCPD(BOCPD):
+    """BOCPD with O(1) amortised online updates that avoid reprocessing history.
+
+    Extends the base BOCPD with an efficient ``update_online()`` method that
+    maintains a compact running state.  Instead of storing the full history
+    of run-length distributions, it keeps only the current posterior and a
+    fixed-size summary of recent change-point activity.
+
+    Key differences from base ``update()``:
+        - Maintains a running exponential moving average of change-point
+          probability for smoother regime detection.
+        - Keeps a bounded circular buffer of recent cp probabilities.
+        - Provides ``get_regime_stability()`` — how long since the last
+          detected change-point, without scanning full history.
+
+    Parameters
+    ----------
+    hazard_lambda : float
+        Expected run length between change-points.
+    ema_alpha : float
+        Smoothing factor for the exponential moving average of change-point
+        probability.  Lower values = more smoothing.  Default 0.1.
+    buffer_size : int
+        Size of the circular buffer for recent cp probabilities.
+    **kwargs
+        Additional arguments passed to ``BOCPD.__init__``.
+
+    Usage:
+        detector = OnlineBOCPD(hazard_lambda=200)
+        for obs in streaming_data:
+            result = detector.update_online(obs)
+            if result["change_detected"]:
+                handle_regime_change()
+            print(result["ema_cp_prob"], result["steps_since_cp"])
+    """
+
+    def __init__(
+        self,
+        hazard_lambda: float = 100.0,
+        ema_alpha: float = 0.1,
+        buffer_size: int = 100,
+        **kwargs,
+    ) -> None:
+        super().__init__(hazard_lambda=hazard_lambda, **kwargs)
+
+        self._ema_alpha = ema_alpha
+        self._ema_cp_prob = 0.0
+        self._buffer_size = buffer_size
+        self._cp_buffer = np.zeros(buffer_size, dtype=np.float64)
+        self._buffer_idx = 0
+        self._buffer_count = 0
+        self._steps_since_cp = 0
+        self._last_cp_step = -1
+        self._total_steps = 0
+        self._online_threshold = 0.5
+
+    def update_online(
+        self,
+        observation: float,
+        threshold: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Process one observation with O(1) state maintenance.
+
+        This wraps the base ``update()`` and maintains additional running
+        state without reprocessing history.
+
+        Parameters
+        ----------
+        observation : float
+            New scalar observation.
+        threshold : float, optional
+            Detection threshold.  Defaults to 0.5.
+
+        Returns
+        -------
+        dict
+            Keys:
+            - ``cp_prob``: raw change-point probability at this step
+            - ``ema_cp_prob``: exponentially smoothed cp probability
+            - ``change_detected``: bool, whether cp_prob > threshold
+            - ``steps_since_cp``: steps since last detected change-point
+            - ``total_steps``: total observations processed
+            - ``map_run_length``: MAP estimate of current run length
+            - ``buffer_mean``: mean cp probability over recent buffer
+        """
+        if threshold is None:
+            threshold = self._online_threshold
+
+        # Core BOCPD update — O(max_run_length), amortised O(1) per step
+        cp_prob = self.update(observation)
+
+        # O(1) running state updates
+        self._total_steps += 1
+
+        # EMA update
+        self._ema_cp_prob = (
+            self._ema_alpha * cp_prob
+            + (1.0 - self._ema_alpha) * self._ema_cp_prob
+        )
+
+        # Circular buffer update
+        self._cp_buffer[self._buffer_idx] = cp_prob
+        self._buffer_idx = (self._buffer_idx + 1) % self._buffer_size
+        self._buffer_count = min(self._buffer_count + 1, self._buffer_size)
+
+        # Change-point tracking
+        detected = cp_prob > threshold
+        if detected:
+            self._steps_since_cp = 0
+            self._last_cp_step = self._total_steps
+        else:
+            self._steps_since_cp += 1
+
+        # Buffer mean (only over filled portion)
+        filled = self._cp_buffer[:self._buffer_count]
+        buffer_mean = float(filled.mean()) if self._buffer_count > 0 else 0.0
+
+        return {
+            "cp_prob": cp_prob,
+            "ema_cp_prob": self._ema_cp_prob,
+            "change_detected": detected,
+            "steps_since_cp": self._steps_since_cp,
+            "total_steps": self._total_steps,
+            "map_run_length": self.get_map_run_length(),
+            "buffer_mean": buffer_mean,
+        }
+
+    def get_regime_stability(self) -> float:
+        """Estimate regime stability as a score in [0, 1].
+
+        Higher values indicate a more stable regime (longer since last
+        change-point, lower recent cp probability).
+
+        Returns
+        -------
+        float
+            Stability score in [0, 1].
+        """
+        if self._total_steps == 0:
+            return 1.0
+
+        # Time decay: more steps since cp = more stable
+        time_factor = 1.0 - math.exp(-self._steps_since_cp / self.hazard_lambda)
+
+        # Low recent cp probability = more stable
+        prob_factor = 1.0 - min(self._ema_cp_prob * 2.0, 1.0)
+
+        return float(0.6 * time_factor + 0.4 * prob_factor)
+
+    def get_recent_cp_rate(self) -> float:
+        """Fraction of recent observations that exceeded default threshold.
+
+        Returns
+        -------
+        float
+            Rate in [0, 1].
+        """
+        if self._buffer_count == 0:
+            return 0.0
+        filled = self._cp_buffer[:self._buffer_count]
+        return float((filled > self._online_threshold).mean())
+
+    def set_threshold(self, threshold: float) -> None:
+        """Update the default online detection threshold."""
+        self._online_threshold = max(0.0, min(1.0, threshold))
+
+    def get_state_snapshot(self) -> Dict[str, Any]:
+        """Return a compact snapshot of the online state.
+
+        Useful for checkpointing without serialising the full BOCPD
+        internal state.
+        """
+        return {
+            "total_steps": self._total_steps,
+            "ema_cp_prob": self._ema_cp_prob,
+            "steps_since_cp": self._steps_since_cp,
+            "last_cp_step": self._last_cp_step,
+            "buffer_mean": float(self._cp_buffer[:self._buffer_count].mean())
+            if self._buffer_count > 0
+            else 0.0,
+            "regime_stability": self.get_regime_stability(),
+            "recent_cp_rate": self.get_recent_cp_rate(),
+            "map_run_length": self.get_map_run_length(),
+        }
+
+    def reset_online(self) -> None:
+        """Reset both the base BOCPD and the online state."""
+        self.reset()
+        self._ema_cp_prob = 0.0
+        self._cp_buffer[:] = 0.0
+        self._buffer_idx = 0
+        self._buffer_count = 0
+        self._steps_since_cp = 0
+        self._last_cp_step = -1
+        self._total_steps = 0
+
+
 # Alias for spec compatibility
 BayesianChangePointDetector = BOCPD

@@ -106,6 +106,67 @@ class AlphaDecayMonitor:
 
         return report
 
+    def check_auto_demotion(
+        self,
+        trade_history: pd.DataFrame,
+    ) -> list[dict]:
+        """HIGH-028: Check all strategies for auto-demotion trigger.
+
+        When a strategy's rolling Sharpe decays below the critical threshold,
+        flag it for review/demotion. Returns a list of demotion recommendations.
+
+        Each recommendation dict has keys:
+            strategy, sharpe_30d, decay_rate, status, action
+        """
+        demotions: list[dict] = []
+
+        auto_demote = getattr(config, "ALPHA_DECAY_AUTO_DEMOTE", False)
+        if not auto_demote:
+            return demotions
+
+        report = self.get_strategy_health_report(trade_history)
+        critical_threshold = getattr(
+            config, "ALPHA_DECAY_CRITICAL_SHARPE", _DEFAULT_CRITICAL_SHARPE
+        )
+
+        for strategy, metrics in report.items():
+            if metrics["status"] == "critical":
+                action = "demote"
+                logger.warning(
+                    "ALPHA DECAY: Strategy '%s' flagged for demotion — "
+                    "sharpe_30d=%.4f (threshold=%.2f), decay_rate=%.4f",
+                    strategy,
+                    metrics.get("sharpe_30d") or 0.0,
+                    critical_threshold,
+                    metrics.get("decay_rate", 0.0),
+                )
+                demotions.append({
+                    "strategy": strategy,
+                    "sharpe_30d": metrics.get("sharpe_30d"),
+                    "decay_rate": metrics.get("decay_rate", 0.0),
+                    "half_life_days": metrics.get("half_life_days"),
+                    "status": "critical",
+                    "action": action,
+                })
+            elif metrics["status"] == "warning":
+                logger.info(
+                    "ALPHA DECAY: Strategy '%s' warning — "
+                    "sharpe_30d=%.4f, decay_rate=%.4f",
+                    strategy,
+                    metrics.get("sharpe_30d") or 0.0,
+                    metrics.get("decay_rate", 0.0),
+                )
+                demotions.append({
+                    "strategy": strategy,
+                    "sharpe_30d": metrics.get("sharpe_30d"),
+                    "decay_rate": metrics.get("decay_rate", 0.0),
+                    "half_life_days": metrics.get("half_life_days"),
+                    "status": "warning",
+                    "action": "reduce_allocation",
+                })
+
+        return demotions
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

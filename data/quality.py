@@ -8,6 +8,7 @@ that strategies can use to weight their signals.
 """
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -261,26 +262,31 @@ def _check_corporate_actions(bars: pd.DataFrame, symbol: str,
 
 # BUG-025: Track symbols needing indicator cache invalidation
 _invalidated_symbols: Dict[str, datetime] = {}
+_invalidated_symbols_lock = threading.Lock()  # MED-007: protect concurrent access
 
 
 def _flag_indicator_invalidation(symbol: str, event_timestamp) -> None:
     """BUG-025: Flag a symbol for cached indicator invalidation due to corporate action."""
     try:
         ts = pd.Timestamp(event_timestamp)
-        _invalidated_symbols[symbol] = ts.to_pydatetime()
+        with _invalidated_symbols_lock:
+            _invalidated_symbols[symbol] = ts.to_pydatetime()
         logger.warning(f"BUG-025: {symbol} flagged for indicator invalidation at {ts}")
     except Exception:
-        _invalidated_symbols[symbol] = datetime.now()
+        with _invalidated_symbols_lock:
+            _invalidated_symbols[symbol] = datetime.now()
 
 
 def get_invalidated_symbols() -> Dict[str, datetime]:
     """Return symbols flagged for indicator cache invalidation due to corporate actions."""
-    return dict(_invalidated_symbols)
+    with _invalidated_symbols_lock:
+        return dict(_invalidated_symbols)
 
 
 def clear_invalidation(symbol: str) -> None:
     """Clear the invalidation flag for a symbol after indicators have been recomputed."""
-    _invalidated_symbols.pop(symbol, None)
+    with _invalidated_symbols_lock:
+        _invalidated_symbols.pop(symbol, None)
 
 
 def _check_duplicate_timestamps(bars: pd.DataFrame, symbol: str) -> List[QualityIssue]:
@@ -498,6 +504,45 @@ class DataQualityFramework:
                    score.issue_count, score.critical_count)
 
         return score
+
+    def check_and_clean(self, bars: pd.DataFrame, symbol: str,
+                        now: Optional[datetime] = None,
+                        min_bar_score: float = 0.5) -> Tuple[pd.DataFrame, DataQualityScore]:
+        """HIGH-026: Run quality checks and return cleaned dataset with flagged bars.
+
+        Instead of rejecting entire datasets, flags individual bad bars and
+        returns a cleaned dataset. Adds a '_quality_score' column (0-1 per bar)
+        and a '_flagged' boolean column indicating bars below min_bar_score.
+
+        Args:
+            bars: DataFrame with OHLCV data, datetime-indexed.
+            symbol: Ticker symbol.
+            now: Current time for staleness check.
+            min_bar_score: Bars with per-bar score below this are flagged.
+
+        Returns:
+            Tuple of (cleaned_bars, DataQualityScore).
+            cleaned_bars has '_quality_score' and '_flagged' columns added.
+            Flagged bars remain in the DataFrame but are marked for exclusion.
+        """
+        score = self.check(bars, symbol, now=now)
+
+        cleaned = bars.copy()
+        if score.per_bar is not None and len(score.per_bar) == len(cleaned):
+            cleaned["_quality_score"] = score.per_bar
+        else:
+            cleaned["_quality_score"] = 1.0
+
+        cleaned["_flagged"] = cleaned["_quality_score"] < min_bar_score
+
+        flagged_count = int(cleaned["_flagged"].sum())
+        if flagged_count > 0:
+            logger.info(
+                "DataQuality %s: %d/%d bars flagged (score < %.2f), keeping in dataset",
+                symbol, flagged_count, len(cleaned), min_bar_score,
+            )
+
+        return cleaned, score
 
     def check_multiple(self, bars_dict: Dict[str, pd.DataFrame],
                        now: Optional[datetime] = None

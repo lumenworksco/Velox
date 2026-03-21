@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
 import config
+import config.settings
 from analytics.param_optimizer import (
     BayesianOptimizer,
     OptimizationResult,
@@ -102,7 +103,7 @@ class TestGetCurrentParams:
             params = _get_current_params({"MR_ZSCORE_ENTRY": (1.0, 2.5)})
             assert params["MR_ZSCORE_ENTRY"] == 99.9
         finally:
-            config._runtime_params.pop("MR_ZSCORE_ENTRY", None)
+            config.settings._runtime_params.pop("MR_ZSCORE_ENTRY", None)
 
 
 # ---- _compute_sortino_from_trades ----
@@ -329,8 +330,8 @@ class TestApplyOptimizedParams:
             assert config.get_param("MR_ZSCORE_ENTRY") == 1.8
             assert config.get_param("MR_HURST_MAX") == 0.48
         finally:
-            config._runtime_params.pop("MR_ZSCORE_ENTRY", None)
-            config._runtime_params.pop("MR_HURST_MAX", None)
+            config.settings._runtime_params.pop("MR_ZSCORE_ENTRY", None)
+            config.settings._runtime_params.pop("MR_HURST_MAX", None)
 
     def test_apply_empty_params_is_noop(self):
         opt = BayesianOptimizer()

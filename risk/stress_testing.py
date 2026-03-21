@@ -378,6 +378,288 @@ class StressTestFramework:
         return result
 
     # ------------------------------------------------------------------
+    # RISK-008: Adversarial scenario generation
+    # ------------------------------------------------------------------
+
+    def generate_adversarial_scenarios(
+        self,
+        positions: dict[str, Any],
+        portfolio_equity: float | None = None,
+    ) -> list[ScenarioShock]:
+        """RISK-008: Generate adversarial scenarios targeting portfolio weaknesses.
+
+        Analyzes the current portfolio to create worst-case scenarios that
+        specifically exploit the portfolio's vulnerabilities:
+        1. Concentrated position attack: max drawdown on largest positions.
+        2. Correlated selloff: simultaneous drop in top holdings.
+        3. Sector collapse: shock to the most concentrated sector.
+        4. Beta amplification: high-beta positions get outsized moves.
+        5. Liquidity crisis on illiquid holdings.
+
+        Args:
+            positions: Dict of symbol -> position info.
+            portfolio_equity: Total portfolio equity.
+
+        Returns:
+            List of adversarial ScenarioShock objects.
+        """
+        if not positions:
+            return []
+
+        pos_list = self._normalize_positions(positions)
+        if not pos_list:
+            return []
+
+        if portfolio_equity is None:
+            portfolio_equity = sum(p["notional"] for p in pos_list) * 2.0
+
+        adversarial: list[ScenarioShock] = []
+
+        try:
+            # 1. Concentrated position attack
+            conc_scenario = self._adversarial_concentration(pos_list, portfolio_equity)
+            if conc_scenario:
+                adversarial.append(conc_scenario)
+        except Exception as e:
+            logger.debug(f"RISK-008: Concentration scenario generation failed: {e}")
+
+        try:
+            # 2. Correlated selloff of top holdings
+            corr_scenario = self._adversarial_correlated_selloff(pos_list, portfolio_equity)
+            if corr_scenario:
+                adversarial.append(corr_scenario)
+        except Exception as e:
+            logger.debug(f"RISK-008: Correlated selloff scenario generation failed: {e}")
+
+        try:
+            # 3. Sector collapse
+            sector_scenario = self._adversarial_sector_collapse(pos_list, portfolio_equity)
+            if sector_scenario:
+                adversarial.append(sector_scenario)
+        except Exception as e:
+            logger.debug(f"RISK-008: Sector collapse scenario generation failed: {e}")
+
+        try:
+            # 4. Beta-amplified crash
+            beta_scenario = self._adversarial_beta_crash(pos_list, portfolio_equity)
+            if beta_scenario:
+                adversarial.append(beta_scenario)
+        except Exception as e:
+            logger.debug(f"RISK-008: Beta crash scenario generation failed: {e}")
+
+        try:
+            # 5. Anti-portfolio (everything moves against us)
+            anti_scenario = self._adversarial_anti_portfolio(pos_list, portfolio_equity)
+            if anti_scenario:
+                adversarial.append(anti_scenario)
+        except Exception as e:
+            logger.debug(f"RISK-008: Anti-portfolio scenario generation failed: {e}")
+
+        if adversarial:
+            logger.info(
+                f"RISK-008: Generated {len(adversarial)} adversarial scenarios "
+                f"targeting portfolio weaknesses"
+            )
+
+        return adversarial
+
+    def run_adversarial_stress_tests(
+        self,
+        positions: dict[str, Any],
+        portfolio_equity: float | None = None,
+    ) -> list[StressTestResult]:
+        """RISK-008: Generate and run adversarial scenarios in one call.
+
+        Combines generate_adversarial_scenarios + run_stress_tests using
+        the adversarial scenarios instead of predefined ones.
+        """
+        scenarios = self.generate_adversarial_scenarios(positions, portfolio_equity)
+        if not scenarios:
+            return []
+
+        # Temporarily swap scenarios
+        old_scenarios = self._scenarios
+        self._scenarios = scenarios
+
+        try:
+            results = self.run_stress_tests(positions, portfolio_equity)
+        finally:
+            self._scenarios = old_scenarios
+
+        return results
+
+    def _adversarial_concentration(
+        self,
+        pos_list: list[dict],
+        portfolio_equity: float,
+    ) -> ScenarioShock | None:
+        """Attack concentrated positions with outsized moves."""
+        if not pos_list:
+            return None
+
+        # Find largest position by notional
+        largest = max(pos_list, key=lambda p: p["notional"])
+        concentration = largest["notional"] / portfolio_equity
+
+        if concentration < 0.05:  # Less than 5% — not concentrated enough
+            return None
+
+        # The larger the concentration, the bigger the shock
+        shock_pct = -0.03 * (1 + concentration * 5)  # -3% to -18% depending on concentration
+        shock_pct = max(shock_pct, -0.20)  # Cap at -20%
+
+        return ScenarioShock(
+            name=f"Adversarial: {largest['symbol']} Concentration Attack",
+            scenario_type=ScenarioType.FLASH_CRASH,
+            description=(
+                f"Targeted attack on largest position {largest['symbol']} "
+                f"({concentration:.0%} of portfolio) with {shock_pct:.0%} move"
+            ),
+            equity_move_pct=shock_pct * 0.3,  # General market sympathy
+            vix_level=40.0,
+            spread_multiplier=4.0,
+            beta_amplification=2.0,  # Concentrated stock moves more
+        )
+
+    def _adversarial_correlated_selloff(
+        self,
+        pos_list: list[dict],
+        portfolio_equity: float,
+    ) -> ScenarioShock | None:
+        """All top holdings drop simultaneously (correlation -> 1)."""
+        if len(pos_list) < 2:
+            return None
+
+        # Sort by notional, take top 5
+        sorted_pos = sorted(pos_list, key=lambda p: -p["notional"])[:5]
+        top_notional = sum(p["notional"] for p in sorted_pos)
+        top_pct = top_notional / portfolio_equity
+
+        return ScenarioShock(
+            name="Adversarial: Correlated Top-Holdings Selloff",
+            scenario_type=ScenarioType.CORRELATION_BREAKDOWN,
+            description=(
+                f"Top {len(sorted_pos)} holdings ({top_pct:.0%} of portfolio) "
+                f"drop simultaneously as correlations spike to 1.0"
+            ),
+            equity_move_pct=-0.05,
+            vix_level=50.0,
+            correlation_override=1.0,
+            spread_multiplier=3.0,
+            beta_amplification=1.5,
+        )
+
+    def _adversarial_sector_collapse(
+        self,
+        pos_list: list[dict],
+        portfolio_equity: float,
+    ) -> ScenarioShock | None:
+        """Collapse the most concentrated sector."""
+        sector_map = getattr(config, "SECTOR_MAP", {})
+        sector_notional: dict[str, float] = {}
+
+        for pos in pos_list:
+            sector = sector_map.get(pos["symbol"], "UNKNOWN")
+            sector_notional[sector] = sector_notional.get(sector, 0.0) + pos["notional"]
+
+        if not sector_notional:
+            return None
+
+        # Find largest sector
+        top_sector = max(sector_notional, key=sector_notional.get)
+        top_sector_pct = sector_notional[top_sector] / portfolio_equity
+
+        if top_sector_pct < 0.15:  # Not concentrated enough
+            return None
+
+        # Shock proportional to concentration
+        sector_shock_pct = -0.08 * (1 + top_sector_pct)
+
+        return ScenarioShock(
+            name=f"Adversarial: {top_sector} Sector Collapse",
+            scenario_type=ScenarioType.SECTOR_SHOCK,
+            description=(
+                f"Most concentrated sector {top_sector} ({top_sector_pct:.0%}) "
+                f"drops {sector_shock_pct:.0%}"
+            ),
+            equity_move_pct=-0.015,
+            vix_level=35.0,
+            sector_shock={top_sector: sector_shock_pct},
+            spread_multiplier=3.0,
+            beta_amplification=1.2,
+        )
+
+    def _adversarial_beta_crash(
+        self,
+        pos_list: list[dict],
+        portfolio_equity: float,
+    ) -> ScenarioShock | None:
+        """Market crash amplified by portfolio's beta exposure."""
+        # Compute weighted average beta
+        total_notional = sum(p["notional"] for p in pos_list)
+        if total_notional <= 0:
+            return None
+
+        weighted_beta = sum(
+            p["beta"] * p["notional"] / total_notional for p in pos_list
+        )
+
+        if weighted_beta <= 1.2:
+            return None  # Beta not high enough to exploit
+
+        # Scale the crash by the portfolio's beta
+        market_drop = -0.04
+        effective_drop = market_drop * weighted_beta
+
+        return ScenarioShock(
+            name=f"Adversarial: Beta-Amplified Crash (beta={weighted_beta:.1f})",
+            scenario_type=ScenarioType.FLASH_CRASH,
+            description=(
+                f"Market drops {market_drop:.0%} amplified by portfolio "
+                f"beta {weighted_beta:.1f} for effective {effective_drop:.1%} loss"
+            ),
+            equity_move_pct=market_drop,
+            vix_level=60.0,
+            spread_multiplier=5.0,
+            beta_amplification=weighted_beta,
+        )
+
+    def _adversarial_anti_portfolio(
+        self,
+        pos_list: list[dict],
+        portfolio_equity: float,
+    ) -> ScenarioShock | None:
+        """Every position moves against its direction (longs drop, shorts rally)."""
+        # Compute the portfolio's directional bias
+        long_notional = sum(p["notional"] for p in pos_list if p["side_mult"] > 0)
+        short_notional = sum(p["notional"] for p in pos_list if p["side_mult"] < 0)
+        net_exposure = (long_notional - short_notional) / portfolio_equity if portfolio_equity > 0 else 0
+
+        # If net long, scenario is a market crash; if net short, a rally
+        if net_exposure > 0:
+            move = -0.04  # Market drops
+            scenario_desc = f"market drops against net-long exposure ({net_exposure:.0%})"
+        elif net_exposure < 0:
+            move = 0.04   # Market rallies
+            scenario_desc = f"market rallies against net-short exposure ({net_exposure:.0%})"
+        else:
+            return None  # Market-neutral, not much to attack
+
+        return ScenarioShock(
+            name="Adversarial: Anti-Portfolio (Everything Moves Against You)",
+            scenario_type=ScenarioType.GAP_OPENING,
+            description=(
+                f"Anti-portfolio scenario: {scenario_desc}. "
+                f"All positions move against their direction."
+            ),
+            equity_move_pct=move,
+            overnight_gap_pct=move,
+            vix_level=45.0,
+            spread_multiplier=4.0,
+            beta_amplification=1.3,
+        )
+
+    # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
 

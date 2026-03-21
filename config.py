@@ -23,8 +23,7 @@ if not os.getenv("TESTING") and not os.getenv("PYTEST_CURRENT_TEST"):
 
 ALLOW_SHORT = os.getenv("ALLOW_SHORT", "false") == "true"
 
-BROKER_ABSTRACTION_ENABLED = True
-PAPER_BROKER_SPREAD_BPS = 5.0
+# MED-030: Removed BROKER_ABSTRACTION_ENABLED and PAPER_BROKER_SPREAD_BPS (dead code, never referenced)
 
 # ============================================================
 # MARKET HOURS (ET)
@@ -137,12 +136,17 @@ SECTOR_GROUPS = {
 # ============================================================
 
 STRATEGY_ALLOCATIONS = {
-    'STAT_MR': 0.40,
-    'VWAP': 0.20,
-    'KALMAN_PAIRS': 0.20,
-    'PEAD': 0.10,
+    'STAT_MR': 0.30,
+    'VWAP': 0.15,
+    'KALMAN_PAIRS': 0.15,
+    'PEAD': 0.08,
     'ORB': 0.05,
     'MICRO_MOM': 0.05,
+    # WIRE-015: New strategy allocations
+    'COPULA_PAIRS': 0.07,
+    'CROSS_SECT_MOM': 0.05,
+    'SECTOR_MOM': 0.05,
+    'MULTI_TF': 0.05,
 }
 
 # --- Statistical Mean Reversion ---
@@ -302,6 +306,9 @@ CLUSTER_CORRELATION_THRESHOLD = 0.70
 CLUSTER_MAX_HEAT = 0.20
 HEAT_CORRELATION_LOOKBACK = 20     # trading days
 CORRELATION_THRESHOLD = 0.92       # Skip if correlated > 92% with open position
+MAX_PAIRWISE_CORRELATION = 0.70    # MED-035: Correlation limiter pairwise cap
+MIN_EFFECTIVE_BETS = 2.0           # MED-035: Minimum effective independent bets
+MAX_SECTOR_WEIGHT = 0.50           # MED-035: Max sector concentration weight
 
 # --- Short Selling ---
 SHORT_SIZE_MULTIPLIER = 0.75       # Short positions = 75% of equivalent long size
@@ -336,6 +343,16 @@ MONTE_CARLO_DELEVERAGE_PCT = 0.20 # Reduce VOL_TARGET by 20%
 # EXECUTION
 # ============================================================
 
+# --- Kill Switch ---
+KILL_SWITCH_BATCH_SIZE = 5         # MED-031: Positions to close per batch
+KILL_SWITCH_BATCH_DELAY_SEC = 0.5  # MED-031: Delay between batches (seconds)
+
+# --- Transaction Cost Model ---
+COST_SPREAD_BPS = 1.0              # MED-035: Default spread cost (basis points)
+COST_SLIPPAGE_BPS = 0.5            # MED-035: Default slippage cost (basis points)
+COST_COMMISSION_PER_SHARE = 0.0035 # MED-035: Commission per share
+COST_MIN_EXPECTED_RETURN_BPS = 5.0 # MED-035: Minimum expected return to justify trade
+
 # --- Smart Order Routing ---
 SMART_ROUTING_ENABLED = True
 SPREAD_THRESHOLD_PCT = 0.0015     # Use limit if spread > 0.15%
@@ -369,7 +386,7 @@ EXECUTION_SLIPPAGE_ALERT_PCT = 0.001
 
 # --- Scan Configuration ---
 SCAN_INTERVAL_SEC = 120
-CLOSE_UNKNOWN_POSITIONS = False    # Auto-close broker positions we didn't open
+# MED-030: Removed CLOSE_UNKNOWN_POSITIONS (dead code, never referenced)
 
 # --- Overnight Holds ---
 OVERNIGHT_HOLD_ENABLED = True
@@ -474,6 +491,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # --- Web Dashboard ---
 WEB_DASHBOARD_ENABLED = os.getenv("WEB_DASHBOARD_ENABLED", "true") == "true"
 WEB_DASHBOARD_PORT = int(os.getenv("WEB_DASHBOARD_PORT", "8080"))
+CORS_ORIGINS = ["http://localhost:3000"]
+TRUSTED_PROXY_IPS: list[str] = []  # MED-034: IPs allowed to set X-Forwarded-For
 
 # --- WebSocket Position Monitoring ---
 WEBSOCKET_MONITORING = True
@@ -539,51 +558,355 @@ def set_param(key: str, value):
         _runtime_params[key] = value
 
 
+# ============================================================
+# PROD-013: YAML Config Support with Hot Reload
+# ============================================================
+
+_yaml_config: dict = {}
+_yaml_lock = _threading.Lock()
+_yaml_watcher_started = False
+_yaml_last_mtime: float = 0.0
+
+YAML_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+
+
+def load_yaml_config(path: str | None = None) -> dict:
+    """PROD-013: Load configuration overrides from a YAML file.
+
+    If a config.yaml exists, loads settings from it and applies them
+    as overrides to the module-level variables. Settings in YAML take
+    precedence over defaults but environment variables still win.
+
+    Args:
+        path: Path to YAML file. Defaults to config.yaml in project root.
+
+    Returns:
+        Dict of loaded YAML settings, or empty dict if file not found.
+    """
+    import logging as _logging
+    _logger = _logging.getLogger("config")
+
+    yaml_path = path or YAML_CONFIG_PATH
+
+    if not os.path.exists(yaml_path):
+        _logger.debug("PROD-013: No config.yaml found at %s", yaml_path)
+        return {}
+
+    try:
+        import yaml
+    except ImportError:
+        _logger.warning(
+            "PROD-013: PyYAML not installed — cannot load config.yaml. "
+            "Install with: pip install PyYAML"
+        )
+        return {}
+
+    try:
+        with open(yaml_path, "r") as f:
+            data = yaml.safe_load(f) or {}
+
+        global _yaml_config
+        with _yaml_lock:
+            _yaml_config = data
+
+        # Apply YAML overrides to module globals
+        applied = _apply_yaml_overrides(data)
+        _logger.info(
+            "PROD-013: Loaded config.yaml (%d settings, %d applied)",
+            len(data), applied,
+        )
+        return data
+
+    except Exception as e:
+        _logger.error("PROD-013: Failed to load config.yaml: %s", e)
+        return {}
+
+
+def _apply_yaml_overrides(data: dict) -> int:
+    """Apply YAML config values as overrides to module globals.
+
+    Only overrides values that:
+    - Exist as module-level attributes in config.py
+    - Are not environment-variable-controlled (API keys, etc.)
+    - Match the expected type
+
+    Returns count of applied overrides.
+    """
+    import logging as _logging
+    _logger = _logging.getLogger("config")
+
+    # Keys that should NEVER be overridden from YAML (security-sensitive)
+    _protected = {"API_KEY", "API_SECRET", "ANTHROPIC_API_KEY", "TELEGRAM_BOT_TOKEN"}
+
+    import config as _self
+    applied = 0
+
+    for key, value in data.items():
+        if key.startswith("_") or key in _protected:
+            continue
+
+        if not hasattr(_self, key):
+            _logger.debug("PROD-013: Ignoring unknown YAML key: %s", key)
+            continue
+
+        current = getattr(_self, key)
+
+        # Type check (allow int<->float coercion)
+        if current is not None and not isinstance(value, type(current)):
+            if isinstance(current, float) and isinstance(value, int):
+                value = float(value)
+            elif isinstance(current, int) and isinstance(value, float) and value == int(value):
+                value = int(value)
+            else:
+                _logger.warning(
+                    "PROD-013: Type mismatch for %s: expected %s, got %s — skipping",
+                    key, type(current).__name__, type(value).__name__,
+                )
+                continue
+
+        setattr(_self, key, value)
+        applied += 1
+        _logger.debug("PROD-013: Applied YAML override: %s = %r", key, value)
+
+    return applied
+
+
+def start_yaml_watcher(poll_interval_sec: float = 30.0):
+    """PROD-013: Start a background thread that polls config.yaml for changes.
+
+    Uses simple file mtime polling (no external dependencies required).
+    When a change is detected, the YAML config is reloaded and overrides
+    are re-applied.
+
+    Args:
+        poll_interval_sec: How often to check for file changes (default 30s).
+    """
+    import logging as _logging
+    _logger = _logging.getLogger("config")
+
+    global _yaml_watcher_started, _yaml_last_mtime
+
+    if _yaml_watcher_started:
+        _logger.debug("PROD-013: YAML watcher already running")
+        return
+
+    yaml_path = YAML_CONFIG_PATH
+    if os.path.exists(yaml_path):
+        _yaml_last_mtime = os.path.getmtime(yaml_path)
+
+    def _watcher_loop():
+        global _yaml_last_mtime
+        while True:
+            _threading.Event().wait(timeout=poll_interval_sec)
+            try:
+                if not os.path.exists(yaml_path):
+                    continue
+                mtime = os.path.getmtime(yaml_path)
+                if mtime > _yaml_last_mtime:
+                    _yaml_last_mtime = mtime
+                    _logger.info("PROD-013: config.yaml changed, reloading...")
+                    load_yaml_config(yaml_path)
+            except Exception as e:
+                _logger.warning("PROD-013: YAML watcher error: %s", e)
+
+    watcher = _threading.Thread(
+        target=_watcher_loop,
+        name="YAMLConfigWatcher",
+        daemon=True,
+    )
+    watcher.start()
+    _yaml_watcher_started = True
+    _logger.info(
+        "PROD-013: YAML config watcher started (poll_interval=%ds)",
+        poll_interval_sec,
+    )
+
+
+def get_yaml_config() -> dict:
+    """Get the currently loaded YAML config (read-only copy)."""
+    with _yaml_lock:
+        return dict(_yaml_config)
+
+
 def validate():
     """Validate configuration at startup. Call from main.py before trading starts.
 
     Raises RuntimeError if critical configuration errors are found.
     """
+    errors, warnings = validate_config()
+
     import logging as _logging
     _logger = _logging.getLogger("config")
-    errors = []
 
-    # API credentials (skip in test mode)
+    for w in warnings:
+        _logger.warning("CONFIG WARNING: %s", w)
+
+    if errors:
+        for e in errors:
+            _logger.error("CONFIG ERROR: %s", e)
+        raise RuntimeError(f"Configuration validation failed with {len(errors)} error(s). See log.")
+
+    _logger.info("Configuration validated successfully (%d warnings)", len(warnings))
+
+
+def validate_config() -> tuple[list[str], list[str]]:
+    """PROD-006: Comprehensive configuration validation.
+
+    Checks:
+    - All required parameters exist and have correct types.
+    - Numeric ranges are valid (allocations sum <= 1.0, risk limits > 0, etc.).
+    - Warns on suspicious but non-fatal values.
+
+    Returns:
+        Tuple of (errors: list[str], warnings: list[str]).
+        Errors are fatal; warnings are logged but non-blocking.
+    """
+    import logging as _logging
+    _logger = _logging.getLogger("config")
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    # --- API credentials (skip in test mode) ---
     if not os.getenv("TESTING") and not os.getenv("PYTEST_CURRENT_TEST"):
         if not API_KEY or not API_SECRET:
             errors.append("ALPACA_API_KEY and ALPACA_API_SECRET must be set")
 
-    # Strategy allocations should sum to <= 1.0
-    total = sum(STRATEGY_ALLOCATIONS.values())
-    if total > 1.01:
-        errors.append(f"Strategy allocations sum to {total:.2%}, must be <= 100%")
+    # --- Strategy allocations sum <= 1.0 ---
+    total_alloc = sum(STRATEGY_ALLOCATIONS.values())
+    if total_alloc > 1.0 + 1e-6:
+        errors.append(
+            f"Strategy allocations sum to {total_alloc:.6f} ({total_alloc:.2%}), must be <= 100%"
+        )
+    if total_alloc < 0.5:
+        warnings.append(
+            f"Strategy allocations sum to only {total_alloc:.2%} — "
+            f"more than half of capital may remain undeployed"
+        )
 
-    # Kelly bounds
-    if KELLY_MIN_RISK >= KELLY_MAX_RISK:
-        errors.append(f"KELLY_MIN_RISK ({KELLY_MIN_RISK}) must be < KELLY_MAX_RISK ({KELLY_MAX_RISK})")
+    # --- Individual allocation values ---
+    for strat, weight in STRATEGY_ALLOCATIONS.items():
+        if not isinstance(weight, (int, float)):
+            errors.append(f"STRATEGY_ALLOCATIONS['{strat}'] must be numeric, got {type(weight).__name__}")
+        elif weight < 0:
+            errors.append(f"STRATEGY_ALLOCATIONS['{strat}'] = {weight} — cannot be negative")
+        elif weight > 0.5:
+            warnings.append(
+                f"STRATEGY_ALLOCATIONS['{strat}'] = {weight:.2%} — "
+                f"single strategy >50% creates concentration risk"
+            )
 
-    # Circuit breaker tiers (validate if module available)
-    try:
-        from risk.circuit_breaker import TieredCircuitBreaker
-        cb = TieredCircuitBreaker()
-        # Tiers are validated internally during construction
-    except Exception:
-        pass  # Module not yet available during early startup
+    # --- Theoretical max deployment vs limit ---
+    n_strategies = len(STRATEGY_ALLOCATIONS)
+    theoretical_max_deploy = n_strategies * MAX_POSITION_PCT
+    if theoretical_max_deploy > MAX_PORTFOLIO_DEPLOY:
+        warnings.append(
+            f"{n_strategies} strategies * {MAX_POSITION_PCT:.0%} max position = "
+            f"{theoretical_max_deploy:.0%} theoretical max deployment, exceeds "
+            f"MAX_PORTFOLIO_DEPLOY={MAX_PORTFOLIO_DEPLOY:.0%}. "
+            f"Risk layer will enforce the deploy limit, but strategies may compete for capital."
+        )
 
-    # Scan interval
+    # --- Risk limits must be positive ---
+    _positive_checks = {
+        "RISK_PER_TRADE_PCT": RISK_PER_TRADE_PCT,
+        "MAX_POSITION_PCT": MAX_POSITION_PCT,
+        "MIN_POSITION_VALUE": MIN_POSITION_VALUE,
+        "MAX_POSITIONS": MAX_POSITIONS,
+        "VOL_TARGET_DAILY": VOL_TARGET_DAILY,
+        "SCAN_INTERVAL_SEC": SCAN_INTERVAL_SEC,
+    }
+    for name, value in _positive_checks.items():
+        if not isinstance(value, (int, float)):
+            errors.append(f"{name} must be numeric, got {type(value).__name__}")
+        elif value <= 0:
+            errors.append(f"{name} = {value} — must be > 0")
+
+    # --- Range checks ---
+    if RISK_PER_TRADE_PCT > 0.10:
+        errors.append(f"RISK_PER_TRADE_PCT ({RISK_PER_TRADE_PCT}) > 10% — dangerously high")
+
+    if MAX_POSITION_PCT > 0.50:
+        errors.append(f"MAX_POSITION_PCT ({MAX_POSITION_PCT}) > 50% — dangerously high")
+
     if SCAN_INTERVAL_SEC < 5:
         errors.append(f"SCAN_INTERVAL_SEC ({SCAN_INTERVAL_SEC}) too low — minimum 5s")
 
-    # Position sizing sanity
-    if RISK_PER_TRADE_PCT <= 0 or RISK_PER_TRADE_PCT > 0.10:
-        errors.append(f"RISK_PER_TRADE_PCT ({RISK_PER_TRADE_PCT}) should be 0-10%")
+    if MAX_PORTFOLIO_DEPLOY > 1.0:
+        errors.append(f"MAX_PORTFOLIO_DEPLOY ({MAX_PORTFOLIO_DEPLOY}) > 100% — invalid")
 
-    if MAX_POSITION_PCT <= 0 or MAX_POSITION_PCT > 0.50:
-        errors.append(f"MAX_POSITION_PCT ({MAX_POSITION_PCT}) should be 0-50%")
+    # --- Kelly criterion bounds ---
+    if KELLY_MIN_RISK >= KELLY_MAX_RISK:
+        errors.append(f"KELLY_MIN_RISK ({KELLY_MIN_RISK}) must be < KELLY_MAX_RISK ({KELLY_MAX_RISK})")
 
-    if errors:
-        for e in errors:
-            _logger.error(f"CONFIG ERROR: {e}")
-        raise RuntimeError(f"Configuration validation failed with {len(errors)} error(s). See log.")
+    if KELLY_FRACTION_MULT <= 0 or KELLY_FRACTION_MULT > 1.0:
+        warnings.append(
+            f"KELLY_FRACTION_MULT ({KELLY_FRACTION_MULT}) — "
+            f"expected 0 < value <= 1.0 (half-Kelly = 0.5)"
+        )
 
-    _logger.info("Configuration validated successfully")
+    # --- Daily P&L controls ---
+    if PNL_LOSS_HALT_PCT >= 0:
+        errors.append(f"PNL_LOSS_HALT_PCT ({PNL_LOSS_HALT_PCT}) must be negative (it's a loss threshold)")
+
+    if DAILY_LOSS_HALT >= 0:
+        errors.append(f"DAILY_LOSS_HALT ({DAILY_LOSS_HALT}) must be negative")
+
+    if PNL_GAIN_LOCK_PCT <= 0:
+        warnings.append(f"PNL_GAIN_LOCK_PCT ({PNL_GAIN_LOCK_PCT}) <= 0 — gain lock effectively disabled")
+
+    # --- Volatility targeting ---
+    if VOL_SCALAR_MIN >= VOL_SCALAR_MAX:
+        errors.append(
+            f"VOL_SCALAR_MIN ({VOL_SCALAR_MIN}) must be < VOL_SCALAR_MAX ({VOL_SCALAR_MAX})"
+        )
+
+    if VOL_TARGET_MAX < VOL_TARGET_DAILY:
+        errors.append(
+            f"VOL_TARGET_MAX ({VOL_TARGET_MAX}) must be >= VOL_TARGET_DAILY ({VOL_TARGET_DAILY})"
+        )
+
+    # --- VIX thresholds ---
+    if VIX_HALT_THRESHOLD < 20:
+        warnings.append(
+            f"VIX_HALT_THRESHOLD ({VIX_HALT_THRESHOLD}) < 20 — "
+            f"will halt trading during normal market conditions"
+        )
+
+    # --- Suspicious values ---
+    if BACKTEST_RISK_FREE_RATE > 0.10:
+        warnings.append(
+            f"BACKTEST_RISK_FREE_RATE ({BACKTEST_RISK_FREE_RATE}) > 10% — verify this is correct"
+        )
+
+    if CORRELATION_THRESHOLD < 0.5:
+        warnings.append(
+            f"CORRELATION_THRESHOLD ({CORRELATION_THRESHOLD}) < 50% — "
+            f"may block too many trades"
+        )
+
+    if MAX_PORTFOLIO_DEPLOY < 0.2:
+        warnings.append(
+            f"MAX_PORTFOLIO_DEPLOY ({MAX_PORTFOLIO_DEPLOY}) < 20% — "
+            f"very conservative, most capital will sit idle"
+        )
+
+    # --- Type checks for key string params ---
+    _string_checks = {
+        "DB_FILE": DB_FILE,
+        "LOG_FILE": LOG_FILE,
+        "STATE_FILE": STATE_FILE,
+    }
+    for name, value in _string_checks.items():
+        if not isinstance(value, str) or not value:
+            errors.append(f"{name} must be a non-empty string")
+
+    # --- Circuit breaker tiers (validate if module available) ---
+    try:
+        from risk.circuit_breaker import TieredCircuitBreaker
+        TieredCircuitBreaker()
+    except ImportError:
+        pass  # Module not yet available during early startup
+    except Exception as e:
+        warnings.append(f"Circuit breaker validation failed: {e}")
+
+    return errors, warnings

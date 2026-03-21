@@ -157,7 +157,14 @@ def _returns(close: pd.Series, horizon: int) -> float:
     """Log return over *horizon* bars ending at the latest bar."""
     if len(close) <= horizon:
         return np.nan
-    return float(np.log(close.iloc[-1] / close.iloc[-1 - horizon]))
+    ret = float(np.log(close.iloc[-1] / close.iloc[-1 - horizon]))
+    # MED-018: Sanity check — flag extreme returns (|return| > 50% per bar)
+    if abs(ret) > 0.50:
+        logger.warning(
+            "Extreme return detected: %.4f over %d bars (close %.2f -> %.2f) — possible bad data",
+            ret, horizon, close.iloc[-1 - horizon], close.iloc[-1],
+        )
+    return ret
 
 
 def _realized_volatility(close: pd.Series, window: int = 20) -> float:
@@ -256,6 +263,14 @@ class FeatureStore:
         self._compute_count = 0
         self._error_count = 0
 
+        # MED-042: Track bar counts for incremental computation
+        self._last_bar_count: Dict[str, int] = {}
+
+        # PROD-003: Track last computed index per symbol for true incremental computation.
+        # Maps symbol -> index (row count) of the last bar that was computed.
+        # Only recomputes features when new bars arrive beyond this index.
+        self._last_computed: Dict[str, int] = {}
+
         # Register built-in features
         self._register_builtins()
 
@@ -316,7 +331,8 @@ class FeatureStore:
         low = bars["low"]
         open_ = bars["open"]
         volume = bars["volume"]
-        vwap = bars.get("vwap")
+        # CRIT-007: Use column check instead of .get() for DataFrame safety
+        vwap = bars["vwap"] if "vwap" in bars.columns else None
 
         try:
             if name == "rsi_7":
@@ -410,6 +426,52 @@ class FeatureStore:
         with self._lock:
             self._online[symbol] = features
             self._timestamps[symbol] = {name: now for name in features}
+            self._last_bar_count[symbol] = len(bars)
+
+        return features
+
+    def compute_features_incremental(self, symbol: str, bars: pd.DataFrame) -> Dict[str, float]:
+        """PROD-003 / MED-042: Incremental feature computation — skip if no new bars.
+
+        Tracks the last computed index per symbol via `_last_computed` dict.
+        Only recomputes features when new bars arrive beyond the previously
+        computed index. This avoids redundant full recomputation when bars
+        haven't changed.
+
+        For most technical indicators the full lookback window is needed,
+        so we still pass the full bars DataFrame to compute functions.
+        The savings come from skipping the entire computation when no new
+        data has arrived.
+
+        Args:
+            symbol: Ticker symbol.
+            bars: OHLCV DataFrame.
+
+        Returns:
+            Dict mapping feature name to computed value (cached or fresh).
+        """
+        if bars is None or bars.empty:
+            return self.get_all_features(symbol)
+
+        current_count = len(bars)
+        with self._lock:
+            prev_computed = self._last_computed.get(symbol, 0)
+            cached = self._online.get(symbol)
+
+        # PROD-003: If no new bars since last computation and we have cache, return it
+        if current_count <= prev_computed and cached:
+            logger.debug(
+                "PROD-003: Skipping recompute for %s (bars=%d, last_computed=%d)",
+                symbol, current_count, prev_computed,
+            )
+            return dict(cached)
+
+        # New bars arrived — full recompute (indicators need full lookback)
+        features = self.compute_features(symbol, bars)
+
+        # Update the last computed index
+        with self._lock:
+            self._last_computed[symbol] = current_count
 
         return features
 
@@ -549,9 +611,11 @@ class FeatureStore:
             if symbol:
                 self._online.pop(symbol, None)
                 self._timestamps.pop(symbol, None)
+                self._last_computed.pop(symbol, None)
             else:
                 self._online.clear()
                 self._timestamps.clear()
+                self._last_computed.clear()
 
     def stats(self) -> dict:
         """Return feature store statistics."""

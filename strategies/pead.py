@@ -206,8 +206,154 @@ class PEADStrategy:
         self._scanned_today = False
         self._candidates = []
 
+    # IMPL-010: Earnings data cache (per-day, shared across scans)
+    _earnings_cache: dict[str, list[dict]] = {}
+    _earnings_cache_date: str = ""
+
     def _get_earnings_surprises(self, symbols: list[str]) -> list[dict]:
-        """Fetch recent earnings surprises via yfinance.
+        """Fetch recent earnings surprises with fallback data sources and caching.
+
+        IMPL-010: Enhanced pipeline with:
+        1. Primary: Financial Modeling Prep (FMP) API (if API key configured)
+        2. Fallback: yfinance earnings_dates
+        3. Per-day caching to avoid redundant API calls
+
+        Returns list of {symbol, surprise_pct, volume_ratio, gap_pct, current_price}.
+        Fail-open: returns empty list on error.
+        """
+        import pandas as pd
+
+        # Check daily cache
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if self._earnings_cache_date == today_str and self._earnings_cache.get(today_str):
+            logger.debug("PEAD: returning cached earnings data")
+            return self._earnings_cache[today_str]
+
+        results = []
+
+        # Try FMP API first (requires FMP_API_KEY in config)
+        fmp_key = getattr(config, "FMP_API_KEY", None)
+        if fmp_key:
+            fmp_results = self._get_earnings_fmp(symbols, fmp_key)
+            if fmp_results:
+                results = fmp_results
+                logger.info(f"PEAD: {len(results)} earnings from FMP API")
+
+        # Fallback to yfinance if FMP returned nothing
+        if not results:
+            yf_results = self._get_earnings_yfinance(symbols)
+            if yf_results:
+                results = yf_results
+                logger.info(f"PEAD: {len(results)} earnings from yfinance (fallback)")
+
+        # Cache results for the day
+        self._earnings_cache_date = today_str
+        self._earnings_cache[today_str] = results
+
+        return results
+
+    def _get_earnings_fmp(self, symbols: list[str], api_key: str) -> list[dict]:
+        """Fetch earnings surprises from Financial Modeling Prep API.
+
+        IMPL-010: Uses FMP's earnings calendar and earnings surprise endpoints.
+        Requires a valid FMP_API_KEY in config.
+
+        Returns list of {symbol, surprise_pct, volume_ratio, gap_pct, current_price}.
+        """
+        results = []
+
+        try:
+            import requests
+        except ImportError:
+            logger.debug("PEAD FMP: requests not installed")
+            return []
+
+        try:
+            from datetime import date as date_cls
+            today = date_cls.today()
+            yesterday = today - timedelta(days=1)
+
+            # FMP earnings calendar endpoint
+            url = (
+                f"https://financialmodelingprep.com/api/v3/earning_calendar"
+                f"?from={yesterday.isoformat()}&to={today.isoformat()}"
+                f"&apikey={api_key}"
+            )
+
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                logger.debug(f"PEAD FMP: HTTP {resp.status_code}")
+                return []
+
+            calendar = resp.json()
+            if not isinstance(calendar, list):
+                return []
+
+            # Filter to our symbols that reported earnings
+            symbol_set = set(symbols)
+            for entry in calendar:
+                symbol = entry.get("symbol", "")
+                if symbol not in symbol_set:
+                    continue
+
+                eps_actual = entry.get("eps", None)
+                eps_estimate = entry.get("epsEstimated", None)
+
+                if eps_actual is None or eps_estimate is None:
+                    continue
+                if eps_estimate == 0:
+                    continue
+
+                surprise_pct = ((eps_actual - eps_estimate) / abs(eps_estimate)) * 100
+
+                # Get price data for volume ratio and gap
+                try:
+                    price_url = (
+                        f"https://financialmodelingprep.com/api/v3/historical-price-full/"
+                        f"{symbol}?timeseries=5&apikey={api_key}"
+                    )
+                    price_resp = requests.get(price_url, timeout=10)
+                    if price_resp.status_code != 200:
+                        continue
+                    price_data = price_resp.json().get("historical", [])
+                    if len(price_data) < 2:
+                        continue
+
+                    # Most recent first in FMP
+                    latest = price_data[0]
+                    prior = price_data[1]
+
+                    volume_ratio = (
+                        latest.get("volume", 0) / prior.get("volume", 1)
+                        if prior.get("volume", 0) > 0 else 0
+                    )
+                    gap_pct = (
+                        (latest.get("open", 0) - prior.get("close", 0))
+                        / prior.get("close", 1) * 100
+                        if prior.get("close", 0) > 0 else 0
+                    )
+                    current_price = float(latest.get("close", 0))
+
+                    if current_price > 0:
+                        results.append({
+                            "symbol": symbol,
+                            "surprise_pct": round(surprise_pct, 2),
+                            "volume_ratio": round(volume_ratio, 2),
+                            "gap_pct": round(gap_pct, 2),
+                            "current_price": current_price,
+                            "source": "fmp",
+                        })
+                except Exception as e:
+                    logger.debug(f"PEAD FMP price fetch failed for {symbol}: {e}")
+                    continue
+
+        except Exception as e:
+            logger.debug(f"PEAD FMP earnings fetch failed: {e}")
+
+        return results
+
+    def _get_earnings_yfinance(self, symbols: list[str]) -> list[dict]:
+        """Fetch recent earnings surprises via yfinance (fallback).
 
         Returns list of {symbol, surprise_pct, volume_ratio, gap_pct, current_price}.
         Fail-open: returns empty list on error.
@@ -218,6 +364,8 @@ class PEADStrategy:
         except ImportError:
             logger.warning("PEAD: yfinance not installed, skipping")
             return []
+
+        import pandas as pd
 
         # Suppress yfinance logging noise
         yf_logger = logging.getLogger("yfinance")
@@ -234,8 +382,6 @@ class PEADStrategy:
                     if earnings is None or (hasattr(earnings, "empty") and earnings.empty):
                         continue
 
-                    # Find most recent past earnings date
-                    import pandas as pd
                     now = pd.Timestamp.now(tz="America/New_York")
                     past_earnings = earnings[earnings.index <= now]
                     if past_earnings.empty:
@@ -261,12 +407,10 @@ class PEADStrategy:
                     if hist is None or len(hist) < 2:
                         continue
 
-                    # Volume ratio: last day vs average of prior days
                     last_vol = hist["Volume"].iloc[-1]
                     avg_vol = hist["Volume"].iloc[:-1].mean()
                     volume_ratio = last_vol / avg_vol if avg_vol > 0 else 0
 
-                    # Gap: open vs prior close
                     gap_pct = ((hist["Open"].iloc[-1] - hist["Close"].iloc[-2])
                                / hist["Close"].iloc[-2]) * 100
 
@@ -278,14 +422,15 @@ class PEADStrategy:
                         "volume_ratio": volume_ratio,
                         "gap_pct": gap_pct,
                         "current_price": current_price,
+                        "source": "yfinance",
                     })
 
                 except Exception as e:
-                    logger.debug(f"PEAD earnings check failed for {symbol}: {e}")
+                    logger.debug(f"PEAD yfinance check failed for {symbol}: {e}")
                     continue
 
         except Exception as e:
-            logger.warning(f"PEAD earnings scan failed: {e}")
+            logger.warning(f"PEAD yfinance scan failed: {e}")
         finally:
             yf_logger.setLevel(prev_level)
 

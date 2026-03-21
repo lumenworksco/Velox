@@ -44,14 +44,14 @@ class TestKellyEngine:
         from risk.kelly import KellyEngine
 
         # 60% win rate, 2:1 win/loss ratio
-        wins = [{"pnl": 20.0, "pnl_pct": 0.02}] * 60
-        losses = [{"pnl": -10.0, "pnl_pct": -0.01}] * 40
+        wins = [{"pnl": 20.0, "pnl_pct": 0.02, "strategy": "STAT_MR"}] * 60
+        losses = [{"pnl": -10.0, "pnl_pct": -0.01, "strategy": "STAT_MR"}] * 40
         mock_trades = wins + losses
 
         with override_config(KELLY_MIN_TRADES=30, KELLY_LOOKBACK=100,
                              KELLY_FRACTION_MULT=0.5, KELLY_MIN_RISK=0.003,
                              KELLY_MAX_RISK=0.02, KELLY_ENABLED=True):
-            with patch("database.get_recent_trades_by_strategy", return_value=mock_trades):
+            with patch("database.get_recent_trades", return_value=mock_trades):
                 with patch("database.save_kelly_params"):
                     engine = KellyEngine()
                     engine.compute_fractions()
@@ -65,14 +65,14 @@ class TestKellyEngine:
         from risk.kelly import KellyEngine
 
         # 20% win rate, 0.5:1 win/loss ratio (losing strategy)
-        wins = [{"pnl": 5.0, "pnl_pct": 0.005}] * 20
-        losses = [{"pnl": -10.0, "pnl_pct": -0.01}] * 80
+        wins = [{"pnl": 5.0, "pnl_pct": 0.005, "strategy": "STAT_MR"}] * 20
+        losses = [{"pnl": -10.0, "pnl_pct": -0.01, "strategy": "STAT_MR"}] * 80
         mock_trades = wins + losses
 
         with override_config(KELLY_MIN_TRADES=30, KELLY_LOOKBACK=100,
                              KELLY_FRACTION_MULT=0.5, KELLY_MIN_RISK=0.003,
                              KELLY_MAX_RISK=0.02, KELLY_ENABLED=True):
-            with patch("database.get_recent_trades_by_strategy", return_value=mock_trades):
+            with patch("database.get_recent_trades", return_value=mock_trades):
                 with patch("database.save_kelly_params"):
                     engine = KellyEngine()
                     engine.compute_fractions()
@@ -84,14 +84,14 @@ class TestKellyEngine:
         from risk.kelly import KellyEngine
 
         # 55% win rate, 1.2:1 win/loss ratio
-        wins = [{"pnl": 12.0, "pnl_pct": 0.012}] * 55
-        losses = [{"pnl": -10.0, "pnl_pct": -0.01}] * 45
+        wins = [{"pnl": 12.0, "pnl_pct": 0.012, "strategy": "STAT_MR"}] * 55
+        losses = [{"pnl": -10.0, "pnl_pct": -0.01, "strategy": "STAT_MR"}] * 45
         mock_trades = wins + losses
 
         with override_config(KELLY_MIN_TRADES=30, KELLY_LOOKBACK=100,
                              KELLY_FRACTION_MULT=0.5, KELLY_MIN_RISK=0.003,
                              KELLY_MAX_RISK=0.02, KELLY_ENABLED=True):
-            with patch("database.get_recent_trades_by_strategy", return_value=mock_trades):
+            with patch("database.get_recent_trades", return_value=mock_trades):
                 with patch("database.save_kelly_params"):
                     engine = KellyEngine()
                     engine.compute_fractions()
@@ -104,14 +104,14 @@ class TestKellyEngine:
         """Verify params dict is populated after computation."""
         from risk.kelly import KellyEngine
 
-        wins = [{"pnl": 20.0, "pnl_pct": 0.02}] * 60
-        losses = [{"pnl": -10.0, "pnl_pct": -0.01}] * 40
+        wins = [{"pnl": 20.0, "pnl_pct": 0.02, "strategy": "STAT_MR"}] * 60
+        losses = [{"pnl": -10.0, "pnl_pct": -0.01, "strategy": "STAT_MR"}] * 40
         mock_trades = wins + losses
 
         with override_config(KELLY_MIN_TRADES=30, KELLY_LOOKBACK=100,
                              KELLY_FRACTION_MULT=0.5, KELLY_MIN_RISK=0.003,
                              KELLY_MAX_RISK=0.02, KELLY_ENABLED=True):
-            with patch("database.get_recent_trades_by_strategy", return_value=mock_trades):
+            with patch("database.get_recent_trades", return_value=mock_trades):
                 with patch("database.save_kelly_params"):
                     engine = KellyEngine()
                     engine.compute_fractions()
@@ -125,20 +125,21 @@ class TestKellyEngine:
         from risk.kelly import KellyEngine
 
         # 200 trades but lookback is 100
-        old_losses = [{"pnl": -10.0, "pnl_pct": -0.01}] * 100  # old terrible trades
-        recent_wins = [{"pnl": 20.0, "pnl_pct": 0.02}] * 100  # recent good trades
+        old_losses = [{"pnl": -10.0, "pnl_pct": -0.01, "strategy": "STAT_MR"}] * 100
+        recent_wins = [{"pnl": 20.0, "pnl_pct": 0.02, "strategy": "STAT_MR"}] * 100
         mock_trades = old_losses + recent_wins  # DB returns chronological order
 
         with override_config(KELLY_MIN_TRADES=30, KELLY_LOOKBACK=100,
                              KELLY_FRACTION_MULT=0.5, KELLY_MIN_RISK=0.003,
                              KELLY_MAX_RISK=0.02, KELLY_ENABLED=True):
-            with patch("database.get_recent_trades_by_strategy", return_value=mock_trades):
+            with patch("database.get_recent_trades", return_value=mock_trades):
                 with patch("database.save_kelly_params"):
                     engine = KellyEngine()
                     engine.compute_fractions()
                     # Should only see the last 100 (all wins)
                     params = engine.params
-                    assert params["STAT_MR"]["win_rate"] == 1.0
+                    # HIGH-002: win_rate capped at 0.95
+                    assert params["STAT_MR"]["win_rate"] == 0.95
 
     def test_last_computed_set(self, override_config):
         """last_computed is set after compute_fractions."""

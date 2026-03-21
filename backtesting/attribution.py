@@ -45,19 +45,32 @@ class StrategyAttribution:
 
 @dataclass
 class FactorAttribution:
-    """P&L attribution by market factor."""
+    """P&L attribution by market factor.
+
+    IMPL-003: Enhanced with style factor decomposition (size, value, volatility)
+    and per-trade factor exposure breakdown.
+    """
     market_beta_pnl: float = 0.0       # P&L explained by market exposure
     sector_pnl: dict[str, float] = field(default_factory=dict)
     momentum_pnl: float = 0.0          # P&L from momentum factor
     mean_reversion_pnl: float = 0.0    # P&L from mean reversion factor
+    size_factor_pnl: float = 0.0       # P&L from size factor (small vs large cap)
+    value_factor_pnl: float = 0.0      # P&L from value factor
+    volatility_factor_pnl: float = 0.0 # P&L from volatility factor (low-vol anomaly)
     residual_alpha: float = 0.0        # Unexplained alpha
 
 
 @dataclass
 class TimingAttribution:
-    """P&L attribution from entry/exit timing and position sizing."""
-    entry_timing_pnl: float = 0.0      # P&L from entry timing
-    exit_timing_pnl: float = 0.0       # P&L from exit timing
+    """P&L attribution from entry/exit timing and position sizing.
+
+    IMPL-003: Enhanced with actual dollar-value timing contributions
+    in addition to scores.
+    """
+    entry_timing_pnl: float = 0.0      # Dollar P&L from entry timing vs VWAP/midpoint
+    exit_timing_pnl: float = 0.0       # Dollar P&L from exit timing vs VWAP/midpoint
+    entry_timing_score: float = 0.0    # 0-1 quality score (1 = entered at best price)
+    exit_timing_score: float = 0.0     # 0-1 quality score (1 = exited at best price)
     sizing_contribution: float = 0.0    # P&L from position sizing decisions
     hold_time_contribution: float = 0.0 # Effect of hold time on returns
 
@@ -365,11 +378,53 @@ class PerformanceAttribution:
             elif strategy in ("STAT_MR", "VWAP", "KALMAN_PAIRS"):
                 mr_pnl += pnl
 
+        # IMPL-003: Style factor decomposition (size, value, volatility)
+        size_pnl = 0.0
+        value_pnl = 0.0
+        vol_pnl = 0.0
+
+        # Large-cap stocks (proxy: stocks in SPY top holdings)
+        large_cap = {"AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "NVDA", "META",
+                      "BRK.B", "UNH", "JNJ", "JPM", "V", "PG", "XOM", "HD",
+                      "MA", "LLY", "AVGO", "MRK", "ABBV", "PEP", "KO", "COST"}
+        # Value vs growth proxy
+        value_stocks = {"JPM", "BAC", "GS", "WFC", "C", "XOM", "CVX", "JNJ",
+                         "PFE", "MRK", "UNH", "ABBV", "V", "MA", "HD", "LOW"}
+        # High-vol stocks
+        high_vol_stocks = {"TSLA", "NVDA", "AMD", "COIN", "MARA", "RIVN",
+                            "GME", "AMC", "ARKK", "PLTR"}
+
+        for t in trades:
+            pnl = t.get("pnl", 0.0)
+            symbol = t.get("symbol", "")
+
+            # Size factor: small-cap minus large-cap
+            if symbol in large_cap:
+                size_pnl -= pnl * 0.1  # Large cap negative exposure to size factor
+            else:
+                size_pnl += pnl * 0.1  # Small/mid cap positive exposure
+
+            # Value factor
+            if symbol in value_stocks:
+                value_pnl += pnl * 0.15
+
+            # Volatility factor (low-vol anomaly: low vol stocks outperform)
+            if symbol in high_vol_stocks:
+                vol_pnl -= pnl * 0.1  # High vol = negative low-vol factor exposure
+            else:
+                vol_pnl += pnl * 0.05
+
+        total_pnl = sum(t.get("pnl", 0.0) for t in trades)
+        factor_explained = total_beta_pnl + size_pnl + value_pnl + vol_pnl
+
         result.market_beta_pnl = total_beta_pnl
         result.sector_pnl = dict(sector_pnl)
         result.momentum_pnl = momentum_pnl
         result.mean_reversion_pnl = mr_pnl
-        result.residual_alpha = sum(t.get("pnl", 0.0) for t in trades) - total_beta_pnl
+        result.size_factor_pnl = size_pnl
+        result.value_factor_pnl = value_pnl
+        result.volatility_factor_pnl = vol_pnl
+        result.residual_alpha = total_pnl - factor_explained
 
         return result
 
@@ -474,12 +529,75 @@ class PerformanceAttribution:
                 pnl_per_share = pnl / qty
                 sizing_values.append(pnl_per_share * qty)
 
-        # Entry timing score: 0-1 where 1 = always entered at the best price
+        # IMPL-003: Compute both timing scores and dollar-value contributions
         if entry_timing_values:
-            result.entry_timing_pnl = float(np.mean(entry_timing_values))
+            result.entry_timing_score = float(np.mean(entry_timing_values))
 
         if exit_timing_values:
-            result.exit_timing_pnl = float(np.mean(exit_timing_values))
+            result.exit_timing_score = float(np.mean(exit_timing_values))
+
+        # Dollar-value timing decomposition:
+        # For each trade, estimate how much P&L came from entry timing vs exit timing
+        # by comparing actual entry/exit prices to the bar midpoint (OHLC average)
+        entry_dollar_contributions = []
+        exit_dollar_contributions = []
+
+        for t in trades:
+            symbol = t.get("symbol", "")
+            entry_price = t.get("entry_price", 0.0)
+            exit_price = t.get("exit_price", 0.0)
+            entry_time = t.get("entry_time")
+            exit_time = t.get("exit_time")
+            qty = t.get("qty", 0)
+            side = t.get("side", "buy")
+
+            if not all([symbol, entry_price, exit_price, entry_time, exit_time, qty]):
+                continue
+            if symbol not in market_data:
+                continue
+
+            df = market_data[symbol]
+
+            # Entry timing dollar contribution:
+            # Compare actual entry price to bar's OHLC midpoint
+            try:
+                entry_bar = df.loc[df.index.asof(entry_time)]
+                if isinstance(entry_bar, pd.DataFrame):
+                    entry_bar = entry_bar.iloc[0]
+                bar_mid = (entry_bar["open"] + entry_bar["high"] +
+                           entry_bar["low"] + entry_bar["close"]) / 4.0
+                if side == "buy":
+                    # Better entry = lower price for longs
+                    entry_savings = (bar_mid - entry_price) * qty
+                else:
+                    # Better entry = higher price for shorts
+                    entry_savings = (entry_price - bar_mid) * qty
+                entry_dollar_contributions.append(entry_savings)
+            except (KeyError, IndexError, TypeError):
+                pass
+
+            # Exit timing dollar contribution
+            try:
+                exit_bar = df.loc[df.index.asof(exit_time)]
+                if isinstance(exit_bar, pd.DataFrame):
+                    exit_bar = exit_bar.iloc[0]
+                bar_mid = (exit_bar["open"] + exit_bar["high"] +
+                           exit_bar["low"] + exit_bar["close"]) / 4.0
+                if side == "buy":
+                    # Better exit = higher price for longs
+                    exit_savings = (exit_price - bar_mid) * qty
+                else:
+                    # Better exit = lower price for shorts
+                    exit_savings = (bar_mid - exit_price) * qty
+                exit_dollar_contributions.append(exit_savings)
+            except (KeyError, IndexError, TypeError):
+                pass
+
+        if entry_dollar_contributions:
+            result.entry_timing_pnl = float(sum(entry_dollar_contributions))
+
+        if exit_dollar_contributions:
+            result.exit_timing_pnl = float(sum(exit_dollar_contributions))
 
         if sizing_values:
             # Compare actual PnL to equal-weight PnL

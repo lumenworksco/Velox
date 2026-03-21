@@ -38,7 +38,9 @@ from config.settings import (  # explicit re-exports for type checkers
     MARKET_OPEN, MARKET_CLOSE, TRADING_START,
     SYMBOLS, CORE_SYMBOLS, LEVERAGED_ETFS, STANDARD_SYMBOLS,
     STRATEGY_ALLOCATIONS, SECTOR_MAP, SECTOR_GROUPS,
-    validate, get_param, set_param,
+    validate, validate_config, get_param, set_param,
+    # PROD-013: YAML config support
+    load_yaml_config, start_yaml_watcher, get_yaml_config,
 )
 
 import logging

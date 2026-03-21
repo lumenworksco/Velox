@@ -30,22 +30,33 @@ app = FastAPI(title="Velox V10 Dashboard", docs_url=None, redoc_url=None)
 
 # V10 SEC-003: IP-based rate limiting (10 req/sec per IP)
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Simple in-memory rate limiter per client IP."""
+    """Simple in-memory rate limiter per client IP.
 
-    def __init__(self, app, max_requests: int = 10, window_sec: float = 1.0):
+    Two layers:
+    - Burst: max 10 requests per second per IP (original SEC-003)
+    - MED-033: Per-endpoint: max 60 requests per minute per IP+endpoint
+    """
+
+    def __init__(self, app, max_requests: int = 10, window_sec: float = 1.0,
+                 endpoint_max: int = 60, endpoint_window_sec: float = 60.0):
         super().__init__(app)
         self.max_requests = max_requests
         self.window_sec = window_sec
+        self.endpoint_max = endpoint_max
+        self.endpoint_window_sec = endpoint_window_sec
         self._requests: dict[str, collections.deque] = {}
+        # MED-033: per-endpoint rate tracking: (ip, path) -> deque of timestamps
+        self._endpoint_requests: dict[tuple[str, str], collections.deque] = {}
 
     async def dispatch(self, request: Request, call_next):
         # Skip rate limiting for health and metrics endpoints
         if request.url.path in ("/health", "/metrics"):
             return await call_next(request)
 
-        client_ip = request.client.host if request.client else "unknown"
+        client_ip = _get_client_ip(request)
         now = _time.time()
 
+        # --- Burst rate limit (10 req/sec per IP) ---
         if client_ip not in self._requests:
             self._requests[client_ip] = collections.deque()
 
@@ -61,7 +72,47 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             )
 
         window.append(now)
+
+        # --- MED-033: Per-endpoint rate limit (60 req/min per IP+endpoint) ---
+        ep_key = (client_ip, request.url.path)
+        if ep_key not in self._endpoint_requests:
+            self._endpoint_requests[ep_key] = collections.deque()
+
+        ep_window = self._endpoint_requests[ep_key]
+        while ep_window and ep_window[0] < now - self.endpoint_window_sec:
+            ep_window.popleft()
+
+        if len(ep_window) >= self.endpoint_max:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": f"Rate limit exceeded. Max {self.endpoint_max} requests per minute per endpoint."},
+            )
+
+        ep_window.append(now)
+
         return await call_next(request)
+
+
+# MED-034: Trusted proxy IPs for X-Forwarded-For header validation.
+# Only trust XFF from these IPs. Empty list = always use request.client.host.
+TRUSTED_PROXIES: set[str] = set(getattr(config, "TRUSTED_PROXY_IPS", []))
+
+
+def _get_client_ip(request: Request) -> str:
+    """MED-034: Extract client IP, only trusting X-Forwarded-For behind known proxies."""
+    direct_ip = request.client.host if request.client else "unknown"
+
+    if not TRUSTED_PROXIES:
+        return direct_ip
+
+    # Only trust XFF if the direct connection is from a known proxy
+    if direct_ip in TRUSTED_PROXIES:
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            # Take the leftmost (client) IP from the chain
+            return xff.split(",")[0].strip()
+
+    return direct_ip
 
 
 # Only enable rate limiting in production (skip during tests)
@@ -95,7 +146,11 @@ _start_time = _time.time()
 
 @app.get("/health")
 async def health():
-    """Health check for Docker / monitoring."""
+    """Liveness check — returns 200 if the process is alive.
+
+    IMPL-007: Lightweight liveness probe suitable for Docker HEALTHCHECK
+    or Kubernetes liveness probes. Does NOT check downstream dependencies.
+    """
     uptime_sec = _time.time() - _start_time
     try:
         positions = database.load_open_positions()
@@ -112,6 +167,80 @@ async def health():
         "version": "V10",
         "auth_enabled": AUTH_ENABLED,
     }
+
+
+@app.get("/ready")
+async def readiness_check():
+    """Readiness check — verifies all critical dependencies are operational.
+
+    IMPL-007: Checks DB connectivity, broker connection, and data feed status.
+    Returns 200 only if ALL checks pass. Returns 503 if any check fails.
+    Suitable for Kubernetes readiness probes or load balancer health checks.
+
+    Checks performed:
+    1. Database connectivity (can query positions table)
+    2. Broker API connectivity (can reach account endpoint)
+    3. Data feed status (can fetch a snapshot for SPY)
+    """
+    checks = {
+        "database": {"ok": False, "latency_ms": None, "detail": ""},
+        "broker": {"ok": False, "latency_ms": None, "detail": ""},
+        "data_feed": {"ok": False, "latency_ms": None, "detail": ""},
+    }
+    overall_ok = True
+
+    # Check 1: Database connectivity
+    try:
+        t0 = _time.time()
+        positions = database.load_open_positions()
+        latency = (_time.time() - t0) * 1000
+        checks["database"]["ok"] = True
+        checks["database"]["latency_ms"] = round(latency, 1)
+        checks["database"]["detail"] = f"{len(positions)} open positions"
+    except Exception as e:
+        checks["database"]["detail"] = str(e)
+        overall_ok = False
+
+    # Check 2: Broker API connectivity
+    try:
+        from data import get_account
+        t0 = _time.time()
+        account = get_account()
+        latency = (_time.time() - t0) * 1000
+        checks["broker"]["ok"] = True
+        checks["broker"]["latency_ms"] = round(latency, 1)
+        equity = float(account.equity) if hasattr(account, "equity") else 0
+        checks["broker"]["detail"] = f"equity=${equity:,.0f}"
+    except Exception as e:
+        checks["broker"]["detail"] = str(e)
+        overall_ok = False
+
+    # Check 3: Data feed status
+    try:
+        from data import verify_data_feed
+        t0 = _time.time()
+        feed_ok = verify_data_feed("SPY")
+        latency = (_time.time() - t0) * 1000
+        checks["data_feed"]["ok"] = feed_ok
+        checks["data_feed"]["latency_ms"] = round(latency, 1)
+        checks["data_feed"]["detail"] = "SPY data accessible" if feed_ok else "SPY data unavailable"
+        if not feed_ok:
+            overall_ok = False
+    except Exception as e:
+        checks["data_feed"]["detail"] = str(e)
+        overall_ok = False
+
+    status_code = 200 if overall_ok else 503
+    result = {
+        "ready": overall_ok,
+        "uptime_seconds": round(_time.time() - _start_time),
+        "checks": checks,
+    }
+
+    if not overall_ok:
+        return JSONResponse(content=result, status_code=503)
+
+    return result
 
 
 # V10: Login rate limiting (IP-based, 3 attempts per minute)
@@ -147,7 +276,7 @@ async def login(request: Request, username: str = Body(...), password: str = Bod
     if not AUTH_ENABLED:
         return {"token": "auth_disabled", "message": "Authentication is not configured"}
 
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _get_client_ip(request)
     if not _check_rate_limit(client_ip):
         raise HTTPException(
             status_code=429,
@@ -1046,6 +1175,21 @@ async def v2_health():
 
 
 # ===================================================================
+# PROD-011: Degraded Module Status Endpoint
+# ===================================================================
+
+@app.get("/api/degraded")
+async def get_degraded_status():
+    """PROD-011: Return which modules are currently in degraded/fail-open state."""
+    try:
+        from engine.degraded_tracker import degraded_tracker
+        return degraded_tracker.status()
+    except Exception as e:
+        logger.error("Failed to get degraded status: %s", e)
+        return {"degraded_count": -1, "healthy": False, "error": str(e)}
+
+
+# ===================================================================
 # V10 Endpoints: OMS, Kill Switch, Circuit Breaker
 # ===================================================================
 
@@ -1118,6 +1262,51 @@ async def v10_kill_switch_deactivate(user=Depends(_require_auth)):
         raise HTTPException(status_code=503, detail="Kill switch not initialized")
     _v10_kill_switch.deactivate()
     return {"status": "deactivated"}
+
+
+# WIRE-009: Fill analytics endpoint (fail-open)
+_fill_analytics = None
+try:
+    from execution.fill_analytics import FillAnalytics as _FA
+    _fill_analytics = _FA()
+except ImportError:
+    _FA = None
+
+
+@app.get("/api/fill-quality")
+async def fill_quality(user=Depends(_require_auth)):
+    """Fill quality analytics summary."""
+    if _fill_analytics is None:
+        raise HTTPException(status_code=503, detail="Fill analytics not available")
+    try:
+        report = _fill_analytics.get_daily_summary()
+        return {"status": "ok", "data": report.__dict__ if hasattr(report, '__dict__') else report}
+    except Exception as e:
+        logger.debug("WIRE-009: Fill analytics error (fail-open): %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# WIRE-011: Attribution endpoint (fail-open)
+_attribution_engine = None
+try:
+    from backtesting.attribution import PerformanceAttribution as _PA
+    _attribution_engine = _PA()
+except ImportError:
+    _PA = None
+
+
+@app.get("/api/attribution")
+async def attribution(days: int = Query(default=30, ge=1, le=365), user=Depends(_require_auth)):
+    """Performance attribution (Brinson-Fachler decomposition)."""
+    if _attribution_engine is None:
+        raise HTTPException(status_code=503, detail="Attribution engine not available")
+    try:
+        trades = database.get_recent_trades(days=days)
+        report = _attribution_engine.compute_attribution(trades, market_data=None)
+        return {"status": "ok", "data": report.__dict__ if hasattr(report, '__dict__') else report}
+    except Exception as e:
+        logger.debug("WIRE-011: Attribution error (fail-open): %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # V10: Register Prometheus metrics endpoint

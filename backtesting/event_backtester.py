@@ -295,13 +295,21 @@ class Portfolio:
 # ===================================================================== #
 
 class FillSimulator:
-    """Simulates order fills with realistic slippage and partial fills.
+    """Simulates order fills with realistic slippage, partial fills, and market impact.
+
+    IMPL-001: Enhanced fill simulation with:
+    - Volume-participation-based slippage (higher participation -> more slippage)
+    - Bid-ask spread estimation from bar data (uses bar range as proxy)
+    - Market impact modeling (square-root model: impact ~ sigma * sqrt(qty/volume))
+    - Realistic partial fills (fill fraction decays with order size relative to volume)
 
     Args:
         commission_per_share: Commission cost per share.
-        slippage_bps: Slippage in basis points.
-        max_fill_pct: Maximum fraction of bar volume that can be filled.
+        slippage_bps: Base slippage in basis points (floor; actual slippage may be higher).
+        max_fill_pct: Maximum fraction of bar volume that can be filled per order.
         latency_bars: Number of bars of delay before fills execute.
+        market_impact_coeff: Coefficient for square-root market impact model (default 0.1).
+        spread_pct_of_range: Fraction of bar range used to estimate bid-ask spread (default 0.1).
     """
 
     def __init__(
@@ -310,16 +318,81 @@ class FillSimulator:
         slippage_bps: float = 5.0,
         max_fill_pct: float = 0.10,
         latency_bars: int = 0,
+        market_impact_coeff: float = 0.1,
+        spread_pct_of_range: float = 0.10,
     ) -> None:
         self._commission = commission_per_share
         self._slippage_bps = slippage_bps
         self._max_fill_pct = max_fill_pct
         self._latency_bars = latency_bars
+        self._market_impact_coeff = market_impact_coeff
+        self._spread_pct_of_range = spread_pct_of_range
         self._pending_orders: list[tuple[int, Order]] = []  # (bars_remaining, order)
+        self._residual_orders: list[Order] = []  # Unfilled remainder from partial fills
 
     def submit_order(self, order: Order) -> None:
         """Submit an order with optional latency delay."""
         self._pending_orders.append((self._latency_bars, order))
+
+    def _estimate_spread(self, bar: pd.Series) -> float:
+        """Estimate bid-ask spread from bar data.
+
+        Uses the bar's high-low range as a proxy: the spread is assumed to be
+        a small fraction of the bar range. For very tight bars, falls back to
+        a minimum of 1 basis point of the close price.
+
+        Returns:
+            Estimated half-spread in price units.
+        """
+        bar_high = float(bar.get("high", 0))
+        bar_low = float(bar.get("low", 0))
+        bar_close = float(bar.get("close", bar_high))
+        bar_range = bar_high - bar_low
+
+        if bar_range > 0:
+            half_spread = (bar_range * self._spread_pct_of_range) / 2.0
+        else:
+            # Fallback: 1 bps of close price
+            half_spread = bar_close * 0.0001
+
+        return max(half_spread, bar_close * 0.00005)  # Floor at 0.5 bps
+
+    def _compute_market_impact(
+        self, qty: int, bar_volume: int, bar_close: float, bar: pd.Series,
+    ) -> float:
+        """Compute market impact using the square-root model.
+
+        Impact = coefficient * sigma * sqrt(qty / volume) * price
+
+        where sigma is estimated from the bar's high-low range (Parkinson estimator).
+
+        Args:
+            qty: Number of shares being traded.
+            bar_volume: Total volume for this bar.
+            bar_close: Bar close price.
+            bar: Full bar data for volatility estimation.
+
+        Returns:
+            Market impact in price units (added to buy price, subtracted from sell price).
+        """
+        if bar_volume <= 0 or qty <= 0:
+            return 0.0
+
+        participation_rate = qty / bar_volume
+
+        # Parkinson volatility estimator from single bar
+        bar_high = float(bar.get("high", bar_close))
+        bar_low = float(bar.get("low", bar_close))
+        if bar_high > bar_low and bar_close > 0:
+            # Parkinson: sigma = (1 / (2*sqrt(ln2))) * ln(H/L)
+            sigma = np.log(bar_high / max(bar_low, 1e-8)) / (2.0 * np.sqrt(np.log(2)))
+        else:
+            sigma = 0.001  # Fallback: 10 bps
+
+        # Square-root market impact model
+        impact = self._market_impact_coeff * sigma * np.sqrt(participation_rate) * bar_close
+
+        return max(impact, 0.0)
 
     def process_bar(
         self,
@@ -327,10 +400,28 @@ class FillSimulator:
         symbol: str,
         bar_timestamp: datetime,
     ) -> list[Fill]:
-        """Process pending orders against a bar. Returns list of fills."""
+        """Process pending orders against a bar. Returns list of fills.
+
+        IMPL-001: Also processes residual orders from previous partial fills.
+        If an order is only partially filled, the unfilled remainder is queued
+        as a residual order for the next bar.
+        """
         fills = []
         remaining_orders = []
+        new_residuals = []
 
+        # Process residual orders from previous partial fills first
+        for residual in self._residual_orders:
+            if residual.symbol != symbol:
+                new_residuals.append(residual)
+                continue
+            fill, leftover = self._try_fill(residual, bar, bar_timestamp)
+            if fill is not None:
+                fills.append(fill)
+            if leftover is not None:
+                new_residuals.append(leftover)
+
+        # Process new pending orders
         for bars_left, order in self._pending_orders:
             if order.symbol != symbol:
                 remaining_orders.append((bars_left, order))
@@ -341,12 +432,15 @@ class FillSimulator:
                 continue
 
             # Ready to fill
-            fill = self._try_fill(order, bar, bar_timestamp)
+            fill, leftover = self._try_fill(order, bar, bar_timestamp)
             if fill is not None:
                 fills.append(fill)
-            # If fill failed (e.g. limit not reached), discard the order
+            if leftover is not None:
+                new_residuals.append(leftover)
+            # If fill is None and leftover is None, the order was not fillable (limit not reached)
 
         self._pending_orders = remaining_orders
+        self._residual_orders = new_residuals
         return fills
 
     def _try_fill(
@@ -354,38 +448,67 @@ class FillSimulator:
         order: Order,
         bar: pd.Series,
         timestamp: datetime,
-    ) -> Optional[Fill]:
-        """Attempt to fill an order against a bar."""
+    ) -> tuple[Optional[Fill], Optional[Order]]:
+        """Attempt to fill an order against a bar.
+
+        IMPL-001: Enhanced fill simulation with realistic partial fills,
+        volume-participation slippage, bid-ask spread, and market impact.
+
+        Returns:
+            Tuple of (Fill or None, residual Order or None).
+            - If fill succeeded: (Fill, residual_order_or_None)
+            - If fill failed (limit not reached, no volume): (None, None)
+        """
         bar_volume = int(bar.get("volume", 0))
         if bar_volume <= 0:
-            return None
+            return None, None
 
-        # Partial fill: cap at max_fill_pct of bar volume
+        # --- Partial fill: cap at max_fill_pct of bar volume ---
         fillable_qty = max(1, int(bar_volume * self._max_fill_pct))
         fill_qty = min(order.qty, fillable_qty)
 
-        # Determine fill price
+        # --- Determine base fill price ---
         if order.order_type == "limit" and order.limit_price is not None:
             if order.side == "buy" and bar["low"] > order.limit_price:
-                return None  # Limit not reached
+                return None, None  # Limit not reached
             if order.side == "sell" and bar["high"] < order.limit_price:
-                return None
+                return None, None
             base_price = order.limit_price
         else:
             # Market order: fill at open of the bar (conservative)
             base_price = float(bar.get("open", bar["close"]))
 
-        # Apply slippage
-        slippage_mult = self._slippage_bps / 10_000
+        bar_close = float(bar.get("close", base_price))
+
+        # --- Bid-ask spread cost ---
+        half_spread = self._estimate_spread(bar)
+
+        # --- Market impact (square-root model) ---
+        market_impact = self._compute_market_impact(fill_qty, bar_volume, bar_close, bar)
+
+        # --- Volume participation slippage ---
+        # Higher participation -> disproportionately more slippage
+        participation_rate = fill_qty / bar_volume if bar_volume > 0 else 0.0
+        participation_slippage_bps = self._slippage_bps * (1.0 + 5.0 * participation_rate)
+        participation_slippage = base_price * participation_slippage_bps / 10_000
+
+        # --- Total slippage: max of (base slippage, participation slippage) + spread + impact ---
+        total_adverse_cost = participation_slippage + half_spread + market_impact
+
         if order.side == "buy":
-            fill_price = base_price * (1.0 + slippage_mult)
+            fill_price = base_price + total_adverse_cost
         else:
-            fill_price = base_price * (1.0 - slippage_mult)
+            fill_price = base_price - total_adverse_cost
+
+        # Clamp fill price within bar range
+        bar_high = float(bar.get("high", fill_price * 1.05))
+        bar_low = float(bar.get("low", fill_price * 0.95))
+        fill_price = max(bar_low, min(bar_high, fill_price))
 
         slippage_cost = abs(fill_price - base_price) * fill_qty
         commission = self._commission * fill_qty
 
-        return Fill(
+        fill = Fill(
             symbol=order.symbol,
             side=order.side,
             qty=fill_qty,
@@ -395,6 +518,22 @@ class FillSimulator:
             timestamp=timestamp,
             strategy=order.strategy,
         )
+
+        # --- Create residual order for unfilled remainder ---
+        residual = None
+        remaining_qty = order.qty - fill_qty
+        if remaining_qty > 0:
+            residual = Order(
+                symbol=order.symbol,
+                side=order.side,
+                qty=remaining_qty,
+                order_type=order.order_type,
+                limit_price=order.limit_price,
+                strategy=order.strategy,
+                timestamp=order.timestamp,
+            )
+
+        return fill, residual
 
 
 # ===================================================================== #

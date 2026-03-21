@@ -19,6 +19,14 @@ from utils import safe_divide
 
 logger = logging.getLogger(__name__)
 
+# WIRE-004: Order book imbalance confirmation (fail-open)
+_order_book_analyzer = None
+try:
+    from microstructure.order_book import OrderBookAnalyzer as _OBA
+    _order_book_analyzer = _OBA()
+except ImportError:
+    _OBA = None
+
 
 class ORBStrategyV2:
     """Opening Range Breakout v2 — scans for volume-confirmed breakouts."""
@@ -166,6 +174,20 @@ class ORBStrategyV2:
                 # --- LONG breakout ---
                 breakout_buf = config.ORB_BREAKOUT_BUFFER
                 if price > orb_high * (1 + breakout_buf) and vol_ratio > config.ORB_VOLUME_RATIO:
+                    # WIRE-004: Order book imbalance confirmation (fail-open)
+                    _imbalance_ok = True
+                    try:
+                        if _order_book_analyzer is not None:
+                            imb = _order_book_analyzer.get_rolling_imbalance(symbol)
+                            if imb < -0.3:
+                                _imbalance_ok = False
+                                logger.debug("WIRE-004: %s ORB long skipped — order book imbalance %.2f", symbol, imb)
+                    except Exception as _e:
+                        logger.debug("WIRE-004: Order book check failed for %s (fail-open): %s", symbol, _e)
+
+                    if not _imbalance_ok:
+                        continue
+
                     entry = price
                     tp = entry + config.ORB_TP_MULT * orb_range
                     sl = entry - config.ORB_SL_MULT * orb_range
@@ -192,6 +214,20 @@ class ORBStrategyV2:
                     and price < orb_low * (1 - breakout_buf)
                     and vol_ratio > config.ORB_VOLUME_RATIO
                 ):
+                    # WIRE-004: Order book imbalance confirmation (fail-open)
+                    _imbalance_ok = True
+                    try:
+                        if _order_book_analyzer is not None:
+                            imb = _order_book_analyzer.get_rolling_imbalance(symbol)
+                            if imb > 0.3:
+                                _imbalance_ok = False
+                                logger.debug("WIRE-004: %s ORB short skipped — order book imbalance %.2f", symbol, imb)
+                    except Exception as _e:
+                        logger.debug("WIRE-004: Order book check failed for %s (fail-open): %s", symbol, _e)
+
+                    if not _imbalance_ok:
+                        continue
+
                     entry = price
                     tp = entry - config.ORB_TP_MULT * orb_range
                     sl = entry + config.ORB_SL_MULT * orb_range

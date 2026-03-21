@@ -96,6 +96,15 @@ class MockTradingClient:
         self._positions.clear()
         return True
 
+    def get_clock(self):
+        return types.SimpleNamespace(is_open=True, next_open="2026-03-22T09:30:00")
+
+    def get_order_by_id(self, order_id: str) -> MockOrder:
+        for order in self._orders:
+            if str(order.id) == order_id:
+                return order
+        raise Exception(f"Order {order_id} not found")
+
     def cancel_orders(self):
         self._orders.clear()
         return True

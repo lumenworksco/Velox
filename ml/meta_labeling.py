@@ -377,7 +377,7 @@ class MetaLabeler:
         # Meta-label: 1 if primary signal direction matches outcome, 0 otherwise
         # For long signals (+1): profitable if label == +1
         # For short signals (-1): profitable if label == -1
-        y_meta = ((signal_dir * y_raw) > 0).astype(int)
+        y_meta = (((signal_dir > 0) & (y_raw > 0)) | ((signal_dir < 0) & (y_raw < 0))).astype(int)
 
         feature_names = list(X_full.columns)
         X = X_full.values.astype(np.float64)

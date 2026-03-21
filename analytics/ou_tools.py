@@ -53,7 +53,8 @@ def fit_ou_params(prices: pd.Series) -> dict:
         residuals = delta_x - (a + b * x_lag)
         sigma = float(np.std(residuals))
 
-        if kappa <= 0 or sigma <= 0:
+        # CRIT-013: Guard against near-zero sigma causing infinite z-scores
+        if kappa <= 0 or sigma < 1e-8:
             return {}
 
         half_life = np.log(2) / kappa  # In units of bar intervals

@@ -20,7 +20,9 @@ from execution.core import (
     _submit_order,
     _check_order_filled,
     _compute_backoff_delay,
+    _validate_bracket_params,
 )
+from data import get_trading_client  # Re-export for backward compatibility
 
 # --- V11 additions ---
 from execution.smart_router import (

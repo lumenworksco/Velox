@@ -90,6 +90,9 @@ class MarketImpactSlippage(SlippageModel):
         participation = qty / avg_daily_volume
         impact = self.volatility * math.sqrt(participation) * self.impact_lambda
         slip_bps = impact * 10000
+        # MED-013: Cap maximum slippage to configurable limit
+        max_slippage_bps = getattr(config, 'MAX_SLIPPAGE_BPS', 50)
+        slip_bps = min(slip_bps, max_slippage_bps)
         half_spread = spread_bps / 2 if spread_bps > 0 else 0.5
         total_slip_bps = slip_bps + half_spread
         slip = price * (total_slip_bps / 10000)

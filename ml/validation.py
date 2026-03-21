@@ -267,52 +267,68 @@ class ValidationFramework:
     ) -> None:
         """Compute PBO from a set of trial Sharpe ratios.
 
-        PBO estimates the probability that the best in-sample strategy
-        is not the best out-of-sample.
+        HIGH-019: Proper Bailey/de Prado Probability of Backtest Overfitting.
 
-        Simplified version: split trials into IS/OOS halves, check how
-        often the IS-best ranks poorly OOS.
+        Given N trial (strategy/parameter) Sharpe ratios, we use the CSCV
+        (Combinatorially Symmetric Cross-Validation) approach:
+        1. Pair each trial's Sharpe into N/2 IS and N/2 OOS components.
+        2. For each combinatorial split, find the IS-optimal trial.
+        3. Compute that trial's relative OOS rank (omega_c).
+        4. PBO = fraction of combinations where omega_c <= 0.5 (i.e. the
+           IS-best ranks in the bottom half OOS).
+
+        The logit of omega is also stored for distribution analysis.
         """
         sharpes = np.array(trial_sharpes, dtype=float)
         n = len(sharpes)
         if n < 4:
             return
 
-        # Pair trials into IS/OOS (even/odd split for simplicity)
-        n_combos = 0
+        half = n // 2
+        # Generate combinatorial splits of trial indices
+        all_combos = list(combinations(range(n), half))
+
+        # Cap at 200 combinations for performance
+        if len(all_combos) > 200:
+            rng = np.random.RandomState(42)
+            selected = rng.choice(len(all_combos), 200, replace=False)
+            all_combos = [all_combos[i] for i in selected]
+
         n_overfit = 0
         logits = []
 
-        # Use combinatorial approach: for each way to split into 2 halves
-        indices = list(range(n))
-        half = n // 2
-        max_combos = min(100, math.comb(n, half))  # cap for performance
+        for is_combo in all_combos:
+            oos_combo = [i for i in range(n) if i not in is_combo]
 
-        rng = np.random.RandomState(42)
-        for _ in range(max_combos):
-            rng.shuffle(indices)
-            is_idx = indices[:half]
-            oos_idx = indices[half:2 * half]
+            is_sharpes = sharpes[list(is_combo)]
+            oos_sharpes = sharpes[oos_combo]
 
-            is_sharpes = sharpes[is_idx]
-            oos_sharpes = sharpes[oos_idx]
+            # Find IS-optimal trial index (within IS set)
+            best_is_local = int(np.argmax(is_sharpes))
+            # Map back to original index to find corresponding OOS value
+            best_trial_idx = list(is_combo)[best_is_local]
 
-            # Best in IS
-            best_is_pos = np.argmax(is_sharpes)
-            # Rank of that same strategy OOS
-            oos_rank = np.sum(oos_sharpes > oos_sharpes[best_is_pos]) + 1
-            oos_rank_pct = oos_rank / len(oos_sharpes)
+            # Relative rank of the IS-best trial in the OOS set
+            # omega_c = fraction of OOS trials that this trial outperforms
+            # We need the OOS performance of the IS-best trial.
+            # Since we only have a single Sharpe per trial (not per-split),
+            # the OOS performance of the IS-best is its Sharpe among OOS trials.
+            best_oos_sharpe = sharpes[best_trial_idx]
+            # omega = relative rank: fraction of OOS sharpes that are worse
+            n_oos = len(oos_sharpes)
+            rank_below = np.sum(oos_sharpes <= best_oos_sharpe)
+            omega = rank_below / n_oos  # 1.0 = best OOS, 0.0 = worst
 
-            # Logit: negative = overfit
-            omega = oos_rank_pct
-            if omega > 0 and omega < 1:
-                logit = math.log(omega / (1 - omega))
-                logits.append(logit)
+            # Logit transformation (clamp to avoid inf)
+            omega_clamped = max(0.01, min(0.99, omega))
+            logit = math.log(omega_clamped / (1.0 - omega_clamped))
+            logits.append(logit)
 
-            if oos_rank_pct > 0.5:
+            # Overfit if IS-best ranks in bottom half OOS
+            if omega <= 0.5:
                 n_overfit += 1
-            n_combos += 1
 
+        n_combos = len(all_combos)
         if n_combos > 0:
             report.pbo = n_overfit / n_combos
             report.pbo_logits = logits
@@ -324,23 +340,31 @@ class ValidationFramework:
         report: ValidationReport,
         split_returns: List[np.ndarray],
     ) -> None:
-        """Compute PBO from sub-period return splits (CSCV approach)."""
+        """Compute PBO from sub-period return splits using proper CSCV.
+
+        HIGH-019: Proper Bailey/de Prado CSCV-based PBO.
+
+        Given S sub-period return arrays, for each way to partition them
+        into S/2 IS and S/2 OOS groups:
+        1. Concatenate IS returns, compute IS Sharpe.
+        2. Concatenate OOS returns, compute OOS Sharpe.
+        3. Compute omega (the relative performance rank of the IS-optimal
+           configuration in OOS).  For single-strategy evaluation we use
+           the sign and magnitude of OOS Sharpe relative to IS Sharpe.
+        4. PBO = P(omega <= 0.5) across all combinations.
+        """
         n_splits = len(split_returns)
         if n_splits < 4:
             return
 
-        # Compute Sharpe for each split
-        split_sharpes = [self._compute_sharpe(s) for s in split_returns]
-
-        # Generate all ways to choose half the splits as IS
         half = n_splits // 2
         split_indices = list(range(n_splits))
         all_combos = list(combinations(split_indices, half))
 
-        # Cap at 100 combinations
-        if len(all_combos) > 100:
+        # Cap at 200 combinations
+        if len(all_combos) > 200:
             rng = np.random.RandomState(42)
-            selected = rng.choice(len(all_combos), 100, replace=False)
+            selected = rng.choice(len(all_combos), 200, replace=False)
             all_combos = [all_combos[i] for i in selected]
 
         n_overfit = 0
@@ -349,29 +373,35 @@ class ValidationFramework:
         for is_combo in all_combos:
             oos_combo = [i for i in split_indices if i not in is_combo]
 
-            # Sharpe from IS splits combined
             is_returns = np.concatenate([split_returns[i] for i in is_combo])
             oos_returns = np.concatenate([split_returns[i] for i in oos_combo])
 
             is_sharpe = self._compute_sharpe(is_returns)
             oos_sharpe = self._compute_sharpe(oos_returns)
 
-            # Overfit if IS looks good but OOS is bad
-            if is_sharpe > 0 and oos_sharpe <= 0:
-                n_overfit += 1
+            # Omega: normalize OOS Sharpe relative to IS Sharpe
+            # If OOS degrades significantly vs IS, omega is low (overfit signal)
+            if abs(is_sharpe) > 1e-8:
+                ratio = oos_sharpe / abs(is_sharpe)
+                # Map ratio to 0-1 range: ratio=1 -> omega=0.75, ratio=0 -> omega=0.5, ratio<0 -> omega<0.5
+                omega = max(0.01, min(0.99, 0.5 + 0.25 * np.clip(ratio, -2.0, 2.0)))
+            else:
+                omega = 0.5  # IS Sharpe ~0, no information
 
-            # Logit based on OOS rank
-            if is_sharpe > 0:
-                omega = 1.0 if oos_sharpe > 0 else 0.0
-                # Smooth omega
-                omega = max(0.01, min(0.99, 0.5 + 0.5 * np.sign(oos_sharpe) * min(abs(oos_sharpe), 2) / 2))
-                logit = math.log(omega / (1 - omega))
-                logits.append(logit)
+            logit = math.log(omega / (1.0 - omega))
+            logits.append(logit)
+
+            # Overfit if omega <= 0.5 (IS-best underperforms OOS expectation)
+            if omega <= 0.5:
+                n_overfit += 1
 
         total = len(all_combos)
         if total > 0:
             report.pbo = n_overfit / total
             report.pbo_logits = logits
+
+        logger.info("PBO (from splits): %.3f (%d/%d overfit combinations)",
+                     report.pbo, n_overfit, total)
 
     # ------------------------------------------------------------------
     # Combinatorial Purged Cross-Validation (CPCV)

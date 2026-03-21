@@ -15,6 +15,22 @@ from correlation import load_correlation_cache
 
 logger = logging.getLogger(__name__)
 
+# WIRE-007: Pre-market stress testing (fail-open)
+_stress_framework = None
+try:
+    from risk.stress_testing import StressTestFramework as _STF
+    _stress_framework = _STF()
+except ImportError:
+    _STF = None
+
+# WIRE-012: Tax-loss harvesting (fail-open)
+_tax_harvester = None
+try:
+    from ops.tax_harvesting import TaxLossHarvester as _TLH
+    _tax_harvester = _TLH()
+except ImportError:
+    _TLH = None
+
 
 def daily_reset(
     risk,
@@ -109,9 +125,53 @@ def daily_reset(
     except Exception as e:
         logger.error(f"Failed to refresh daily caches: {e}")
 
+    # WIRE-007: Run pre-market stress test (fail-open)
+    try:
+        if _stress_framework is not None:
+            equity = float(getattr(risk, 'current_equity', 0) or 0)
+            positions = getattr(risk, 'open_trades', {})
+            if equity > 0:
+                stress_result = _stress_framework.run_stress_tests(positions, equity)
+                if _stress_framework.should_block_new_positions():
+                    logger.warning("WIRE-007: Stress test recommends blocking new positions")
+                else:
+                    logger.info("WIRE-007: Pre-market stress test passed")
+    except Exception as e:
+        logger.debug("WIRE-007: Stress test failed (fail-open): %s", e)
 
-def weekly_tasks(current: datetime, kalman_pairs, param_optimizer=None, walk_forward=None):
-    """Run weekly tasks (Sunday): pair selection, parameter optimization, walk-forward."""
+
+def weekly_tasks(current: datetime, kalman_pairs, param_optimizer=None,
+                 walk_forward=None, hmm_detector=None):
+    """Run weekly tasks (Sunday): HMM retrain, pair selection, parameter optimization, walk-forward.
+
+    IMPL-008: Added HMM retrain as the first weekly task. The HMM should
+    be retrained before pair selection so that regime-aware decisions use
+    the freshest model.
+    """
+    # IMPL-008: Retrain HMM regime detector on recent SPY data
+    if hmm_detector is not None:
+        try:
+            logger.info("Sunday: retraining HMM regime detector...")
+            success = hmm_detector.retrain_weekly(lookback_days=252)
+            if success:
+                logger.info(
+                    f"HMM retrain complete: current regime = "
+                    f"{hmm_detector.current_regime.value}"
+                )
+            else:
+                logger.warning("HMM retrain returned False — using existing model")
+        except Exception as e:
+            logger.error(f"HMM weekly retrain failed: {e}")
+    else:
+        # Try to import and create detector if not provided
+        try:
+            from analytics.hmm_regime import HMMRegimeDetector
+            detector = HMMRegimeDetector()
+            if detector.retrain_weekly():
+                logger.info("HMM retrain completed (ad-hoc detector instance)")
+        except Exception as e:
+            logger.debug(f"HMM retrain skipped (no detector available): {e}")
+
     try:
         logger.info("Sunday: selecting cointegrated pairs...")
         kalman_pairs.select_pairs_weekly(current)
@@ -180,5 +240,19 @@ def eod_close(
 
     if closed_count:
         logger.info(f"EOD: closed {closed_count} day-hold positions")
+
+    # WIRE-012: Tax-loss harvesting scan after market close (fail-open)
+    try:
+        if _tax_harvester is not None:
+            positions = getattr(risk, 'open_trades', {})
+            if positions:
+                harvest_candidates = _tax_harvester.scan_for_harvesting(
+                    positions=positions,
+                    threshold=getattr(config, 'TAX_HARVEST_THRESHOLD', -0.03),
+                )
+                if harvest_candidates:
+                    logger.info("WIRE-012: Tax harvest candidates: %d positions", len(harvest_candidates))
+    except Exception as e:
+        logger.debug("WIRE-012: Tax harvesting scan failed (fail-open): %s", e)
 
     return closed_count

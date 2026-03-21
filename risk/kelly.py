@@ -24,11 +24,40 @@ class KellyEngine:
 
     def compute_fractions(self):
         """Recalculate Kelly fractions from trade database. Call daily at market open."""
+        # MED-015: Validate Kelly risk bounds at computation time
+        if config.KELLY_MIN_RISK >= config.KELLY_MAX_RISK:
+            logger.error(
+                "KELLY_MIN_RISK (%.4f) >= KELLY_MAX_RISK (%.4f) — "
+                "using flat RISK_PER_TRADE_PCT for all strategies",
+                config.KELLY_MIN_RISK, config.KELLY_MAX_RISK,
+            )
+            for s in config.STRATEGY_ALLOCATIONS:
+                self._fractions[s] = config.RISK_PER_TRADE_PCT
+            return
+
         strategies = list(config.STRATEGY_ALLOCATIONS.keys())
+
+        # MED-041: Single batch query for all trade history, then partition locally
+        # to avoid N sequential database roundtrips
+        try:
+            all_trades = database.get_recent_trades(days=365)
+        except Exception as e:
+            logger.warning(f"Kelly batch query failed, falling back to per-strategy: {e}")
+            all_trades = None
+
+        trades_by_strategy: dict[str, list[dict]] = {}
+        if all_trades is not None:
+            for t in all_trades:
+                strat = t.get("strategy", "")
+                if strat in config.STRATEGY_ALLOCATIONS:
+                    trades_by_strategy.setdefault(strat, []).append(t)
 
         for strategy in strategies:
             try:
-                trades = database.get_recent_trades_by_strategy(strategy, days=365)
+                if all_trades is not None:
+                    trades = trades_by_strategy.get(strategy, [])
+                else:
+                    trades = database.get_recent_trades_by_strategy(strategy, days=365)
                 # Use last KELLY_LOOKBACK trades
                 trades = trades[-config.KELLY_LOOKBACK:] if len(trades) > config.KELLY_LOOKBACK else trades
 
@@ -52,6 +81,10 @@ class KellyEngine:
                     avg_loss = 1e-6
 
                 win_loss_ratio = safe_divide(avg_win, avg_loss, default=0.0)
+
+                # HIGH-002: Cap extreme values to prevent outsized Kelly fractions
+                win_loss_ratio = min(win_loss_ratio, 10.0)
+                win_rate = min(win_rate, 0.95)
 
                 # Guard against near-zero win/loss ratio
                 if win_loss_ratio < 1e-6:

@@ -209,11 +209,13 @@ class InformationBarGenerator:
             state.n_ticks += 1
             state.cumulative_imbalance += imbalances[i]
 
-            # Check if imbalance exceeds threshold
-            expected_imbalance = ewma_ticks * abs(
-                imbalances[max(0, i - int(ewma_ticks)): i + 1].mean()
-                if state.n_ticks > 1 else imbalances[i]
-            )
+            # CRIT-004: Use completed bar count for threshold, not raw tick index
+            if len(bars) > 0 and state.n_ticks > 1:
+                recent_imb = [abs(b["imbalance"]) for b in bars[-max(1, int(ewma_ticks)):]]
+                avg_bar_imb = np.mean(recent_imb) if recent_imb else abs(float(imbalances[i]))
+                expected_imbalance = ewma_ticks * avg_bar_imb
+            else:
+                expected_imbalance = ewma_ticks * abs(float(imbalances[i]))
             dynamic_threshold = max(expected_imbalance, threshold * 0.1)
 
             if abs(state.cumulative_imbalance) >= dynamic_threshold and state.n_ticks >= 2:

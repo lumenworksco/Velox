@@ -1,16 +1,22 @@
 """Timezone utility functions — ensures consistent ET-aware datetimes throughout the codebase.
 
 BUG-009: Centralizes timezone handling to prevent naive/aware datetime mismatches.
+CRIT-003: Fallback import if config is unavailable.
 """
 
 from datetime import datetime
 
-import config
+try:
+    import config
+    _ET = config.ET
+except Exception:
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
 
 
 def now_et() -> datetime:
     """Return the current time as a timezone-aware datetime in US/Eastern."""
-    return datetime.now(config.ET)
+    return datetime.now(_ET)
 
 
 def ensure_et(dt: datetime) -> datetime:
@@ -20,5 +26,5 @@ def ensure_et(dt: datetime) -> datetime:
     - If already aware, converts to ET.
     """
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=config.ET)
-    return dt.astimezone(config.ET)
+        return dt.replace(tzinfo=_ET)
+    return dt.astimezone(_ET)

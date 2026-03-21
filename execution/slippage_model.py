@@ -102,6 +102,10 @@ class SlippageModel:
     def predict_slippage(self, features: SlippageFeatures) -> SlippagePrediction:
         """Predict expected slippage for an order.
 
+        HIGH-017: Blends theoretical (linear model) and empirical (fill history
+        average) slippage predictions.  The blend weight shifts toward the
+        empirical model as more fill data accumulates.
+
         Args:
             features: Market microstructure features at order time.
 
@@ -119,6 +123,8 @@ class SlippageModel:
                 w_closing=self._weights.w_closing,
                 w_market_order=self._weights.w_market_order,
             )
+            n_fills = len(self._fill_history)
+            empirical_mean = self._compute_empirical_mean() if n_fills >= 10 else None
         w = w_snapshot
 
         # Normalize features
@@ -126,8 +132,8 @@ class SlippageModel:
         size_log = math.log1p(features.size_adv_ratio * 1000)  # Log-scale, shift for stability
         vix_normalized = features.vix / 20.0  # Normalize to ~20 VIX
 
-        # Linear prediction
-        pred_bps = (
+        # Theoretical (linear model) prediction
+        theoretical_bps = (
             w.intercept
             + w.w_spread * features.spread_bps
             + w.w_volatility * vol_normalized
@@ -137,10 +143,26 @@ class SlippageModel:
             + (w.w_closing if features.is_closing else 0.0)
             + (w.w_market_order if features.order_type == "market" else 0.0)
         )
+        theoretical_bps = max(0.0, theoretical_bps)
+
+        # HIGH-017: Blend theoretical and empirical predictions
+        # Weight empirical more as sample count grows: w_emp = n / (n + K)
+        # K=100 means at 100 fills, empirical gets 50% weight
+        _BLEND_K = 100
+        if empirical_mean is not None and n_fills >= 10:
+            w_empirical = n_fills / (n_fills + _BLEND_K)
+            w_theoretical = 1.0 - w_empirical
+            pred_bps = w_theoretical * theoretical_bps + w_empirical * empirical_mean
+        else:
+            pred_bps = theoretical_bps
 
         # Floor at 0 — negative slippage (price improvement) is possible but
         # we predict the expected cost, which is non-negative
         pred_bps = max(0.0, pred_bps)
+
+        # MED-013: Cap maximum estimated slippage to prevent extreme values
+        max_slippage_bps = getattr(config, "MAX_SLIPPAGE_BPS", 50)
+        pred_bps = min(pred_bps, max_slippage_bps)
 
         # Confidence interval: +/- based on volatility and model uncertainty
         uncertainty_mult = 1.0 + vol_normalized * 0.5
@@ -342,6 +364,19 @@ class SlippageModel:
             total_cost, prediction.expected_bps, half_spread_bps,
         )
         return round(total_cost, 2)
+
+    def _compute_empirical_mean(self) -> float:
+        """Compute the mean actual slippage from fill history.
+
+        Must be called while holding ``self._lock``.
+        """
+        if not self._fill_history:
+            return 0.0
+        slippages = [
+            max(0.0, f.get("actual_slippage_bps", 0.0))
+            for f in self._fill_history[-500:]
+        ]
+        return sum(slippages) / len(slippages) if slippages else 0.0
 
     def _retrain_sgd(self, fills: list[dict]) -> None:
         """Retrain model weights using stochastic gradient descent.

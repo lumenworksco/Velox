@@ -14,8 +14,17 @@ from engine.event_log import log_event, EventType
 
 logger = logging.getLogger(__name__)
 
+# WIRE-006: Factor model for exposure limit checks (fail-open)
+_factor_model = None
+try:
+    from risk.factor_model import FactorRiskModel as _FRM
+    _factor_model = _FRM()
+except ImportError:
+    _FRM = None
+
 # --- VIX Risk Scaling ---
 _vix_cache: tuple[float, float] | None = None  # (vix_value, fetch_timestamp)
+_vix_cache_lock = threading.Lock()  # MED-001: protect concurrent VIX cache access
 
 
 def get_vix_level() -> float:
@@ -23,19 +32,26 @@ def get_vix_level() -> float:
     global _vix_cache
 
     now = time_mod.time()
-    if _vix_cache and (now - _vix_cache[1]) < config.VIX_CACHE_SECONDS:
-        return _vix_cache[0]
+    with _vix_cache_lock:
+        if _vix_cache and (now - _vix_cache[1]) < config.VIX_CACHE_SECONDS:
+            return _vix_cache[0]
 
     try:
         import yfinance as yf
+        import math
         vix = yf.Ticker("^VIX").fast_info.get("last_price", 0)
-        if vix and vix > 0:
-            _vix_cache = (float(vix), now)
+        # CRIT-015: Guard against None or NaN VIX values
+        if vix is None or not isinstance(vix, (int, float)) or math.isnan(vix):
+            vix = 0
+        if vix > 0:
+            with _vix_cache_lock:
+                _vix_cache = (float(vix), now)
             return float(vix)
     except Exception as e:
         logger.warning(f"Failed to fetch VIX: {e}")
 
-    return _vix_cache[0] if _vix_cache else 20.0  # Default to 20 if unavailable
+    with _vix_cache_lock:
+        return _vix_cache[0] if _vix_cache else 20.0  # Default to 20 if unavailable
 
 
 def get_vix_risk_scalar() -> float:
@@ -156,6 +172,19 @@ class RiskManager:
         max_deploy = self.current_equity * config.MAX_PORTFOLIO_DEPLOY
         if deployed >= max_deploy:
             return False, f"Max portfolio deployment ({config.MAX_PORTFOLIO_DEPLOY:.0%}) reached"
+
+        # WIRE-006: Factor exposure limit check (fail-open)
+        try:
+            if _factor_model is not None and self.open_trades:
+                violations = _factor_model.check_factor_limits(
+                    positions=self.open_trades,
+                    returns_data=None,
+                    exposures=None,
+                )
+                if violations:
+                    return False, f"Factor limit breach: {violations[0]}"
+        except Exception as _e:
+            logger.debug("WIRE-006: Factor model check failed (fail-open): %s", _e)
 
         return True, ""
 

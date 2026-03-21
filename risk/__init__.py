@@ -17,6 +17,12 @@ from risk.intraday_controls import IntradayRiskControls
 from risk.gap_risk import GapRiskManager
 from risk.correlation import DynamicCorrelation
 
+# Next-gen risk modules (RISK-001 through RISK-008)
+from risk.dynamic_hedging import DynamicHedgingEngine
+from risk.margin_monitor import MarginMonitor
+from risk.corporate_actions import CorporateActionDetector
+from risk.conformal_stops import ConformalStopEngine
+
 # Backward compatibility: re-export RiskManager, TradeRecord, VIX functions
 from risk.risk_manager import (
     RiskManager,
@@ -41,6 +47,11 @@ __all__ = [
     "IntradayRiskControls",
     "GapRiskManager",
     "DynamicCorrelation",
+    # Next-gen risk (RISK-001 through RISK-008)
+    "DynamicHedgingEngine",
+    "MarginMonitor",
+    "CorporateActionDetector",
+    "ConformalStopEngine",
     # V1-V5 backward compat
     "RiskManager",
     "TradeRecord",

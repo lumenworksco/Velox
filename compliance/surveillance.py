@@ -108,30 +108,6 @@ class SelfSurveillance:
     # Public API
     # ------------------------------------------------------------------
 
-    def run_daily_check(self, trades: list[dict]) -> SurveillanceReport:
-        """Run all surveillance checks on a day's trades.
-
-        Args:
-            trades: List of trade dicts with keys:
-                symbol, side, qty, entry_time, exit_time, entry_price, exit_price,
-                strategy, order_id (optional).
-
-        Returns:
-            SurveillanceReport with any flags found.
-
-        Never raises.
-        """
-        try:
-            return self._run_daily_inner(trades)
-        except Exception as e:
-            logger.error(f"SelfSurveillance.run_daily_check failed: {e}")
-            report = SurveillanceReport(
-                date=datetime.now(config.ET).strftime("%Y-%m-%d"),
-                errors=[str(e)],
-                clean=False,
-            )
-            return report
-
     def check_wash_trade(self, trades: list[dict] | dict) -> list[SurveillanceFlag]:
         """Check for wash trade patterns in a list of trades.
 

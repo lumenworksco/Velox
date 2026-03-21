@@ -16,6 +16,7 @@ Model persisted to models/hmm_regime.pkl.
 """
 
 import logging
+import threading
 import joblib
 from enum import Enum
 from pathlib import Path
@@ -104,24 +105,34 @@ def _compute_raw_features(df: pd.DataFrame) -> np.ndarray:
     # Daily returns (log)
     log_returns = np.diff(np.log(np.maximum(close, 1e-8)))
 
-    # Realized volatility (5-day and 20-day rolling std of returns)
+    # MED-040: Vectorized rolling std using cumulative sums (replaces Python loops)
     n = len(log_returns)
-    vol_5d = np.full(n, np.nan)
-    vol_20d = np.full(n, np.nan)
-    for i in range(4, n):
-        vol_5d[i] = np.std(log_returns[i - 4 : i + 1])
-    for i in range(19, n):
-        vol_20d[i] = np.std(log_returns[i - 19 : i + 1])
 
-    # Volume ratio (today / 20-day average)
+    def _rolling_std_vec(arr: np.ndarray, window: int) -> np.ndarray:
+        """Vectorized rolling standard deviation via cumulative sums."""
+        result = np.full(len(arr), np.nan)
+        if len(arr) < window:
+            return result
+        cs = np.concatenate([[0], np.cumsum(arr)])
+        cs2 = np.concatenate([[0], np.cumsum(arr ** 2)])
+        win_sum = cs[window:] - cs[:-window]
+        win_sum2 = cs2[window:] - cs2[:-window]
+        variance = win_sum2 / window - (win_sum / window) ** 2
+        variance = np.maximum(variance, 0)
+        result[window - 1:] = np.sqrt(variance)
+        return result
+
+    vol_5d = _rolling_std_vec(log_returns, 5)
+    vol_20d = _rolling_std_vec(log_returns, 20)
+
+    # Volume ratio (today / 20-day average) — vectorized
     vol_shifted = volume[1:]  # Align with returns
     vol_ratio = np.full(n, np.nan)
-    for i in range(19, n):
-        avg_vol = np.mean(vol_shifted[i - 19 : i])
-        if avg_vol > 0:
-            vol_ratio[i] = vol_shifted[i] / avg_vol
-        else:
-            vol_ratio[i] = 1.0
+    if n >= 20:
+        vcs = np.concatenate([[0], np.cumsum(vol_shifted)])
+        avg_vol_20 = (vcs[20:] - vcs[:-20]) / 20.0
+        safe_avg = np.where(avg_vol_20 > 0, avg_vol_20, 1.0)
+        vol_ratio[19:] = vol_shifted[19:] / safe_avg
 
     # VIX proxy: 20-day annualized vol (since we may not have VIX in historical data)
     vix_proxy = vol_20d * np.sqrt(252) * 100  # Convert to VIX-like scale
@@ -238,6 +249,7 @@ class HMMRegimeDetector:
             r: 0.2 for r in MarketRegimeState
         }
         self._fitted = False
+        self._lock = threading.Lock()  # MED-003: protect regime state
 
         # Try to load saved model
         self._load_model()
@@ -321,6 +333,17 @@ class HMMRegimeDetector:
                     f"val_score={val_score:.1f} (ratio={score_ratio:.2f})"
                 )
 
+            # HIGH-003: Reorder HMM states so state 0 = lowest mean return
+            sorted_indices = np.argsort(model.means_[:, 0])  # sort by mean daily return
+            model.means_ = model.means_[sorted_indices]
+            # Use internal _covars_ to bypass covariance_type validation during reorder
+            if hasattr(model, '_covars_'):
+                model._covars_ = model._covars_[sorted_indices]
+            else:
+                model.covars_ = model.covars_[sorted_indices]
+            model.startprob_ = model.startprob_[sorted_indices]
+            model.transmat_ = model.transmat_[sorted_indices][:, sorted_indices]
+
             self.model = model
             self._label_map = _label_states(model, features)
             self._feature_means = means
@@ -363,6 +386,12 @@ class HMMRegimeDetector:
 
             # Get state probabilities for the last observation
             log_prob, posteriors = self.model.score_samples(features)
+
+            # CRIT-012: Guard against NaN scores from degenerate features
+            if np.isnan(log_prob).any() or np.isnan(posteriors).any():
+                logger.warning("HMM produced NaN scores — returning fallback regime")
+                return self._current_regime, self._regime_probabilities
+
             last_posteriors = posteriors[-1]  # Probabilities for most recent day
 
             # Map HMM states to regime labels
@@ -371,17 +400,85 @@ class HMMRegimeDetector:
                 regime = self._label_map.get(state_idx, MarketRegimeState.MEAN_REVERTING)
                 probs[regime] = probs.get(regime, 0.0) + prob
 
-            # Determine most likely regime
+            # Determine most likely regime with 10% hysteresis
             best_regime = max(probs, key=lambda r: probs[r])
 
-            self._current_regime = best_regime
-            self._regime_probabilities = probs
+            # HIGH-003: Only switch regime if new regime probability exceeds
+            # the current regime's probability by at least 10%
+            current_prob = probs.get(self._current_regime, 0.0)
+            best_prob = probs.get(best_regime, 0.0)
+            if best_regime != self._current_regime:
+                if best_prob < current_prob + 0.10:
+                    # Not enough conviction to switch — stay in current regime
+                    best_regime = self._current_regime
+
+            # MED-003: atomically update regime state under lock
+            with self._lock:
+                self._current_regime = best_regime
+                self._regime_probabilities = probs
 
             return best_regime, probs
 
         except Exception as e:
             logger.error(f"HMM prediction failed: {e}")
             return self._current_regime, self._regime_probabilities
+
+    def retrain_weekly(self, lookback_days: int = 252) -> bool:
+        """Retrain the HMM on recent market data (called weekly on Sunday).
+
+        IMPL-008: Fetches the last `lookback_days` of daily SPY data and
+        refits the HMM. This keeps the model adapted to current market
+        conditions while using enough history for stable estimation.
+
+        Args:
+            lookback_days: Number of trading days of history to use for
+                retraining. Defaults to 252 (approximately 1 year).
+
+        Returns:
+            True if retraining succeeded, False otherwise.
+        """
+        logger.info(
+            f"HMM weekly retrain: fetching {lookback_days} days of SPY data"
+        )
+
+        try:
+            from data import get_daily_bars
+        except ImportError:
+            logger.error("Cannot import data module for HMM retrain")
+            return False
+
+        try:
+            spy_data = get_daily_bars("SPY", days=lookback_days)
+            if spy_data is None or len(spy_data) < 100:
+                logger.warning(
+                    f"Insufficient SPY data for retrain: "
+                    f"{len(spy_data) if spy_data is not None else 0} bars "
+                    f"(need 100+)"
+                )
+                return False
+
+            # Normalize column names to lowercase
+            spy_data.columns = [c.lower() for c in spy_data.columns]
+
+            old_regime = self._current_regime
+            success = self.fit(spy_data)
+
+            if success:
+                # Run prediction on recent data to update current regime
+                recent = spy_data.tail(30)
+                new_regime, probs = self.predict_regime(recent)
+                logger.info(
+                    f"HMM retrain complete: regime {old_regime.value} -> "
+                    f"{new_regime.value}, {len(spy_data)} training samples"
+                )
+            else:
+                logger.warning("HMM retrain: fit() returned False")
+
+            return success
+
+        except Exception as e:
+            logger.error(f"HMM weekly retrain failed: {e}", exc_info=True)
+            return False
 
     def get_transition_matrix(self) -> np.ndarray | None:
         """Return the fitted transition probability matrix.
@@ -395,13 +492,15 @@ class HMMRegimeDetector:
 
     @property
     def current_regime(self) -> MarketRegimeState:
-        """Current most-likely regime."""
-        return self._current_regime
+        """Current most-likely regime (thread-safe read)."""
+        with self._lock:
+            return self._current_regime
 
     @property
     def regime_probabilities(self) -> dict[MarketRegimeState, float]:
-        """Full probability distribution across regimes."""
-        return dict(self._regime_probabilities)
+        """Full probability distribution across regimes (thread-safe snapshot)."""
+        with self._lock:
+            return dict(self._regime_probabilities)
 
     @property
     def is_fitted(self) -> bool:

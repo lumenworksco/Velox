@@ -4,22 +4,27 @@ Provides structured, JSON-capable logging that works alongside the existing
 stdlib logging. In development mode, renders human-readable colored output.
 In production (STRUCTURED_LOGGING=true), outputs JSON lines for log aggregation.
 
-Usage:
-    from engine.logging_config import get_logger
-    logger = get_logger(__name__)
-    logger.info("trade_opened", symbol="AAPL", qty=10, strategy="STAT_MR")
+PROD-010: Added CorrelationIdFilter for request/scan tracing across modules.
+Use `set_correlation_id()` at the start of each scan cycle or request handler.
 
-    # Produces (dev mode):
-    # 2026-03-19 14:30:00 [info] trade_opened  symbol=AAPL qty=10 strategy=STAT_MR
+Usage:
+    from engine.logging_config import get_logger, set_correlation_id
+    logger = get_logger(__name__)
+
+    set_correlation_id()  # Auto-generates UUID for this scan cycle
+    logger.info("trade_opened", symbol="AAPL", qty=10, strategy="STAT_MR")
 
     # Produces (production mode):
     # {"event":"trade_opened","symbol":"AAPL","qty":10,"strategy":"STAT_MR",
-    #  "timestamp":"2026-03-19T14:30:00","level":"info","logger":"engine.signal_processor"}
+    #  "timestamp":"2026-03-19T14:30:00","level":"info","logger":"engine.signal_processor",
+    #  "correlation_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890"}
 """
 
 import os
 import logging
 import sys
+import uuid
+import threading
 
 import structlog
 
@@ -29,6 +34,64 @@ import config
 PRODUCTION_MODE = os.getenv("STRUCTURED_LOGGING", "").lower() in ("true", "1", "yes")
 LOG_LEVEL = getattr(config, "LOG_LEVEL", "INFO")
 
+# ---------------------------------------------------------------------------
+# PROD-010: Correlation ID support
+# ---------------------------------------------------------------------------
+
+# Thread-local storage for correlation IDs
+_correlation_local = threading.local()
+
+
+def set_correlation_id(cid: str | None = None) -> str:
+    """Set a correlation ID for the current thread/scan cycle.
+
+    Args:
+        cid: Explicit correlation ID. If None, auto-generates a UUID.
+
+    Returns:
+        The correlation ID that was set.
+    """
+    if cid is None:
+        cid = str(uuid.uuid4())
+    _correlation_local.correlation_id = cid
+    # Also bind to structlog contextvars for structured logging
+    structlog.contextvars.bind_contextvars(correlation_id=cid)
+    return cid
+
+
+def get_correlation_id() -> str:
+    """Get the current thread's correlation ID (or 'none' if not set)."""
+    return getattr(_correlation_local, "correlation_id", "none")
+
+
+def clear_correlation_id():
+    """Clear the correlation ID for the current thread."""
+    _correlation_local.correlation_id = "none"
+    try:
+        structlog.contextvars.unbind_contextvars("correlation_id")
+    except Exception:
+        pass
+
+
+class CorrelationIdFilter(logging.Filter):
+    """PROD-010: Stdlib logging filter that adds correlation_id to every LogRecord.
+
+    Attach to handlers so that formatters can include %(correlation_id)s.
+    Works with both stdlib and structlog-formatted output.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.correlation_id = get_correlation_id()  # type: ignore[attr-defined]
+        return True
+
+
+def _add_correlation_id(logger, method_name, event_dict):
+    """Structlog processor that adds correlation_id to event dict."""
+    cid = get_correlation_id()
+    if cid != "none":
+        event_dict["correlation_id"] = cid
+    return event_dict
+
 
 def configure_logging():
     """Configure structlog + stdlib logging integration.
@@ -36,8 +99,10 @@ def configure_logging():
     Call once at startup (before any logging). Safe to call multiple times.
     """
     # Shared processors for both structlog and stdlib
+    # PROD-010: Added _add_correlation_id for request tracing
     shared_processors = [
         structlog.contextvars.merge_contextvars,
+        _add_correlation_id,
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,
         structlog.processors.TimeStamper(fmt="iso"),
@@ -75,6 +140,8 @@ def configure_logging():
     # Root handler
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(formatter)
+    # PROD-010: Add correlation ID filter to all handlers
+    handler.addFilter(CorrelationIdFilter())
 
     root = logging.getLogger()
     root.handlers.clear()
@@ -92,6 +159,8 @@ def configure_logging():
         file_handler = logging.FileHandler(config.LOG_FILE)
         file_handler.setFormatter(file_formatter)
         file_handler.setLevel(logging.DEBUG)
+        # PROD-010: correlation ID filter on file handler too
+        file_handler.addFilter(CorrelationIdFilter())
         root.addHandler(file_handler)
 
     # Quiet noisy libraries

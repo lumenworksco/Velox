@@ -278,6 +278,8 @@ class EntropyFeatures:
         # Compute Shannon entropy of pattern distribution
         total = sum(pattern_counts.values())
         probs = np.array([c / total for c in pattern_counts.values()])
+        # CRIT-005: Filter zero probabilities to avoid 0 * log2(0) = NaN
+        probs = probs[probs > 0]
         entropy = -np.sum(probs * np.log2(probs))
 
         if normalize:

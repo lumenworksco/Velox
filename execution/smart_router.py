@@ -17,6 +17,14 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# WIRE-005: SpreadAnalyzer for enriched spread data (fail-open)
+_spread_analyzer = None
+try:
+    from microstructure.spread_analysis import SpreadAnalyzer as _SA
+    _spread_analyzer = _SA()
+except ImportError:
+    _SA = None
+
 
 class OrderTypeChoice(Enum):
     """Order type decisions from the router."""
@@ -146,6 +154,16 @@ class SmartOrderRouter:
 
         # Gather decision factors
         spread_bps = market_data.spread_bps
+
+        # WIRE-005: Enrich spread_bps with SpreadAnalyzer effective spread (fail-open)
+        try:
+            if _spread_analyzer is not None:
+                effective_bps = _spread_analyzer.get_effective_spread_bps(signal.symbol)
+                if effective_bps is not None and effective_bps > 0:
+                    # Use the wider of quote spread and effective spread for safety
+                    spread_bps = max(spread_bps, effective_bps)
+        except Exception as _e:
+            logger.debug("WIRE-005: SpreadAnalyzer failed for %s (fail-open): %s", signal.symbol, _e)
         size_ratio = self._compute_size_ratio(signal, market_data)
         vol_regime = self._classify_vol_regime(market_data)
 
@@ -241,6 +259,18 @@ class SmartOrderRouter:
         vol_regime: str,
     ) -> tuple[OrderTypeChoice, float | None, str]:
         """Core routing logic. Returns (order_type, limit_price, reason)."""
+
+        # Rule 0: ORB-specific routing — breakout signals need aggressive limit
+        # at the breakout price to ensure fills at the intended level.
+        # CRIT-027: Must be checked BEFORE generic conditions (e.g. size ratio)
+        # which would otherwise misroute ORB to passive limits.
+        if getattr(signal, 'strategy', '') == 'ORB':
+            limit_price = round(signal.entry_price, 2)
+            return (
+                OrderTypeChoice.LIMIT_AGGRESSIVE,
+                limit_price,
+                "ORB breakout — aggressive limit at breakout price",
+            )
 
         # Rule 1: Critical urgency always goes market
         if urgency == UrgencyLevel.CRITICAL:

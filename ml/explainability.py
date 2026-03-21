@@ -335,7 +335,7 @@ class ModelExplainer:
             "target": float(target),
             "changes": changes,
             "success": success,
-            "iterations": iteration + 1 if 'iteration' in dir() else 0,
+            "iterations": iteration + 1 if max_iterations > 0 else 0,
         }
 
         logger.info(

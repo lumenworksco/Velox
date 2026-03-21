@@ -11,6 +11,7 @@ All scores are normalized to [-1, +1] where:
 """
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Optional, Set, Tuple
@@ -149,6 +150,7 @@ class EnhancedSeasonality:
         # Adaptive learning: accumulate observed returns by bucket
         self._learned_scores: Dict[Tuple[int, int], List[float]] = {}
         self._learning_enabled = True
+        self._lock = threading.Lock()  # MED-004: protect _learned_scores mutations
 
     def get_seasonality_score(
         self,
@@ -257,13 +259,15 @@ class EnhancedSeasonality:
             return
 
         bucket = self._get_bucket(timestamp)
-        if bucket not in self._learned_scores:
-            self._learned_scores[bucket] = []
-        self._learned_scores[bucket].append(return_pct)
+        # MED-004: protect _learned_scores mutations
+        with self._lock:
+            if bucket not in self._learned_scores:
+                self._learned_scores[bucket] = []
+            self._learned_scores[bucket].append(return_pct)
 
-        # Cap history at 500 observations per bucket
-        if len(self._learned_scores[bucket]) > 500:
-            self._learned_scores[bucket] = self._learned_scores[bucket][-500:]
+            # Cap history at 500 observations per bucket
+            if len(self._learned_scores[bucket]) > 500:
+                self._learned_scores[bucket] = self._learned_scores[bucket][-500:]
 
     def _get_intraday_score(self, timestamp: datetime) -> float:
         """Get the intraday seasonality score for the current 15-min bucket."""
@@ -271,8 +275,11 @@ class EnhancedSeasonality:
         base_score = INTRADAY_SEASONALITY.get(bucket, 0.0)
 
         # Blend with learned score if available
-        if bucket in self._learned_scores and len(self._learned_scores[bucket]) >= 20:
-            learned = np.mean(self._learned_scores[bucket])
+        # MED-004: snapshot learned scores under lock
+        with self._lock:
+            learned_data = list(self._learned_scores.get(bucket, []))
+        if len(learned_data) >= 20:
+            learned = np.mean(learned_data)
             # Normalize learned return to [-1, 1] range (assume 0.5% max move per bucket)
             learned_normalized = np.clip(learned / 0.005, -1, 1)
             # 70% base, 30% learned

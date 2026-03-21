@@ -63,6 +63,7 @@ class Container:
         self._lock = threading.Lock()
         self._components: dict[str, Any] = {}
         self._factories: dict[str, Any] = {}
+        self._resolving: set[str] = set()  # HIGH-022: cycle detection
 
         # Register default factories
         self._register_defaults()
@@ -77,6 +78,9 @@ class Container:
         self.register_factory("risk_manager", self._create_risk_manager)
         self.register_factory("oms", self._create_oms)
         self.register_factory("circuit_breaker", self._create_circuit_breaker)
+
+        # V11 modules — lazy-imported so they only load on first access
+        self._register_v11_defaults()
 
     # ------------------------------------------------------------------
     # Public API
@@ -115,10 +119,20 @@ class Container:
             if factory is None:
                 raise KeyError(f"Container: no factory registered for '{name}'")
 
-            logger.debug("Container: creating '%s'", name)
-            inst = factory()
-            self._components[name] = inst
-            return inst
+            # HIGH-022: Cycle detection — prevent infinite recursion
+            if name in self._resolving:
+                raise RuntimeError(
+                    f"Container: circular dependency detected while resolving '{name}'. "
+                    f"Resolution chain: {self._resolving}"
+                )
+            self._resolving.add(name)
+            try:
+                logger.debug("Container: creating '%s'", name)
+                inst = factory()
+                self._components[name] = inst
+                return inst
+            finally:
+                self._resolving.discard(name)
 
     # ------------------------------------------------------------------
     # Convenience properties
@@ -214,6 +228,193 @@ class Container:
     def _create_circuit_breaker():
         from risk.circuit_breaker import TieredCircuitBreaker
         return TieredCircuitBreaker()
+
+    # ------------------------------------------------------------------
+    # V11 module factories (ARCH-011)
+    # ------------------------------------------------------------------
+
+    def _register_v11_defaults(self) -> None:
+        """Register V11 module factories with lazy imports."""
+
+        # --- Risk modules ---
+        self.register_factory("intraday_controls", lambda: (
+            __import__("risk.intraday_controls", fromlist=["IntradayRiskControls"])
+            .IntradayRiskControls()
+        ))
+        self.register_factory("factor_model", lambda: (
+            __import__("risk.factor_model", fromlist=["FactorRiskModel"])
+            .FactorRiskModel()
+        ))
+        self.register_factory("stress_test", lambda: (
+            __import__("risk.stress_testing", fromlist=["StressTestFramework"])
+            .StressTestFramework()
+        ))
+        self.register_factory("gap_risk", lambda: (
+            __import__("risk.gap_risk", fromlist=["GapRiskManager"])
+            .GapRiskManager()
+        ))
+        self.register_factory("dynamic_hedger", lambda: (
+            __import__("risk.dynamic_hedging", fromlist=["DynamicHedger"])
+            .DynamicHedger()
+        ))
+        self.register_factory("margin_monitor", lambda: (
+            __import__("risk.margin_monitor", fromlist=["MarginMonitor"])
+            .MarginMonitor()
+        ))
+        self.register_factory("corporate_actions", lambda: (
+            __import__("risk.corporate_actions", fromlist=["CorporateActionsMonitor"])
+            .CorporateActionsMonitor()
+        ))
+        self.register_factory("conformal_stops", lambda: (
+            __import__("risk.conformal_stops", fromlist=["ConformalStopEngine"])
+            .ConformalStopEngine()
+        ))
+
+        # --- Execution modules ---
+        self.register_factory("fill_analytics", lambda: (
+            __import__("execution.fill_analytics", fromlist=["FillAnalytics"])
+            .FillAnalytics()
+        ))
+        self.register_factory("slippage_model", lambda: (
+            __import__("execution.slippage_model", fromlist=["SlippageModel"])
+            .SlippageModel()
+        ))
+
+        # --- Microstructure ---
+        self.register_factory("vpin", lambda: (
+            __import__("microstructure.vpin", fromlist=["VPIN"])
+            .VPIN()
+        ))
+
+        # --- ML modules ---
+        self.register_factory("feature_engine", lambda: (
+            __import__("ml.features", fromlist=["FeatureEngine"])
+            .FeatureEngine()
+        ))
+        self.register_factory("batch_inference", lambda: (
+            __import__("ml.inference", fromlist=["BatchInferenceEngine"])
+            .BatchInferenceEngine()
+        ))
+        self.register_factory("model_registry", lambda: (
+            __import__("ml.model_registry", fromlist=["ModelRegistry"])
+            .ModelRegistry()
+        ))
+        self.register_factory("bocpd", lambda: (
+            __import__("ml.change_point", fromlist=["BayesianChangePointDetector"])
+            .BayesianChangePointDetector()
+        ))
+
+        # --- Data modules ---
+        self.register_factory("feature_store", lambda: (
+            __import__("data.feature_store", fromlist=["FeatureStore"])
+            .FeatureStore()
+        ))
+        self.register_factory("data_quality", lambda: (
+            __import__("data.quality", fromlist=["DataQualityFramework"])
+            .DataQualityFramework()
+        ))
+
+        # --- Monitoring modules ---
+        self.register_factory("alert_manager", lambda: (
+            __import__("monitoring.alerting", fromlist=["AlertManager"])
+            .AlertManager()
+        ))
+        self.register_factory("latency_tracker", lambda: (
+            __import__("monitoring.latency", fromlist=["LatencyTracker"])
+            .LatencyTracker()
+        ))
+        self.register_factory("metrics_pipeline", lambda: (
+            __import__("monitoring.metrics", fromlist=["MetricsPipeline"])
+            .MetricsPipeline()
+        ))
+        self.register_factory("v11_reconciler", lambda: (
+            __import__("monitoring.reconciliation", fromlist=["PositionReconciler"])
+            .PositionReconciler()
+        ))
+        self.register_factory("watchdog", lambda: (
+            __import__("monitoring.watchdog", fromlist=["Watchdog"])
+            .Watchdog()
+        ))
+
+        # --- Compliance modules ---
+        self.register_factory("audit_trail", lambda: (
+            __import__("compliance.audit_trail", fromlist=["AuditTrail"])
+            .AuditTrail()
+        ))
+        self.register_factory("pdt_compliance", lambda: (
+            __import__("compliance.pdt", fromlist=["PDTCompliance"])
+            .PDTCompliance()
+        ))
+        self.register_factory("surveillance", lambda: (
+            __import__("compliance.surveillance", fromlist=["SelfSurveillance"])
+            .SelfSurveillance()
+        ))
+
+        # --- Ops modules ---
+        self.register_factory("drawdown_risk", lambda: (
+            __import__("ops.drawdown_risk", fromlist=["DrawdownRiskManager"])
+            .DrawdownRiskManager()
+        ))
+        self.register_factory("disaster_recovery", lambda: (
+            __import__("ops.disaster_recovery", fromlist=["DisasterRecovery"])
+            .DisasterRecovery()
+        ))
+
+        # --- Alpha modules ---
+        self.register_factory("enhanced_seasonality", lambda: (
+            __import__("alpha.seasonality", fromlist=["EnhancedSeasonality"])
+            .EnhancedSeasonality()
+        ))
+
+        # --- Engine modules ---
+        self.register_factory("shadow_trader", lambda: (
+            __import__("engine.shadow_mode", fromlist=["ShadowTrader"])
+            .ShadowTrader()
+        ))
+
+    # ------------------------------------------------------------------
+    # V11 convenience properties
+    # ------------------------------------------------------------------
+
+    @property
+    def batch_inference(self):
+        """BatchInferenceEngine instance."""
+        return self.get("batch_inference")
+
+    @property
+    def model_registry(self):
+        """ModelRegistry instance."""
+        return self.get("model_registry")
+
+    @property
+    def watchdog(self):
+        """Watchdog instance."""
+        return self.get("watchdog")
+
+    @property
+    def shadow_trader(self):
+        """ShadowTrader instance."""
+        return self.get("shadow_trader")
+
+    @property
+    def dynamic_hedger(self):
+        """DynamicHedger instance."""
+        return self.get("dynamic_hedger")
+
+    @property
+    def margin_monitor(self):
+        """MarginMonitor instance."""
+        return self.get("margin_monitor")
+
+    @property
+    def corporate_actions(self):
+        """CorporateActionsMonitor instance."""
+        return self.get("corporate_actions")
+
+    @property
+    def conformal_stops(self):
+        """ConformalStopEngine instance."""
+        return self.get("conformal_stops")
 
     # ------------------------------------------------------------------
     # Lifecycle

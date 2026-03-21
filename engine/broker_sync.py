@@ -1,7 +1,7 @@
 """V10 Engine — Broker position synchronization and shadow trade management."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import config
 import database
@@ -110,8 +110,21 @@ def sync_positions_with_broker(risk: RiskManager, now: datetime, ws_monitor=None
                     atr = pta.atr(bars['high'], bars['low'], bars['close'], length=10)
                     if atr is not None and len(atr) > 0:
                         atr_val = float(atr.iloc[-1])
-            except Exception:
-                pass  # Use default 2%
+                    else:
+                        # MED-027: Warn when ATR data is missing for re-adopted position
+                        logger.warning(
+                            f"ATR data unavailable for re-adopted position {symbol} — "
+                            f"using default 2%% of price (${atr_val:.2f}) for TP/SL"
+                        )
+                else:
+                    logger.warning(
+                        f"Insufficient bars for ATR calculation on re-adopted position {symbol} "
+                        f"(got {len(bars) if bars is not None else 0}, need 10) — using default 2%%"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"ATR calculation failed for re-adopted position {symbol}: {e} — using default 2%%"
+                )
 
             tp_mult, sl_mult = 2.0, 1.5  # 2 ATR TP, 1.5 ATR SL
             if side == "buy":

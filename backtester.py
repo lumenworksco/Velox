@@ -236,8 +236,10 @@ def _compute_result(strategy: str, trades: list[BacktestTrade],
         return BacktestResult(strategy=strategy)
 
     total_return = (portfolio_history[-1] - initial_capital) / initial_capital
-    days = 126  # ~6 months of trading days
-    annualized = (1 + total_return) ** (252 / max(days, 1)) - 1
+    # HIGH-027: Derive lookback from actual data length instead of hardcoded 126
+    days = min(len(portfolio_history) // 4, 252) if len(portfolio_history) > 4 else len(portfolio_history)
+    days = max(days, 1)  # Guard against zero
+    annualized = (1 + total_return) ** (252 / days) - 1
 
     # Daily returns for Sharpe
     arr = np.array(portfolio_history)

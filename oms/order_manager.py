@@ -2,6 +2,7 @@
 
 import logging
 import threading
+from collections import deque
 from datetime import datetime
 
 from oms.order import Order, OrderState
@@ -20,12 +21,18 @@ class OrderManager:
     """
 
     def __init__(self):
-        self._orders: dict[str, Order] = {}       # oms_id -> Order
-        self._by_broker_id: dict[str, str] = {}   # broker_order_id -> oms_id
-        self._by_symbol: dict[str, list[str]] = {} # symbol -> [oms_id, ...]
-        self._idempotency: dict[str, str] = {}    # idempotency_key -> oms_id
-        self._lock = threading.Lock()
-        self._audit: list[dict] = []               # State transition log
+        # MED-026: Wrap initialization with explicit error logging and propagation
+        try:
+            self._orders: dict[str, Order] = {}       # oms_id -> Order
+            self._by_broker_id: dict[str, str] = {}   # broker_order_id -> oms_id
+            self._by_symbol: dict[str, list[str]] = {} # symbol -> [oms_id, ...]
+            self._idempotency: dict[str, str] = {}    # idempotency_key -> oms_id
+            self._lock = threading.Lock()
+            self._audit: deque[dict] = deque(maxlen=10_000)  # HIGH-006: bounded audit log
+            logger.info("OrderManager initialized successfully")
+        except Exception as e:
+            logger.critical("OrderManager initialization failed: %s", e, exc_info=True)
+            raise
 
     @staticmethod
     def _generate_idempotency_key(symbol: str, side: str, qty: int,
@@ -34,9 +41,11 @@ class OrderManager:
 
         Uses a 5-second timestamp bucket so that identical orders within the
         same 5-second window are treated as duplicates.
+
+        HIGH-024: Uses time.monotonic() to avoid issues with system clock changes.
         """
         import time
-        timestamp_bucket = int(time.time()) // 5
+        timestamp_bucket = int(time.monotonic()) // 5
         return f"{symbol}_{side}_{qty}_{strategy}_{timestamp_bucket}"
 
     def create_order(self, symbol: str, strategy: str, side: str,
@@ -138,10 +147,8 @@ class OrderManager:
                         cancelled.append(order.oms_id)
         return cancelled
 
-    _MAX_AUDIT_ENTRIES = 10_000
-
     def _log_transition(self, order: Order, old_state: OrderState | None, new_state: OrderState):
-        """Log a state transition for audit trail (capped at 10k entries)."""
+        """Log a state transition for audit trail (bounded by deque maxlen)."""
         self._audit.append({
             "timestamp": datetime.now().isoformat(),
             "oms_id": order.oms_id,
@@ -150,13 +157,10 @@ class OrderManager:
             "old_state": old_state.value if old_state else "NEW",
             "new_state": new_state.value,
         })
-        # Rotate: keep only last MAX entries to prevent memory leak
-        if len(self._audit) > self._MAX_AUDIT_ENTRIES:
-            self._audit = self._audit[-self._MAX_AUDIT_ENTRIES:]
 
     def get_audit_trail(self, limit: int = 50) -> list[dict]:
         """Get recent audit trail entries."""
-        return self._audit[-limit:]
+        return list(self._audit)[-limit:]
 
     @property
     def stats(self) -> dict:

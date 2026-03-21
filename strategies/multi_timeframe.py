@@ -83,6 +83,138 @@ class AlignmentResult:
     direction_consensus: int = 0           # +1, -1, or 0
 
 
+class BarAggregator:
+    """Aggregates base-frequency bars (2-min) into higher timeframes (15-min, daily).
+
+    IMPL-012: Produces OHLCV bars at multiple frequencies from 2-minute base bars.
+    Handles partial bars at session boundaries correctly.
+
+    Usage:
+        agg = BarAggregator()
+        bars_15min = agg.aggregate(bars_2min, target_freq="15min")
+        bars_daily = agg.aggregate(bars_2min, target_freq="daily")
+    """
+
+    # Mapping of target frequencies to pandas resample rules
+    FREQ_MAP = {
+        "15min": "15min",
+        "15T": "15min",
+        "daily": "1D",
+        "1D": "1D",
+        "1h": "1h",
+        "1H": "1h",
+        "5min": "5min",
+        "5T": "5min",
+        "30min": "30min",
+        "30T": "30min",
+    }
+
+    @staticmethod
+    def aggregate(
+        bars: pd.DataFrame,
+        target_freq: str = "15min",
+    ) -> Optional[pd.DataFrame]:
+        """Aggregate OHLCV bars from base frequency to target frequency.
+
+        IMPL-012: Correctly aggregates:
+        - Open: first open in the period
+        - High: max high in the period
+        - Low: min low in the period
+        - Close: last close in the period
+        - Volume: sum of volumes in the period
+
+        Args:
+            bars: DataFrame with columns [open, high, low, close, volume]
+                and a DatetimeIndex. Base frequency is typically 2-min.
+            target_freq: Target frequency string ("15min", "daily", "1h", etc.).
+
+        Returns:
+            Aggregated DataFrame with same columns, or None if input is invalid.
+        """
+        if bars is None or bars.empty:
+            return None
+
+        # Normalize column names
+        df = bars.copy()
+        df.columns = [c.lower() for c in df.columns]
+
+        required = {"open", "high", "low", "close"}
+        if not required.issubset(set(df.columns)):
+            return None
+
+        # Ensure DatetimeIndex
+        if not isinstance(df.index, pd.DatetimeIndex):
+            try:
+                df.index = pd.DatetimeIndex(df.index)
+            except Exception:
+                return None
+
+        # Map target frequency to pandas resample rule
+        resample_rule = BarAggregator.FREQ_MAP.get(target_freq, target_freq)
+
+        try:
+            agg_dict = {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+            }
+
+            # Include volume if present
+            if "volume" in df.columns:
+                agg_dict["volume"] = "sum"
+
+            # For daily aggregation, use trading-day boundaries
+            if resample_rule in ("1D",):
+                # Group by date for clean daily bars
+                df_grouped = df.groupby(df.index.date).agg(agg_dict)
+                df_grouped.index = pd.DatetimeIndex(df_grouped.index)
+                result = df_grouped
+            else:
+                result = df.resample(resample_rule).agg(agg_dict)
+
+            # Drop rows where all OHLC values are NaN (incomplete periods)
+            result = result.dropna(subset=["open", "high", "low", "close"], how="all")
+
+            if result.empty:
+                return None
+
+            return result
+
+        except Exception:
+            return None
+
+    @staticmethod
+    def build_multi_timeframe(
+        bars_2min: pd.DataFrame,
+    ) -> Dict[str, pd.DataFrame]:
+        """Build all three timeframe views from 2-min base bars.
+
+        IMPL-012: Convenience method that produces the full multi-timeframe
+        data set needed by MultiTimeframeFilter.
+
+        Args:
+            bars_2min: 2-minute OHLCV bars with DatetimeIndex.
+
+        Returns:
+            Dict with keys "2min", "15min", "daily" mapped to DataFrames.
+        """
+        result: Dict[str, pd.DataFrame] = {}
+
+        if bars_2min is not None and not bars_2min.empty:
+            result["2min"] = bars_2min
+
+            bars_15 = BarAggregator.aggregate(bars_2min, "15min")
+            if bars_15 is not None:
+                result["15min"] = bars_15
+
+            bars_daily = BarAggregator.aggregate(bars_2min, "daily")
+            if bars_daily is not None:
+                result["daily"] = bars_daily
+
+        return result
+
+
 class MultiTimeframeFilter:
     """Multi-Timeframe confirmation filter for signal quality.
 
@@ -90,16 +222,24 @@ class MultiTimeframeFilter:
     When timeframes agree, signal confidence is boosted; when they disagree,
     confidence is reduced or the signal is filtered out entirely.
 
+    IMPL-012: Includes BarAggregator for building 15-min and daily bars
+    from 2-min base bars when higher-timeframe data is not directly available.
+
     Usage:
         mtf = MultiTimeframeFilter()
         score = mtf.score_signal(signal, bars_2min, bars_15min, bars_daily)
         filtered = mtf.filter_signals(signals, market_data)
+
+        # Or, build multi-timeframe from 2-min bars:
+        mtf_data = BarAggregator.build_multi_timeframe(bars_2min)
+        score = mtf.score_signal(signal, mtf_data["2min"], mtf_data.get("15min"), mtf_data.get("daily"))
     """
 
     def __init__(self, min_confidence: float = MIN_CONFIDENCE_PASS):
         self.min_confidence = min_confidence
         self._cache: Dict[str, Tuple[datetime, AlignmentResult]] = {}
         self._cache_ttl_sec = 120  # Cache alignment for 2 minutes
+        self.aggregator = BarAggregator()
 
     def score_signal(
         self,
@@ -185,9 +325,13 @@ class MultiTimeframeFilter:
         Adjusts each signal's confidence by blending with the alignment score.
         Signals with resulting confidence below min_confidence are removed.
 
+        IMPL-012: If 15min or daily bars are not available in market_data but
+        2min bars are, automatically aggregates them using BarAggregator.
+
         Args:
             signals: List of raw signals from strategies.
             market_data: Dict mapping symbol -> {"2min": df, "15min": df, "daily": df}.
+                If only "2min" is provided, 15min and daily are auto-aggregated.
 
         Returns:
             Filtered list of signals with adjusted confidence values.
@@ -199,6 +343,13 @@ class MultiTimeframeFilter:
             bars_2min = symbol_data.get("2min")
             bars_15min = symbol_data.get("15min")
             bars_daily = symbol_data.get("daily")
+
+            # IMPL-012: Auto-aggregate missing timeframes from 2-min base bars
+            if bars_2min is not None and not bars_2min.empty:
+                if bars_15min is None or (hasattr(bars_15min, "empty") and bars_15min.empty):
+                    bars_15min = BarAggregator.aggregate(bars_2min, "15min")
+                if bars_daily is None or (hasattr(bars_daily, "empty") and bars_daily.empty):
+                    bars_daily = BarAggregator.aggregate(bars_2min, "daily")
 
             alignment_score = self.score_signal(
                 signal, bars_2min, bars_15min, bars_daily

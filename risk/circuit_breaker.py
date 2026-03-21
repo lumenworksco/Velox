@@ -19,6 +19,14 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# WIRE-014: Drawdown risk (CDaR) as additional circuit breaker trigger (fail-open)
+_drawdown_mgr = None
+try:
+    from ops.drawdown_risk import DrawdownRiskManager as _DRM
+    _drawdown_mgr = _DRM()
+except ImportError:
+    _DRM = None
+
 
 class CircuitTier(IntEnum):
     NORMAL = 0
@@ -56,6 +64,22 @@ class TieredCircuitBreaker:
 
     def __init__(self, tiers: dict[CircuitTier, TierConfig] | None = None):
         self.tiers = tiers or DEFAULT_TIERS
+        # MED-011: Validate thresholds are monotonically decreasing
+        # (more severe tiers must have lower/more-negative thresholds)
+        ordered_tiers = [CircuitTier.YELLOW, CircuitTier.ORANGE, CircuitTier.RED, CircuitTier.BLACK]
+        for i in range(len(ordered_tiers) - 1):
+            t_curr = ordered_tiers[i]
+            t_next = ordered_tiers[i + 1]
+            if t_curr in self.tiers and t_next in self.tiers:
+                if self.tiers[t_curr].threshold_pct <= self.tiers[t_next].threshold_pct:
+                    logger.warning(
+                        "MED-011: Circuit breaker thresholds not monotonic: "
+                        "%s (%.3f%%) should be > %s (%.3f%%). Falling back to defaults.",
+                        t_curr.name, self.tiers[t_curr].threshold_pct,
+                        t_next.name, self.tiers[t_next].threshold_pct,
+                    )
+                    self.tiers = dict(DEFAULT_TIERS)
+                    break
         self.current_tier = CircuitTier.NORMAL
         self.last_update: datetime | None = None
         self.tier_history: list[tuple[datetime, CircuitTier]] = []
@@ -85,10 +109,26 @@ class TieredCircuitBreaker:
         # This explicit ordering avoids IntEnum sort-order issues.
         new_tier = CircuitTier.NORMAL
         for tier in (CircuitTier.BLACK, CircuitTier.RED, CircuitTier.ORANGE, CircuitTier.YELLOW):
+            if tier not in self.tiers:
+                continue
             cfg = self.tiers[tier]
             if day_pnl_pct <= cfg.threshold_pct:
                 new_tier = tier
                 break
+
+        # WIRE-014: CDaR-based escalation (fail-open)
+        # If drawdown risk is elevated, escalate tier by one level
+        try:
+            if _drawdown_mgr is not None:
+                dd_mult = _drawdown_mgr.get_exposure_multiplier(abs(day_pnl_pct))
+                if dd_mult <= 0.0 and new_tier < CircuitTier.RED:
+                    new_tier = CircuitTier.RED
+                    logger.warning("WIRE-014: CDaR escalated circuit breaker to RED (dd_mult=0)")
+                elif dd_mult <= 0.5 and new_tier < CircuitTier.ORANGE:
+                    new_tier = CircuitTier.ORANGE
+                    logger.warning("WIRE-014: CDaR escalated circuit breaker to ORANGE (dd_mult=%.2f)", dd_mult)
+        except Exception as _e:
+            logger.debug("WIRE-014: Drawdown risk check failed (fail-open): %s", _e)
 
         # Apply hysteresis buffer for de-escalation to prevent rapid
         # oscillation when P&L hovers near a threshold boundary.

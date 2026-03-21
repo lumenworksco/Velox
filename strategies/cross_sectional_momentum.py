@@ -51,6 +51,10 @@ class MomentumRank:
     universe_rank_pct: float = 0.0  # Percentile rank in full universe
 
 
+# IMPL-011: Minimum warm-up period before generating signals
+WARM_UP_DAYS = 60  # Require at least 60 calendar days of data
+
+
 class CrossSectionalMomentum:
     """Cross-Sectional Momentum — long winners, short losers.
 
@@ -63,6 +67,9 @@ class CrossSectionalMomentum:
 
     The strategy is market-neutral by construction: total long exposure
     equals total short exposure, so net market beta is approximately zero.
+
+    IMPL-011: Includes warm-up period validation to ensure data pipeline
+    has sufficient history before generating signals.
     """
 
     def __init__(self, industry_neutral: bool = False):
@@ -71,10 +78,109 @@ class CrossSectionalMomentum:
         self._last_rebalance_date: Optional[datetime] = None
         self._current_longs: List[str] = []
         self._current_shorts: List[str] = []
+        self._warm_up_verified: bool = False
+        self._data_pipeline_ok: bool = False
 
     def reset_daily(self):
         """Clear per-day state. Preserve weekly rebalance state."""
         pass
+
+    def verify_data_pipeline(self, symbols: Optional[List[str]] = None) -> Dict:
+        """Verify that the data pipeline can provide sufficient history.
+
+        IMPL-011: End-to-end validation of the data pipeline:
+        1. Check that get_daily_bars works for a sample of symbols
+        2. Verify bars have required columns (close, volume)
+        3. Verify at least WARM_UP_DAYS of data available
+        4. Check for excessive gaps or stale data
+
+        Args:
+            symbols: List of symbols to check. Defaults to config.STANDARD_SYMBOLS.
+
+        Returns:
+            Dict with keys: ok (bool), symbols_checked (int), symbols_with_data (int),
+            avg_bars_available (float), min_bars_available (int), issues (list).
+        """
+        if symbols is None:
+            symbols = config.STANDARD_SYMBOLS
+
+        result = {
+            "ok": False,
+            "symbols_checked": 0,
+            "symbols_with_data": 0,
+            "avg_bars_available": 0.0,
+            "min_bars_available": 0,
+            "issues": [],
+        }
+
+        bars_counts = []
+        sample_symbols = symbols[:20]  # Check a representative sample
+
+        for symbol in sample_symbols:
+            result["symbols_checked"] += 1
+            try:
+                df = get_daily_bars(
+                    symbol,
+                    days=MOMENTUM_LOOKBACK_DAYS + SKIP_RECENT_DAYS + 10,
+                )
+                if df is None or df.empty:
+                    result["issues"].append(f"{symbol}: no data returned")
+                    continue
+
+                # Verify required columns
+                required_cols = {"close"}
+                df_cols = {c.lower() for c in df.columns}
+                missing = required_cols - df_cols
+                if missing:
+                    result["issues"].append(f"{symbol}: missing columns {missing}")
+                    continue
+
+                bars_counts.append(len(df))
+                result["symbols_with_data"] += 1
+
+                # Check for stale data (last bar older than 5 days)
+                if hasattr(df.index, 'date') or hasattr(df.index, 'to_pydatetime'):
+                    try:
+                        last_bar_date = df.index[-1]
+                        if hasattr(last_bar_date, 'date'):
+                            last_bar_date = last_bar_date.date()
+                        from datetime import date as date_cls
+                        days_stale = (date_cls.today() - last_bar_date).days
+                        if days_stale > 5:
+                            result["issues"].append(
+                                f"{symbol}: stale data ({days_stale} days old)"
+                            )
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                result["issues"].append(f"{symbol}: fetch error: {e}")
+
+        if bars_counts:
+            result["avg_bars_available"] = round(np.mean(bars_counts), 1)
+            result["min_bars_available"] = int(min(bars_counts))
+        else:
+            result["min_bars_available"] = 0
+
+        # Pipeline is OK if we have data for at least 80% of checked symbols
+        # and the minimum bar count meets warm-up requirements
+        min_required = MOMENTUM_LOOKBACK_DAYS + SKIP_RECENT_DAYS
+        data_ratio = result["symbols_with_data"] / max(result["symbols_checked"], 1)
+        result["ok"] = (
+            data_ratio >= 0.80
+            and result["min_bars_available"] >= min_required
+        )
+
+        self._data_pipeline_ok = result["ok"]
+        log_fn = logger.info if result["ok"] else logger.warning
+        log_fn(
+            f"XS momentum data pipeline: {'OK' if result['ok'] else 'FAIL'} "
+            f"({result['symbols_with_data']}/{result['symbols_checked']} symbols, "
+            f"min {result['min_bars_available']} bars, "
+            f"{len(result['issues'])} issues)"
+        )
+
+        return result
 
     def generate_signals(self, bars: Dict[str, pd.DataFrame],
                          regime: str = "UNKNOWN",
@@ -94,6 +200,20 @@ class CrossSectionalMomentum:
             now = datetime.now(config.ET)
 
         signals: List[Signal] = []
+
+        # IMPL-011: Warm-up period check — require sufficient data history
+        if not self._warm_up_verified:
+            pipeline_result = self.verify_data_pipeline()
+            if not pipeline_result["ok"]:
+                logger.warning(
+                    f"XS momentum: warm-up check failed — need at least "
+                    f"{MOMENTUM_LOOKBACK_DAYS + SKIP_RECENT_DAYS} bars of data for "
+                    f"80%+ of symbols. Got min={pipeline_result['min_bars_available']} bars, "
+                    f"{pipeline_result['symbols_with_data']}/{pipeline_result['symbols_checked']} symbols"
+                )
+                return signals
+            self._warm_up_verified = True
+            logger.info("XS momentum: warm-up check passed, data pipeline verified")
 
         # Weekly rebalance check
         if not self._should_rebalance(now):
@@ -138,7 +258,7 @@ class CrossSectionalMomentum:
 
         # Assign universe percentile ranks
         for i, rank in enumerate(sorted_ranks):
-            rank.universe_rank_pct = 1.0 - (i / n)
+            rank.universe_rank_pct = 1.0 - (i / n) if n > 0 else 0.0
 
         # Top decile = long
         top_cutoff = max(1, int(n * TOP_DECILE_PCT))
@@ -197,7 +317,7 @@ class CrossSectionalMomentum:
 
             # Assign within-sector percentile ranks
             for i, rank in enumerate(sorted_stocks):
-                rank.sector_rank_pct = 1.0 - (i / n)
+                rank.sector_rank_pct = 1.0 - (i / n) if n > 0 else 0.0
 
             # Top and bottom within sector
             top_cutoff = max(1, int(n * TOP_DECILE_PCT))
@@ -243,7 +363,7 @@ class CrossSectionalMomentum:
         price_end = close.iloc[-(SKIP_RECENT_DAYS + 1)]  # T-5 (skip last week)
         price_start = close.iloc[-(total_bars_needed + 1)]  # T-26
 
-        if price_start <= 0:
+        if price_start <= 0 or abs(price_start) < 1e-10:
             return None
 
         return_1m_skip = (price_end - price_start) / price_start
@@ -264,7 +384,7 @@ class CrossSectionalMomentum:
             if bars is None or bars.empty:
                 return None
             price = float(bars["close"].iloc[-1])
-            if price <= 0:
+            if price <= 0 or abs(price) < 1e-10:
                 return None
 
             return Signal(
@@ -299,7 +419,7 @@ class CrossSectionalMomentum:
             if bars is None or bars.empty:
                 return None
             price = float(bars["close"].iloc[-1])
-            if price <= 0:
+            if price <= 0 or abs(price) < 1e-10:
                 return None
 
             return Signal(

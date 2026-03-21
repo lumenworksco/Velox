@@ -14,6 +14,8 @@ Modules:
     change_point        — ADVML-003: Bayesian Online Change-Point Detection
     explainability      — ADVML-004: XAI / SHAP explanation layer
     synthetic_data      — ADVML-005: Synthetic data generation (GARCH + bootstrap)
+    inference           — PROD-002: Batch inference engine
+    model_registry      — PROD-007: Model version registry with rollback
 """
 
 __all__ = [
@@ -30,4 +32,6 @@ __all__ = [
     "change_point",
     "explainability",
     "synthetic_data",
+    "inference",
+    "model_registry",
 ]

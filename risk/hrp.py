@@ -108,6 +108,25 @@ class HierarchicalRiskParity:
             corr = clean.corr()
             cov = clean.cov()
 
+            # MED-021: Clean correlation/covariance matrices
+            # Replace NaN with 0 (uncorrelated assumption) and ensure PSD
+            if corr.isna().any().any():
+                logger.warning("HRP: NaN in correlation matrix — replacing with 0.0")
+                corr = corr.fillna(0.0)
+                np.fill_diagonal(corr.values, 1.0)
+            if cov.isna().any().any():
+                logger.warning("HRP: NaN in covariance matrix — replacing with 0.0")
+                cov = cov.fillna(0.0)
+            # Ensure covariance is positive semi-definite
+            cov_vals = cov.values
+            eigvals = np.linalg.eigvalsh(cov_vals)
+            if np.any(eigvals < -1e-10):
+                logger.warning("HRP: Covariance matrix not PSD — clamping negative eigenvalues")
+                evals, evecs = np.linalg.eigh(cov_vals)
+                evals = np.maximum(evals, 0.0)
+                cov_clean = evecs @ np.diag(evals) @ evecs.T
+                cov = pd.DataFrame(cov_clean, index=cov.index, columns=cov.columns)
+
             # Step 2: Hierarchical clustering on correlation distance
             dist = self._correlation_distance(corr)
             link = linkage(squareform(dist), method="ward")

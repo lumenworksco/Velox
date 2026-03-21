@@ -338,6 +338,22 @@ class ExitManager:
 
         risk_manager.partial_close(symbol, qty, price, now, reason)
 
+        # CRIT-028: Register partial close in OMS order manager if available
+        try:
+            from engine.signal_processor import _order_manager, _OMS_AVAILABLE
+            if _OMS_AVAILABLE and _order_manager:
+                _order_manager.create_order(
+                    symbol=symbol,
+                    strategy=risk_manager.open_trades[symbol].strategy if symbol in risk_manager.open_trades else "",
+                    side="sell" if risk_manager.open_trades.get(symbol, None) and risk_manager.open_trades[symbol].side == "buy" else "buy",
+                    order_type="market",
+                    qty=qty,
+                    limit_price=price,
+                    idempotency_key=f"partial_{symbol}_{reason}_{now.strftime('%Y%m%d%H%M%S')}",
+                )
+        except Exception as e:
+            logger.debug(f"OMS registration for partial close failed (non-critical): {e}")
+
     def update_highest_prices(self, risk_manager, quotes: dict):
         """Update price extremes from live quote data (called by WebSocket handler).
 

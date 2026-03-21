@@ -148,7 +148,10 @@ class AlmgrenChriss:
         )
 
         # Build slices with impact estimates
-        interval_sec = total_duration_sec / n_slices if n_slices > 0 else 0
+        # CRIT-026: Use actual trajectory length (after zero-qty filtering) to
+        # avoid timing gaps when some slices were removed.
+        actual_n_slices = len(trajectory)
+        interval_sec = total_duration_sec / actual_n_slices if actual_n_slices > 0 else 0
         slices: list[ExecutionSlice] = []
         cumulative = 0
 
@@ -322,8 +325,15 @@ class AlmgrenChriss:
         for j in range(min(remainder, n_slices)):
             int_alloc[fractional[j][1]] += 1
 
-        # Remove zero-quantity slices
-        return [q for q in int_alloc if q > 0]
+        # CRIT-026: Remove zero-quantity slices and redistribute their shares
+        # to avoid gaps in the execution schedule.
+        result = [q for q in int_alloc if q > 0]
+        lost = total_qty - sum(result)
+        if lost > 0 and result:
+            # Distribute lost shares round-robin across remaining slices
+            for j in range(lost):
+                result[j % len(result)] += 1
+        return result
 
     def _auto_duration(self, order_size: int, adv: float, urgency: float) -> float:
         """Auto-compute execution duration in seconds."""

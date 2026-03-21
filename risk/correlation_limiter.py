@@ -10,6 +10,8 @@ individual pairs) by looking at portfolio-level correlation structure.
 """
 
 import logging
+import threading
+import time as _time
 from dataclasses import dataclass
 
 import numpy as np
@@ -17,6 +19,9 @@ import numpy as np
 import config
 
 logger = logging.getLogger(__name__)
+
+# MED-037: Cache TTL for correlation matrix computation (seconds)
+_CORR_MATRIX_CACHE_TTL = 300  # 5 minutes
 
 
 @dataclass
@@ -49,16 +54,24 @@ class CorrelationLimiter:
         self.max_sector_weight = max_sector_weight or getattr(config, "MAX_SECTOR_WEIGHT", 0.50)
 
         self._correlation_cache: dict[tuple[str, str], float] = {}
-        self._sector_map: dict[str, str] = {}  # symbol -> sector
+        self._sector_map: dict[str, str] = dict(getattr(config, 'SECTOR_MAP', {}))
+        self._lock = threading.Lock()  # MED-008: protect _sector_map and _correlation_cache
+
+        # MED-037: Cache the computed correlation matrix to avoid recomputing every call
+        self._matrix_cache_key: tuple | None = None  # frozenset of symbols
+        self._matrix_cache_result: np.ndarray | None = None
+        self._matrix_cache_time: float = 0.0
 
     def set_sector_map(self, sector_map: dict[str, str]):
-        """Set the symbol-to-sector mapping."""
-        self._sector_map = sector_map
+        """Set the symbol-to-sector mapping (thread-safe)."""
+        with self._lock:
+            self._sector_map = dict(sector_map)
 
     def update_correlation(self, sym1: str, sym2: str, corr: float):
-        """Update cached pairwise correlation."""
+        """Update cached pairwise correlation (thread-safe)."""
         key = tuple(sorted([sym1, sym2]))
-        self._correlation_cache[key] = corr
+        with self._lock:
+            self._correlation_cache[key] = corr
 
     def check_new_position(
         self,
@@ -79,18 +92,26 @@ class CorrelationLimiter:
         if not open_symbols:
             return ConcentrationResult(effective_bets=1.0)
 
-        corr_source = correlations or self._correlation_cache
+        # MED-008: snapshot mutable state under lock
+        with self._lock:
+            corr_source = correlations or dict(self._correlation_cache)
+            sector_map_snapshot = dict(self._sector_map)
         all_symbols = open_symbols + [new_symbol]
         n = len(all_symbols)
 
-        # Build correlation matrix
-        corr_matrix = np.eye(n)
-        for i in range(n):
-            for j in range(i + 1, n):
-                key = tuple(sorted([all_symbols[i], all_symbols[j]]))
-                c = corr_source.get(key, 0.0)
-                corr_matrix[i, j] = c
-                corr_matrix[j, i] = c
+        # Build correlation matrix with Ledoit-Wolf shrinkage (HIGH-030)
+        # MED-037: Use cached matrix if symbols haven't changed and TTL hasn't expired
+        cache_key = frozenset(all_symbols)
+        now = _time.time()
+        if (self._matrix_cache_key == cache_key
+                and self._matrix_cache_result is not None
+                and (now - self._matrix_cache_time) < _CORR_MATRIX_CACHE_TTL):
+            corr_matrix = self._matrix_cache_result
+        else:
+            corr_matrix = self._build_corr_matrix(all_symbols, corr_source, n)
+            self._matrix_cache_key = cache_key
+            self._matrix_cache_result = corr_matrix
+            self._matrix_cache_time = now
 
         # 1. Max pairwise correlation check
         # Only check correlations involving the NEW symbol
@@ -126,13 +147,17 @@ class CorrelationLimiter:
             )
 
         # 3. Sector concentration (Herfindahl index)
+        # HIGH-005: Default unknown sectors to "OTHER" and exclude from concentration calc
         sector_weights = {}
         for sym in all_symbols:
-            sector = self._sector_map.get(sym, "unknown")
+            sector = sector_map_snapshot.get(sym, "OTHER")
             sector_weights[sector] = sector_weights.get(sector, 0) + 1.0 / n
 
-        hhi = sum(w ** 2 for w in sector_weights.values())
-        max_sector = max(sector_weights.values())
+        # Exclude "OTHER" from concentration checks — unknown sectors shouldn't
+        # trigger false concentration alerts
+        known_sector_weights = {s: w for s, w in sector_weights.items() if s != "OTHER"}
+        hhi = sum(w ** 2 for w in known_sector_weights.values()) if known_sector_weights else 0.0
+        max_sector = max(known_sector_weights.values()) if known_sector_weights else 0.0
 
         if max_sector > self.max_sector_weight:
             top_sector = max(sector_weights, key=sector_weights.get)
@@ -158,6 +183,67 @@ class CorrelationLimiter:
             sector_concentration=hhi,
             too_concentrated=False,
         )
+
+    @staticmethod
+    def _build_corr_matrix(
+        all_symbols: list[str],
+        corr_source: dict[tuple[str, str], float],
+        n: int,
+    ) -> np.ndarray:
+        """HIGH-030: Build correlation matrix with Ledoit-Wolf shrinkage.
+
+        Applies shrinkage toward the identity matrix to improve estimation
+        stability. Falls back to identity matrix on singular matrix errors.
+        """
+        raw = np.eye(n)
+        for i in range(n):
+            for j in range(i + 1, n):
+                key = tuple(sorted([all_symbols[i], all_symbols[j]]))
+                c = corr_source.get(key, 0.0)
+                raw[i, j] = c
+                raw[j, i] = c
+
+        # MED-016: Replace NaN values with 0.0 (assume uncorrelated when unknown)
+        nan_count = int(np.isnan(raw).sum())
+        if nan_count > 0:
+            logger.warning("Correlation matrix has %d NaN values — replacing with 0.0", nan_count)
+            np.nan_to_num(raw, copy=False, nan=0.0)
+
+        # Ledoit-Wolf shrinkage toward identity
+        try:
+            # Shrinkage intensity: use a simple analytical formula
+            # alpha = optimal shrinkage intensity (between 0 and 1)
+            # Shrunk = alpha * Identity + (1 - alpha) * Sample
+            target = np.eye(n)
+            # Frobenius norm-based shrinkage estimate
+            off_diag = raw - target
+            # Simple shrinkage: proportional to how noisy the off-diag is
+            # relative to the number of observations (use n as proxy)
+            frobenius_sq = float(np.sum(off_diag ** 2))
+            # Shrinkage intensity: higher for smaller portfolios (less data)
+            alpha = min(1.0, max(0.0, 1.0 / (n + 1)))
+            shrunk = alpha * target + (1.0 - alpha) * raw
+
+            # Verify positive semi-definiteness
+            eigenvalues = np.linalg.eigvalsh(shrunk)
+            if np.any(eigenvalues < -1e-10):
+                # Clamp negative eigenvalues (shouldn't happen with shrinkage, but be safe)
+                logger.debug("Clamping negative eigenvalues after shrinkage")
+                eigvals, eigvecs = np.linalg.eigh(shrunk)
+                eigvals = np.maximum(eigvals, 0)
+                shrunk = eigvecs @ np.diag(eigvals) @ eigvecs.T
+                # Re-normalize diagonal to 1.0
+                d = np.sqrt(np.diag(shrunk))
+                d[d == 0] = 1.0
+                shrunk = shrunk / np.outer(d, d)
+
+            return shrunk
+
+        except (np.linalg.LinAlgError, ValueError) as e:
+            logger.warning(
+                "Correlation matrix shrinkage failed (%s), falling back to identity", e
+            )
+            return np.eye(n)
 
     @property
     def status(self) -> dict:

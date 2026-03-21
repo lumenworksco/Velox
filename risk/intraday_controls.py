@@ -1,14 +1,15 @@
-"""RISK-005: Enhanced intraday risk controls with rolling P&L limits and velocity checks.
+"""RISK-005 + RISK-006: Enhanced intraday risk controls with multi-timeframe
+rolling P&L limits, per-window pause durations, and velocity checks.
 
 Monitors P&L on multiple rolling time windows and enforces progressive
 throttling when losses cluster in short periods. Designed to catch
 runaway strategies or adverse market microstructure before the daily
 circuit breaker triggers.
 
-Rolling windows:
-    - 5 min:  max -0.3% portfolio loss
-    - 30 min: max -0.5% portfolio loss
-    - 1 hour: max -0.8% portfolio loss
+Rolling windows (RISK-006: each window pauses trading for its own duration):
+    - 5 min:  max -0.3% portfolio loss  -> pause for 5 min
+    - 30 min: max -0.5% portfolio loss  -> pause for 30 min
+    - 1 hour: max -0.8% portfolio loss  -> pause for 1 hour
 
 Velocity controls:
     - 3+ stops hit in 15 min  -> pause all entries for 30 min
@@ -102,8 +103,14 @@ class IntradayRiskControls:
         # Current state
         self._state = ControlState.NORMAL
         self._pause_until: datetime | None = None
+        self._pause_reason: str = ""           # RISK-006: reason for current pause
         self._last_check: datetime | None = None
         self._lock = threading.Lock()
+
+        # RISK-006: Cached rolling P&Ls for reporting during pause
+        self._cached_rolling_5m: float = 0.0
+        self._cached_rolling_30m: float = 0.0
+        self._cached_rolling_1h: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -213,7 +220,11 @@ class IntradayRiskControls:
             self._ticks.clear()
             self._state = ControlState.NORMAL
             self._pause_until = None
+            self._pause_reason = ""
             self._last_check = None
+            self._cached_rolling_5m = 0.0
+            self._cached_rolling_30m = 0.0
+            self._cached_rolling_1h = 0.0
         logger.info("Intraday risk controls reset for new day")
 
     # ------------------------------------------------------------------
@@ -229,6 +240,23 @@ class IntradayRiskControls:
         while self._ticks and self._ticks[0].timestamp < cutoff:
             self._ticks.popleft()
 
+        # RISK-006: Check if a per-window pause is still active
+        if self._pause_until and now < self._pause_until:
+            remaining = (self._pause_until - now).total_seconds()
+            reason = self._pause_reason or "rolling_window_breach"
+            return RiskControlState(
+                state=ControlState.HALTED,
+                size_multiplier=0.0,
+                reason=f"{reason} (pause {remaining:.0f}s remaining)",
+                pause_until=self._pause_until,
+                rolling_5m_pnl=self._cached_rolling_5m,
+                rolling_30m_pnl=self._cached_rolling_30m,
+                rolling_1h_pnl=self._cached_rolling_1h,
+            )
+        elif self._pause_until and now >= self._pause_until:
+            self._pause_until = None
+            self._pause_reason = ""
+
         # 1. Check rolling P&L windows
         rolling_pnls = {}
         for window, limit in self._window_limits.items():
@@ -239,17 +267,30 @@ class IntradayRiskControls:
             rolling_pnls[window] = window_pnl
 
             if window_pnl < limit:
+                # RISK-006: Pause for the breached window's duration
+                self._pause_until = now + window
+                window_min = int(window.total_seconds() / 60)
                 reason = (
-                    f"{int(window.total_seconds() / 60)}min P&L {window_pnl:.3%} "
+                    f"{window_min}min P&L {window_pnl:.3%} "
                     f"< limit {limit:.3%}"
                 )
-                logger.warning(f"Intraday control HALT: {reason}")
+                self._pause_reason = reason
+                logger.warning(
+                    f"RISK-006: Intraday control HALT: {reason} — "
+                    f"pausing for {window_min}min until {self._pause_until.strftime('%H:%M:%S')}"
+                )
                 self._state = ControlState.HALTED
+
+                # Cache rolling P&Ls for pause state
+                self._cached_rolling_5m = rolling_pnls.get(timedelta(minutes=5), 0.0)
+                self._cached_rolling_30m = rolling_pnls.get(timedelta(minutes=30), 0.0)
+                self._cached_rolling_1h = rolling_pnls.get(timedelta(hours=1), 0.0)
 
                 return RiskControlState(
                     state=ControlState.HALTED,
                     size_multiplier=0.0,
                     reason=reason,
+                    pause_until=self._pause_until,
                     rolling_5m_pnl=rolling_pnls.get(timedelta(minutes=5), 0.0),
                     rolling_30m_pnl=rolling_pnls.get(timedelta(minutes=30), 0.0),
                     rolling_1h_pnl=rolling_pnls.get(timedelta(hours=1), 0.0),

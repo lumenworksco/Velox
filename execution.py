@@ -17,6 +17,40 @@ from strategies.base import Signal
 logger = logging.getLogger(__name__)
 
 
+def _validate_bracket_params(signal: Signal) -> tuple[bool, str]:
+    """MED-032: Validate bracket order parameters before submission.
+
+    Checks that stop_loss and take_profit are on the correct side of entry_price
+    for the given trade direction.
+
+    Returns:
+        (valid, reason) tuple.
+    """
+    entry = signal.entry_price
+    sl = signal.stop_loss
+    tp = signal.take_profit
+
+    if entry <= 0:
+        return False, f"Invalid entry price: {entry}"
+    if sl <= 0 or tp <= 0:
+        return False, f"Invalid SL={sl} or TP={tp} (must be > 0)"
+
+    if signal.side == "buy":
+        # Long: stop_loss must be below entry, take_profit must be above entry
+        if sl >= entry:
+            return False, f"Long SL={sl} >= entry={entry}"
+        if tp <= entry:
+            return False, f"Long TP={tp} <= entry={entry}"
+    elif signal.side == "sell":
+        # Short: stop_loss must be above entry, take_profit must be below entry
+        if sl <= entry:
+            return False, f"Short SL={sl} <= entry={entry}"
+        if tp >= entry:
+            return False, f"Short TP={tp} >= entry={entry}"
+
+    return True, ""
+
+
 def _submit_order(signal: Signal, qty: int, client=None):
     """Internal: submit a single order. Returns order object.
 
@@ -27,6 +61,11 @@ def _submit_order(signal: Signal, qty: int, client=None):
     """
     if client is None:
         client = get_trading_client()
+
+    # MED-032: Validate bracket parameters before submission
+    valid, reason = _validate_bracket_params(signal)
+    if not valid:
+        raise ValueError(f"Bracket order validation failed for {signal.symbol}: {reason}")
 
     side = OrderSide.BUY if signal.side == "buy" else OrderSide.SELL
 
@@ -46,7 +85,7 @@ def _submit_order(signal: Signal, qty: int, client=None):
             )
         )
 
-    if signal.strategy in ("MICRO_MOM", "BETA_HEDGE"):
+    elif signal.strategy in ("MICRO_MOM", "BETA_HEDGE"):
         # Momentum / hedge: market order, speed matters
         return client.submit_order(
             MarketOrderRequest(
@@ -60,8 +99,7 @@ def _submit_order(signal: Signal, qty: int, client=None):
             )
         )
 
-    # V10: Removed dead MOMENTUM routing (strategy no longer exists)
-    if signal.strategy == "ORB":
+    elif signal.strategy == "ORB":
         # ORB uses limit order at breakout price (day only)
         return client.submit_order(
             LimitOrderRequest(
@@ -75,6 +113,22 @@ def _submit_order(signal: Signal, qty: int, client=None):
                 stop_loss={"stop_price": round(signal.stop_loss, 2)},
             )
         )
+
+    elif signal.strategy == "PEAD":
+        # CRIT-014: PEAD: limit order (swing trade, not time-sensitive)
+        return client.submit_order(
+            LimitOrderRequest(
+                symbol=signal.symbol,
+                qty=qty,
+                side=side,
+                time_in_force=TimeInForce.DAY,
+                limit_price=round(signal.entry_price, 2),
+                order_class=OrderClass.BRACKET,
+                take_profit={"limit_price": round(signal.take_profit, 2)},
+                stop_loss={"stop_price": round(signal.stop_loss, 2)},
+            )
+        )
+
     else:
         # VWAP and others: market order (speed matters, day only)
         return client.submit_order(
@@ -173,26 +227,48 @@ def submit_bracket_order(signal: Signal, qty: int) -> str | list[str] | None:
 
     client = get_trading_client()
 
-    try:
-        order = _submit_order(signal, qty, client)
-        logger.info(
-            f"Order submitted: {signal.side.upper()} {qty} {signal.symbol} "
-            f"({signal.strategy}) order_id={order.id}"
-        )
-        return str(order.id)
+    # HIGH-009: 3 retries with exponential backoff (1s, 2s, 4s)
+    backoff_delays = [1, 2, 4]
+    last_order_id = None
 
-    except Exception as e:
-        logger.error(f"Bracket order failed for {signal.symbol}: {e}")
-
-        # Retry once after 2 seconds
-        time.sleep(2)
+    for attempt in range(1 + len(backoff_delays)):  # 1 initial + 3 retries
         try:
+            # Before retrying, check if a previous attempt actually went through
+            if attempt > 0 and last_order_id:
+                try:
+                    existing = client.get_order_by_id(last_order_id)
+                    status = str(existing.status).lower()
+                    if status in ("new", "accepted", "partially_filled", "filled"):
+                        logger.info(
+                            f"Order {last_order_id} already {status} — skipping retry"
+                        )
+                        return str(last_order_id)
+                except Exception:
+                    pass  # Order not found or API error — proceed with retry
+
             order = _submit_order(signal, qty, client)
-            logger.info(f"Order retry succeeded: {order.id}")
+            logger.info(
+                f"Order submitted: {signal.side.upper()} {qty} {signal.symbol} "
+                f"({signal.strategy}) order_id={order.id}"
+                + (f" (attempt {attempt + 1})" if attempt > 0 else "")
+            )
             return str(order.id)
-        except Exception as e2:
-            logger.error(f"Order retry also failed for {signal.symbol}: {e2}")
-            return None
+
+        except Exception as e:
+            last_order_id_str = f" (last_order_id={last_order_id})" if last_order_id else ""
+            if attempt < len(backoff_delays):
+                delay = backoff_delays[attempt]
+                logger.warning(
+                    f"Order attempt {attempt + 1} failed for {signal.symbol}: {e}"
+                    f"{last_order_id_str} — retrying in {delay}s"
+                )
+                time.sleep(delay)
+            else:
+                logger.error(
+                    f"Order failed after {attempt + 1} attempts for "
+                    f"{signal.symbol}: {e}{last_order_id_str}"
+                )
+                return None
 
 
 def close_position(symbol: str, reason: str = "") -> bool:
@@ -207,16 +283,60 @@ def close_position(symbol: str, reason: str = "") -> bool:
         return False
 
 
-def close_all_positions(reason: str = "EOD") -> int:
-    """Close all open positions. Returns count of positions closed."""
+def close_all_positions(reason: str = "EOD") -> tuple[bool, int, list[str]]:
+    """Close all open positions.
+
+    HIGH-031: Returns (success, count, failed_symbols) tuple instead of just int.
+
+    Args:
+        reason: Reason string for logging.
+
+    Returns:
+        Tuple of:
+          - success: True if all positions closed without error
+          - count: Number of positions successfully closed
+          - failed_symbols: List of symbols that failed to close
+    """
     client = get_trading_client()
+    failed_symbols: list[str] = []
+    closed_count = 0
+
     try:
+        # Get current positions before closing
+        positions = client.get_all_positions()
+        total = len(positions)
+
+        if total == 0:
+            logger.info(f"No positions to close ({reason})")
+            return True, 0, []
+
+        # Attempt to close all
         client.close_all_positions(cancel_orders=True)
-        logger.info(f"All positions closed ({reason})")
-        return 0
+
+        # Verify which positions actually closed
+        time.sleep(1)  # Brief pause for settlement
+        remaining = client.get_all_positions()
+        remaining_symbols = {p.symbol for p in remaining}
+
+        for pos in positions:
+            if pos.symbol in remaining_symbols:
+                failed_symbols.append(pos.symbol)
+            else:
+                closed_count += 1
+
+        success = len(failed_symbols) == 0
+        if success:
+            logger.info(f"All {closed_count} positions closed ({reason})")
+        else:
+            logger.warning(
+                f"Closed {closed_count}/{total} positions ({reason}), "
+                f"failed: {failed_symbols}"
+            )
+        return success, closed_count, failed_symbols
+
     except Exception as e:
         logger.error(f"Failed to close all positions: {e}")
-        return -1
+        return False, closed_count, failed_symbols
 
 
 def cancel_all_open_orders() -> bool:

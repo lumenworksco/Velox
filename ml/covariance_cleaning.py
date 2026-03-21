@@ -446,3 +446,200 @@ class CovarianceCleaner:
         np.fill_diagonal(matrix, 1.0)
         np.clip(matrix, -1.0, 1.0, out=matrix)
         return matrix
+
+
+# ---------------------------------------------------------------------------
+# COMP-013: RMT Denoising — standalone functions
+# ---------------------------------------------------------------------------
+
+
+def denoise_correlation(
+    corr_matrix: np.ndarray,
+    q_ratio: float,
+    method: str = "constant",
+    preserve_trace: bool = True,
+) -> np.ndarray:
+    """Denoise a correlation matrix using Marchenko-Pastur RMT bounds.
+
+    Standalone function interface (wraps CovarianceCleaner).
+
+    Parameters
+    ----------
+    corr_matrix : np.ndarray
+        (N, N) symmetric correlation matrix.
+    q_ratio : float
+        Quality ratio ``N / T`` (number of assets / number of observations).
+        Alternatively, pass ``n_observations`` directly and this function
+        will compute ``q = N / n_observations``.  If q_ratio > 1,
+        it is interpreted as ``n_observations``.
+    method : str
+        ``"constant"`` replaces noise eigenvalues with their mean.
+        ``"target"`` uses Ledoit-Wolf shrinkage toward identity.
+    preserve_trace : bool
+        If True, rescale to preserve the trace.
+
+    Returns
+    -------
+    np.ndarray
+        Denoised (N, N) correlation matrix, PSD with unit diagonal.
+    """
+    corr_matrix = np.asarray(corr_matrix, dtype=np.float64)
+    n = corr_matrix.shape[0]
+
+    # Interpret q_ratio: if > 1, treat as n_observations
+    if q_ratio > 1.0:
+        n_obs = int(q_ratio)
+    else:
+        n_obs = max(2, int(n / max(q_ratio, 1e-12)))
+
+    cleaner = CovarianceCleaner(method=method, preserve_trace=preserve_trace)
+    return cleaner.denoise_correlation(corr_matrix, n_obs)
+
+
+def get_signal_eigenvalues(
+    corr_matrix: np.ndarray,
+    q_ratio: Optional[float] = None,
+    n_observations: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    """Identify signal eigenvalues that exceed the Marchenko-Pastur upper bound.
+
+    Parameters
+    ----------
+    corr_matrix : np.ndarray
+        (N, N) symmetric correlation matrix.
+    q_ratio : float, optional
+        Quality ratio ``N / T``.  Provide either this or ``n_observations``.
+    n_observations : int, optional
+        Number of time observations.  If provided, ``q_ratio = N / T``.
+
+    Returns
+    -------
+    signal_eigenvalues : np.ndarray
+        Eigenvalues above the MP upper bound (descending order).
+    noise_eigenvalues : np.ndarray
+        Eigenvalues within the MP bulk (descending order).
+    lambda_plus : float
+        Upper MP bound.
+    lambda_minus : float
+        Lower MP bound.
+    """
+    corr_matrix = np.asarray(corr_matrix, dtype=np.float64)
+    n = corr_matrix.shape[0]
+
+    if q_ratio is None and n_observations is None:
+        raise ValueError("Provide either q_ratio or n_observations.")
+    if q_ratio is None:
+        q_ratio = n / max(n_observations, 1)
+
+    # Compute MP bounds
+    sqrt_q = math.sqrt(max(q_ratio, 1e-12))
+    lambda_plus = (1.0 + sqrt_q) ** 2
+    lambda_minus = (1.0 - sqrt_q) ** 2
+
+    # Eigendecomposition
+    eigvals = np.linalg.eigvalsh(corr_matrix)
+    eigvals = np.sort(eigvals)[::-1]  # descending
+
+    signal_mask = eigvals > lambda_plus
+    noise_mask = ~signal_mask
+
+    signal_eigs = eigvals[signal_mask]
+    noise_eigs = eigvals[noise_mask]
+
+    logger.info(
+        "RMT signal/noise split: %d signal, %d noise eigenvalues "
+        "(lambda_+=%.4f, q=%.4f)",
+        len(signal_eigs), len(noise_eigs), lambda_plus, q_ratio,
+    )
+
+    return signal_eigs, noise_eigs, lambda_plus, lambda_minus
+
+
+def compute_mp_pdf(
+    eigenvalues: np.ndarray,
+    q_ratio: float,
+    n_points: int = 200,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute theoretical Marchenko-Pastur PDF for comparison with empirical.
+
+    Parameters
+    ----------
+    eigenvalues : np.ndarray
+        Empirical eigenvalues (for determining plot range).
+    q_ratio : float
+        Quality ratio N/T.
+    n_points : int
+        Number of points to evaluate the PDF.
+
+    Returns
+    -------
+    x : np.ndarray
+        Eigenvalue grid.
+    pdf : np.ndarray
+        MP density at each point.
+    """
+    sqrt_q = math.sqrt(max(q_ratio, 1e-12))
+    lambda_plus = (1.0 + sqrt_q) ** 2
+    lambda_minus = (1.0 - sqrt_q) ** 2
+
+    x = np.linspace(
+        max(0.0, lambda_minus - 0.1),
+        lambda_plus + 0.5,
+        n_points,
+    )
+    pdf = CovarianceCleaner.marchenko_pastur_pdf(x, q_ratio)
+    return x, pdf
+
+
+def shrink_noisy_eigenvalues(
+    eigvals: np.ndarray,
+    q_ratio: float,
+    shrinkage_target: float = 1.0,
+    alpha: Optional[float] = None,
+) -> np.ndarray:
+    """Shrink eigenvalues within the MP bulk toward a target value.
+
+    Parameters
+    ----------
+    eigvals : np.ndarray
+        Array of eigenvalues (descending order recommended).
+    q_ratio : float
+        Quality ratio N / T.
+    shrinkage_target : float
+        Target value for noise eigenvalues.  Default 1.0 (identity).
+    alpha : float, optional
+        Shrinkage intensity in [0, 1].  If None, estimated automatically.
+
+    Returns
+    -------
+    np.ndarray
+        Shrunk eigenvalues (same shape as input).
+    """
+    eigvals = np.asarray(eigvals, dtype=np.float64).copy()
+
+    sqrt_q = math.sqrt(max(q_ratio, 1e-12))
+    lambda_plus = (1.0 + sqrt_q) ** 2
+    lambda_minus = (1.0 - sqrt_q) ** 2
+
+    noise_mask = (eigvals <= lambda_plus) & (eigvals >= lambda_minus)
+
+    if not np.any(noise_mask):
+        logger.debug("No eigenvalues in MP bulk; returning unchanged.")
+        return eigvals
+
+    if alpha is None:
+        # Auto-estimate: dispersion of noise eigenvalues around target
+        noise = eigvals[noise_mask]
+        dispersion = np.mean((noise - shrinkage_target) ** 2)
+        total_var = max(np.var(eigvals), 1e-12)
+        alpha = min(1.0, dispersion / total_var)
+
+    eigvals[noise_mask] = (
+        alpha * shrinkage_target + (1.0 - alpha) * eigvals[noise_mask]
+    )
+
+    logger.debug(
+        "Shrunk %d noise eigenvalues (alpha=%.3f, target=%.2f)",
+        int(noise_mask.sum()), alpha, shrinkage_target,
+    )
+    return eigvals

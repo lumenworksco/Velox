@@ -8,6 +8,14 @@ from earnings import has_earnings_soon
 
 logger = logging.getLogger(__name__)
 
+# WIRE-008: Gap risk sizing for overnight holds (fail-open)
+_gap_risk_manager = None
+try:
+    from risk.gap_risk import GapRiskManager as _GRM
+    _gap_risk_manager = _GRM()
+except ImportError:
+    _GRM = None
+
 
 @dataclass
 class OvernightDecision:
@@ -113,12 +121,25 @@ class OvernightManager:
         held = 0
         for symbol, trade in candidates:
             if held < config.OVERNIGHT_MAX_POSITIONS:
+                # WIRE-008: Gap risk sizing adjustment (fail-open)
+                gap_size_reduction = config.OVERNIGHT_SIZE_REDUCTION
+                try:
+                    if _gap_risk_manager is not None:
+                        gap_mult = _gap_risk_manager.get_overnight_sizing_multiplier(symbol)
+                        if gap_mult < 1.0:
+                            # Increase reduction (closer to 1.0 = close more)
+                            gap_size_reduction = 1.0 - (1.0 - config.OVERNIGHT_SIZE_REDUCTION) * gap_mult
+                            logger.info("WIRE-008: %s gap risk mult=%.2f, adjusted reduction=%.2f",
+                                        symbol, gap_mult, gap_size_reduction)
+                except Exception as _e:
+                    logger.debug("WIRE-008: Gap risk check failed for %s (fail-open): %s", symbol, _e)
+
                 decisions.append(
                     OvernightDecision(
                         symbol=symbol,
                         action="hold",
                         reason="overnight_hold",
-                        size_reduction=config.OVERNIGHT_SIZE_REDUCTION,
+                        size_reduction=gap_size_reduction,
                     )
                 )
                 # Store overnight info

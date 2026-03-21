@@ -373,9 +373,15 @@ class ModelTrainer:
             raise ValueError("No valid CV splits generated — dataset too small?")
 
         # Train base models on full data, evaluate via CV
+        # HIGH-018: Track which base models succeed per fold so the stacking
+        # meta-learner only receives columns that actually produced predictions.
+        base_model_names = ["lgbm", "xgb", "rf"]
+        model_col_map = {"lgbm": 0, "xgb": 1, "rf": 2}
         fold_metrics = []
         oof_preds = np.zeros((len(X), 3))  # out-of-fold preds for each base model
         oof_mask = np.zeros(len(X), dtype=bool)
+        # HIGH-018: Track which models produced OOF predictions across all folds
+        oof_model_produced = {name: np.zeros(len(X), dtype=bool) for name in base_model_names}
 
         for fold_idx, (train_idx, test_idx) in enumerate(splits):
             X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
@@ -390,6 +396,7 @@ class ModelTrainer:
                     pred = lgbm_model.predict(X_test)
                     fold_preds["lgbm"] = pred
                     oof_preds[test_idx, 0] = pred
+                    oof_model_produced["lgbm"][test_idx] = True
                 except Exception as e:
                     logger.warning("LightGBM fold %d failed: %s", fold_idx, e)
 
@@ -400,6 +407,7 @@ class ModelTrainer:
                     pred = xgb_model.predict(X_test)
                     fold_preds["xgb"] = pred
                     oof_preds[test_idx, 1] = pred
+                    oof_model_produced["xgb"][test_idx] = True
                 except Exception as e:
                     logger.warning("XGBoost fold %d failed: %s", fold_idx, e)
 
@@ -412,6 +420,7 @@ class ModelTrainer:
                     pred = rf_model.predict(X_test)
                 fold_preds["rf"] = pred
                 oof_preds[test_idx, 2] = pred
+                oof_model_produced["rf"][test_idx] = True
             except Exception as e:
                 logger.warning("Random Forest fold %d failed: %s", fold_idx, e)
 
@@ -422,10 +431,12 @@ class ModelTrainer:
                 avg_pred = np.mean(list(fold_preds.values()), axis=0)
                 fm = self._compute_fold_metrics(y_test, avg_pred)
                 fm["fold"] = fold_idx
+                fm["models_trained"] = list(fold_preds.keys())
                 fold_metrics.append(fm)
 
-            logger.info("Fold %d/%d complete — %d train, %d test",
-                        fold_idx + 1, len(splits), len(train_idx), len(test_idx))
+            logger.info("Fold %d/%d complete — %d train, %d test, models=%s",
+                        fold_idx + 1, len(splits), len(train_idx), len(test_idx),
+                        list(fold_preds.keys()))
 
         # Train final base models on all data
         base_models = []
@@ -467,19 +478,36 @@ class ModelTrainer:
             importances = {k: v / n_models for k, v in importances.items()}
 
         # --- Stacking meta-learner ---
+        # HIGH-018: Only stack columns from models that actually produced
+        # predictions across all folds.  A model column is included only if
+        # it produced predictions for at least all OOF rows.
         meta_model = None
         if self.use_stacking and oof_mask.sum() > 10:
             try:
-                meta_X = oof_preds[oof_mask]
-                meta_y = y[oof_mask]
-                if self.model_type == "classification":
-                    meta_model = LogisticRegression(
-                        C=1.0, max_iter=1000, solver="lbfgs"
-                    )
+                # Determine which model columns have full OOF coverage
+                usable_cols = []
+                for name in base_model_names:
+                    col_idx = model_col_map[name]
+                    # Model produced predictions wherever oof_mask is True
+                    if np.all(oof_model_produced[name][oof_mask]):
+                        usable_cols.append(col_idx)
+                    else:
+                        logger.info("Stacking: excluding %s (incomplete OOF coverage)", name)
+
+                if not usable_cols:
+                    logger.warning("No base models with full OOF coverage — skipping stacking")
                 else:
-                    meta_model = Ridge(alpha=1.0)
-                meta_model.fit(meta_X, meta_y)
-                logger.info("Stacking meta-learner trained on %d OOF samples", len(meta_X))
+                    meta_X = oof_preds[oof_mask][:, usable_cols]
+                    meta_y = y[oof_mask]
+                    if self.model_type == "classification":
+                        meta_model = LogisticRegression(
+                            C=1.0, max_iter=1000, solver="lbfgs"
+                        )
+                    else:
+                        meta_model = Ridge(alpha=1.0)
+                    meta_model.fit(meta_X, meta_y)
+                    logger.info("Stacking meta-learner trained on %d OOF samples, %d model columns",
+                                len(meta_X), len(usable_cols))
             except Exception as e:
                 logger.warning("Meta-learner training failed: %s", e)
                 meta_model = None
