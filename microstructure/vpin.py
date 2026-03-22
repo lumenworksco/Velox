@@ -212,6 +212,62 @@ class VPIN:
         self._total_trades_processed = 0
         logger.debug("VPIN state reset")
 
+    @classmethod
+    def from_adv(cls, adv: float, n_buckets: int = 50, toxic_threshold: float = 0.35) -> "VPIN":
+        """Create a VPIN instance with bucket volume = 1/50 x ADV.
+
+        Per Easley, Lopez de Prado, O'Hara (2012), the optimal bucket
+        volume V* = ADV / 50 ensures ~50 buckets per day.
+
+        Args:
+            adv: Average daily volume in shares.
+            n_buckets: Number of rolling buckets (default 50).
+            toxic_threshold: VPIN level to flag as TOXIC_FLOW (default 0.35).
+
+        Returns:
+            Configured VPIN instance.
+        """
+        bucket_vol = max(1, int(adv / 50))
+        return cls(bucket_volume=bucket_vol, n_buckets=n_buckets, high_vpin_threshold=toxic_threshold)
+
+    def estimate_toxicity(self, trades: list[dict] | None = None) -> dict:
+        """Estimate order-flow toxicity using VPIN.
+
+        Implements the full ELO (2012) toxicity estimation:
+        1. Ingest any new trades.
+        2. Compute VPIN over rolling n buckets.
+        3. Flag as TOXIC_FLOW if VPIN > 0.35.
+
+        Args:
+            trades: Optional list of trade dicts with keys: price, volume, side (optional).
+
+        Returns:
+            Dict with keys:
+                vpin (float): Current VPIN value [0, 1].
+                is_toxic (bool): True if VPIN > toxic threshold (0.35).
+                label (str): "TOXIC_FLOW" or "NORMAL".
+                buckets_filled (int): Number of completed buckets.
+                sizing_modifier (float): Position sizing multiplier [0.3, 1.0].
+        """
+        if trades is not None:
+            for t in trades:
+                self.add_trade(
+                    price=t["price"],
+                    volume=t["volume"],
+                    side=t.get("side"),
+                )
+
+        vpin_val = self.compute_vpin()
+        toxic = vpin_val >= self._high_vpin_threshold
+
+        return {
+            "vpin": round(vpin_val, 4),
+            "is_toxic": toxic,
+            "label": "TOXIC_FLOW" if toxic else "NORMAL",
+            "buckets_filled": len(self._completed_buckets),
+            "sizing_modifier": round(self.get_sizing_modifier(), 3),
+        }
+
     def __repr__(self) -> str:
         vpin = self.compute_vpin()
         return (

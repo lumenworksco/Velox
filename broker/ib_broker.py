@@ -1,5 +1,9 @@
 """V10: Interactive Brokers adapter.
 
+# Not implemented — see V11.3
+# QW-004: IB broker is NOT production-ready and should not be used.
+# The IBBroker class below is a skeleton that raises NotImplementedError.
+
 Implements the Broker interface for IB TWS/Gateway via ib_insync.
 Requires: pip install ib_insync
 
@@ -32,19 +36,29 @@ class IBBroker(Broker):
     Requires IB TWS or IB Gateway running locally.
     """
 
+    # V11.2: Interactive Brokers integration is deferred to V11.3.
+    # The adapter skeleton is preserved for forward-compatibility but
+    # __init__ logs a clear error instead of raising, so broker discovery
+    # does not crash the bot.
+
     def __init__(self, host: str = None, port: int = None, client_id: int = None):
-        raise NotImplementedError(
-            "IB broker not yet implemented for production use. "
-            "Use the Alpaca broker adapter instead."
+        logger.error(
+            "IBBroker is not available in V11.2. Interactive Brokers support "
+            "is deferred to V11.3. Use the Alpaca broker adapter instead."
         )
         self._host = host or IB_HOST
         self._port = port or IB_PORT
         self._client_id = client_id or IB_CLIENT_ID
         self._ib = None
         self._connected = False
+        self._available = False  # V11.2: flag that this broker is not ready
 
     def connect(self):
         """Connect to IB TWS/Gateway."""
+        if not self._available:
+            raise BrokerError(
+                "IBBroker is deferred to V11.3. Use Alpaca broker instead."
+            )
         try:
             from ib_insync import IB
             self._ib = IB()

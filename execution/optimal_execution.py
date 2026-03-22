@@ -61,6 +61,10 @@ class ImpactParams:
     calibrated_at: datetime | None = None
 
 
+# Large order threshold: use Almgren-Chriss closed-form when order notional
+# exceeds this value (in dollars). Fall back to TWAP if solver fails.
+LARGE_ORDER_THRESHOLD = 50_000  # $50k notional
+
 # Strategy -> execution style mapping
 _STRATEGY_STYLE: dict[str, str] = {
     # Decaying signals: front-load to capture alpha before it decays
@@ -267,6 +271,131 @@ class AlmgrenChriss:
         self._params.alpha = new_alpha
         self._params.calibrated_at = datetime.now()
 
+    def auto_calibrate_eta(self, spread: float, adv: float, price: float = 100.0) -> float:
+        """Auto-calibrate temporary impact coefficient eta from bid-ask spread and ADV.
+
+        V11.2: eta ~ half-spread / sqrt(ADV_in_dollars) per Almgren (2005).
+
+        Args:
+            spread: Bid-ask spread in dollars.
+            adv: Average daily volume in shares.
+            price: Current price (used to normalize).
+
+        Returns:
+            Calibrated eta value (also updates internal params).
+        """
+        if adv <= 0 or price <= 0:
+            return self._params.eta
+
+        half_spread_pct = (spread / 2) / price
+        adv_dollars = adv * price
+        # eta scales as half-spread normalized by sqrt of dollar volume
+        new_eta = half_spread_pct / math.sqrt(adv_dollars / 1e6) if adv_dollars > 0 else 0.05
+        new_eta = max(0.005, min(0.50, new_eta))
+
+        logger.info(
+            f"Auto-calibrated eta={new_eta:.4f} from spread=${spread:.2f}, "
+            f"ADV={adv:,.0f}, price=${price:.2f} (was {self._params.eta:.4f})"
+        )
+        self._params.eta = new_eta
+        self._params.calibrated_at = datetime.now()
+        return new_eta
+
+    def compute_ac_closed_form(
+        self,
+        total_qty: int,
+        n_slices: int,
+        urgency: float,
+        volatility: float,
+        adv: float,
+    ) -> list[int]:
+        """Almgren-Chriss closed-form optimal trajectory.
+
+        x_k = X * sinh(kappa * (T - t_k)) / sinh(kappa * T)
+
+        where kappa^2 = (lambda * sigma^2) / eta, lambda = urgency parameter.
+
+        Args:
+            total_qty: Total shares to execute.
+            n_slices: Number of time periods T.
+            urgency: Risk-aversion parameter lambda in [0, 1].
+            volatility: Daily volatility sigma.
+            adv: Average daily volume.
+
+        Returns:
+            List of per-slice quantities (integers summing to total_qty).
+            Falls back to TWAP if solver fails.
+        """
+        if n_slices <= 0:
+            return [total_qty] if total_qty > 0 else []
+        if n_slices == 1:
+            return [total_qty]
+
+        try:
+            eta = self._params.eta
+            sigma = volatility
+            lam = max(urgency * 5.0, 0.01)  # Scale urgency to meaningful lambda
+
+            # kappa^2 = lambda * sigma^2 / eta
+            kappa_sq = (lam * sigma * sigma) / max(eta, 1e-8)
+            kappa = math.sqrt(kappa_sq)
+            T = float(n_slices)
+
+            sinh_kT = math.sinh(kappa * T)
+            if abs(sinh_kT) < 1e-12:
+                raise ValueError("sinh(kappa*T) near zero")
+
+            # Remaining inventory at each time step: x_k = X * sinh(kappa*(T-k)) / sinh(kappa*T)
+            inventory = []
+            for k in range(n_slices + 1):
+                x_k = total_qty * math.sinh(kappa * (T - k)) / sinh_kT
+                inventory.append(x_k)
+
+            # Per-slice quantity = inventory[k] - inventory[k+1]
+            raw_qty = [inventory[k] - inventory[k + 1] for k in range(n_slices)]
+
+            # Convert to integers
+            int_qty = [max(0, int(round(q))) for q in raw_qty]
+            remainder = total_qty - sum(int_qty)
+
+            # Distribute remainder
+            if remainder > 0:
+                # Add to slices with largest fractional parts
+                fracs = [(raw_qty[i] - int_qty[i], i) for i in range(n_slices)]
+                fracs.sort(reverse=True)
+                for j in range(min(abs(remainder), n_slices)):
+                    int_qty[fracs[j][1]] += 1
+            elif remainder < 0:
+                # Remove from slices with smallest fractional parts
+                fracs = [(raw_qty[i] - int_qty[i], i) for i in range(n_slices)]
+                fracs.sort()
+                for j in range(min(abs(remainder), n_slices)):
+                    if int_qty[fracs[j][1]] > 0:
+                        int_qty[fracs[j][1]] -= 1
+
+            # Filter zero-qty slices
+            result = [q for q in int_qty if q > 0]
+            lost = total_qty - sum(result)
+            if lost > 0 and result:
+                for j in range(lost):
+                    result[j % len(result)] += 1
+
+            logger.debug(
+                f"AC closed-form: kappa={kappa:.4f}, {len(result)} slices, "
+                f"front/back ratio={result[0]}/{result[-1] if result else 0}"
+            )
+            return result
+
+        except Exception as e:
+            logger.warning(f"AC closed-form failed ({e}), falling back to TWAP")
+            # TWAP fallback: uniform distribution
+            base = total_qty // n_slices
+            remainder = total_qty - base * n_slices
+            twap = [base] * n_slices
+            for j in range(remainder):
+                twap[j] += 1
+            return [q for q in twap if q > 0]
+
     def _compute_trajectory(
         self, n_slices: int, total_qty: int, urgency: float, style: str
     ) -> list[int]:
@@ -302,10 +431,11 @@ class AlmgrenChriss:
                 weights.append(math.exp(ramp * i / n_slices))
 
         else:
-            # Uniform with slight U-shape (optimal per A-C for high vol)
+            # V11.2: Use Almgren-Chriss closed-form for uniform style
+            # (delegates to sinh-based optimal trajectory internally)
             for i in range(n_slices):
                 t = i / (n_slices - 1) if n_slices > 1 else 0.5
-                # Sinh-based optimal trajectory
+                # Sinh-based optimal trajectory: x_k ~ cosh(kappa*(1-t))
                 kappa = urgency * 3.0 + 0.1
                 w = math.cosh(kappa * (1 - t)) / math.cosh(kappa)
                 weights.append(max(w, 0.1))

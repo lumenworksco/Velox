@@ -27,7 +27,9 @@ logger = logging.getLogger(__name__)
 
 _HAS_LGBM = False
 _HAS_XGB = False
+_HAS_CATBOOST = False
 _HAS_SKLEARN = False
+_HAS_OPTUNA = False
 
 try:
     import lightgbm as lgb
@@ -40,6 +42,21 @@ try:
     _HAS_XGB = True
 except ImportError:
     xgb = None  # type: ignore[assignment]
+
+# T5-003: CatBoost integration
+try:
+    import catboost as cb
+    _HAS_CATBOOST = True
+except ImportError:
+    cb = None  # type: ignore[assignment]
+
+# T5-003: Optuna for Bayesian hyperparameter optimization
+try:
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    _HAS_OPTUNA = True
+except ImportError:
+    optuna = None  # type: ignore[assignment]
 
 try:
     from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
@@ -61,6 +78,8 @@ def _check_ml_deps(require_all: bool = False) -> bool:
             missing.append("lightgbm")
         if not _HAS_XGB:
             missing.append("xgboost")
+        if not _HAS_CATBOOST:
+            missing.append("catboost")
         if not _HAS_SKLEARN:
             missing.append("scikit-learn")
         if missing:
@@ -296,12 +315,25 @@ class ModelTrainer:
         "n_jobs": -1,
     }
 
+    # T5-003: CatBoost default parameters
+    DEFAULT_CATBOOST_PARAMS = {
+        "iterations": 300,
+        "depth": 6,
+        "learning_rate": 0.05,
+        "l2_leaf_reg": 3.0,
+        "border_count": 128,
+        "verbose": 0,
+        "allow_writing_files": False,
+        "random_seed": 42,
+    }
+
     def __init__(
         self,
         model_type: str = "classification",
         lgbm_params: Optional[Dict] = None,
         xgb_params: Optional[Dict] = None,
         rf_params: Optional[Dict] = None,
+        catboost_params: Optional[Dict] = None,
         use_stacking: bool = True,
     ):
         """Initialize the trainer.
@@ -311,6 +343,7 @@ class ModelTrainer:
             lgbm_params: Override default LightGBM parameters.
             xgb_params: Override default XGBoost parameters.
             rf_params: Override default Random Forest parameters.
+            catboost_params: Override default CatBoost parameters.
             use_stacking: If True, train a meta-learner on base model outputs.
         """
         self.model_type = model_type
@@ -320,6 +353,7 @@ class ModelTrainer:
         self.lgbm_params = {**self.DEFAULT_LGBM_PARAMS, **(lgbm_params or {})}
         self.xgb_params = {**self.DEFAULT_XGB_PARAMS, **(xgb_params or {})}
         self.rf_params = {**self.DEFAULT_RF_PARAMS, **(rf_params or {})}
+        self.catboost_params = {**self.DEFAULT_CATBOOST_PARAMS, **(catboost_params or {})}
 
         # Adjust for regression
         if model_type == "regression":
@@ -327,6 +361,7 @@ class ModelTrainer:
             self.lgbm_params["metric"] = "mse"
             self.xgb_params["objective"] = "reg:squarederror"
             self.xgb_params["eval_metric"] = "rmse"
+            self.catboost_params["loss_function"] = "RMSE"
 
     def train(
         self,
@@ -375,10 +410,11 @@ class ModelTrainer:
         # Train base models on full data, evaluate via CV
         # HIGH-018: Track which base models succeed per fold so the stacking
         # meta-learner only receives columns that actually produced predictions.
-        base_model_names = ["lgbm", "xgb", "rf"]
-        model_col_map = {"lgbm": 0, "xgb": 1, "rf": 2}
+        # T5-003: Added CatBoost as 4th ensemble member
+        base_model_names = ["lgbm", "xgb", "rf", "catboost"]
+        model_col_map = {"lgbm": 0, "xgb": 1, "rf": 2, "catboost": 3}
         fold_metrics = []
-        oof_preds = np.zeros((len(X), 3))  # out-of-fold preds for each base model
+        oof_preds = np.zeros((len(X), 4))  # out-of-fold preds for each base model
         oof_mask = np.zeros(len(X), dtype=bool)
         # HIGH-018: Track which models produced OOF predictions across all folds
         oof_model_produced = {name: np.zeros(len(X), dtype=bool) for name in base_model_names}
@@ -423,6 +459,20 @@ class ModelTrainer:
                 oof_model_produced["rf"][test_idx] = True
             except Exception as e:
                 logger.warning("Random Forest fold %d failed: %s", fold_idx, e)
+
+            # --- T5-003: CatBoost ---
+            if _HAS_CATBOOST:
+                try:
+                    cb_model = self._train_catboost(X_train, y_train)
+                    if self.model_type == "classification" and hasattr(cb_model, "predict_proba"):
+                        pred = cb_model.predict_proba(X_test)[:, 1]
+                    else:
+                        pred = cb_model.predict(X_test).flatten()
+                    fold_preds["catboost"] = pred
+                    oof_preds[test_idx, 3] = pred
+                    oof_model_produced["catboost"][test_idx] = True
+                except Exception as e:
+                    logger.warning("CatBoost fold %d failed: %s", fold_idx, e)
 
             oof_mask[test_idx] = True
 
@@ -471,6 +521,17 @@ class ModelTrainer:
                 importances[name] = importances.get(name, 0) + float(val)
         except Exception as e:
             logger.warning("Final Random Forest training failed: %s", e)
+
+        # T5-003: CatBoost final model
+        if _HAS_CATBOOST:
+            try:
+                final_cb = self._train_catboost(X_scaled, y)
+                base_models.append(final_cb)
+                imp = final_cb.get_feature_importance()
+                for name, val in zip(feature_names, imp):
+                    importances[name] = importances.get(name, 0) + float(val)
+            except Exception as e:
+                logger.warning("Final CatBoost training failed: %s", e)
 
         # Normalize importances
         n_models = len(base_models)
@@ -686,6 +747,219 @@ class ModelTrainer:
             model = RandomForestRegressor(**params)
         model.fit(X, y)
         return model
+
+    def _train_catboost(self, X: np.ndarray, y: np.ndarray):
+        """T5-003: Train a CatBoost model."""
+        params = dict(self.catboost_params)
+        if self.model_type == "classification":
+            model = cb.CatBoostClassifier(**params)
+        else:
+            model = cb.CatBoostRegressor(**params)
+        model.fit(X, y, verbose=False)
+        return model
+
+    # ------------------------------------------------------------------
+    # T5-003: Bayesian Hyperparameter Optimization (Optuna)
+    # ------------------------------------------------------------------
+
+    def optimize_hyperparameters(
+        self,
+        features_df: pd.DataFrame,
+        labels: pd.Series,
+        n_trials: int = 50,
+        purge_window: int = 10,
+        embargo: int = 5,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Run Bayesian hyperparameter optimization using Optuna.
+
+        Optimizes LightGBM, XGBoost, and CatBoost hyperparameters using
+        purged cross-validation to prevent lookahead bias.
+
+        Args:
+            features_df: Feature DataFrame.
+            labels: Target labels.
+            n_trials: Number of Optuna optimization trials.
+            purge_window: Purge window for CV.
+            embargo: Embargo period for CV.
+
+        Returns:
+            Dict mapping model name to best hyperparameters found.
+        """
+        if not _HAS_OPTUNA:
+            logger.warning("T5-003: optuna not installed — skipping hyperparameter optimization")
+            return {}
+
+        if not _HAS_SKLEARN:
+            logger.warning("T5-003: sklearn required for optimization")
+            return {}
+
+        import config as _cfg
+        if not getattr(_cfg, "ML_ENSEMBLE_ENABLED", False):
+            logger.info("T5-003: ML_ENSEMBLE_ENABLED=False — skipping optimization")
+            return {}
+
+        logger.info("T5-003: Starting Bayesian hyperparameter optimization (%d trials)", n_trials)
+
+        X = features_df.values.astype(np.float64)
+        y = labels.values.astype(np.float64)
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        pkf = PurgedKFold(n_splits=3, purge_window=purge_window, embargo=embargo)
+        splits = pkf.split(X_scaled, y)
+        if not splits:
+            logger.warning("T5-003: No valid CV splits for optimization")
+            return {}
+
+        best_params: Dict[str, Dict[str, Any]] = {}
+
+        # --- Optimize LightGBM ---
+        if _HAS_LGBM:
+            def _lgbm_objective(trial):
+                params = {
+                    "num_leaves": trial.suggest_int("num_leaves", 15, 63),
+                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+                    "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
+                    "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
+                    "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
+                    "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
+                    "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
+                    "n_estimators": trial.suggest_int("n_estimators", 100, 500),
+                    "objective": "binary" if self.model_type == "classification" else "regression",
+                    "verbose": -1,
+                    "boosting_type": "gbdt",
+                }
+                scores = []
+                for train_idx, test_idx in splits:
+                    if self.model_type == "classification":
+                        m = lgb.LGBMClassifier(**params)
+                    else:
+                        m = lgb.LGBMRegressor(**params)
+                    m.fit(X_scaled[train_idx], y[train_idx])
+                    pred = m.predict(X_scaled[test_idx])
+                    if self.model_type == "classification":
+                        pred_binary = (pred > 0.5).astype(int)
+                        scores.append(accuracy_score(y[test_idx].astype(int), pred_binary))
+                    else:
+                        scores.append(-mean_squared_error(y[test_idx], pred))
+                return float(np.mean(scores))
+
+            try:
+                study = optuna.create_study(direction="maximize")
+                study.optimize(_lgbm_objective, n_trials=n_trials, show_progress_bar=False)
+                best_params["lgbm"] = study.best_params
+                logger.info("T5-003: LightGBM best score=%.4f", study.best_value)
+            except Exception as e:
+                logger.warning("T5-003: LightGBM optimization failed: %s", e)
+
+        # --- Optimize XGBoost ---
+        if _HAS_XGB:
+            def _xgb_objective(trial):
+                params = {
+                    "max_depth": trial.suggest_int("max_depth", 3, 10),
+                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+                    "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                    "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                    "min_child_weight": trial.suggest_int("min_child_weight", 1, 20),
+                    "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
+                    "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
+                    "n_estimators": trial.suggest_int("n_estimators", 100, 500),
+                    "verbosity": 0,
+                }
+                scores = []
+                for train_idx, test_idx in splits:
+                    if self.model_type == "classification":
+                        params["objective"] = "binary:logistic"
+                        m = xgb.XGBClassifier(**params)
+                    else:
+                        params["objective"] = "reg:squarederror"
+                        m = xgb.XGBRegressor(**params)
+                    m.fit(X_scaled[train_idx], y[train_idx])
+                    pred = m.predict(X_scaled[test_idx])
+                    if self.model_type == "classification":
+                        pred_binary = (pred > 0.5).astype(int)
+                        scores.append(accuracy_score(y[test_idx].astype(int), pred_binary))
+                    else:
+                        scores.append(-mean_squared_error(y[test_idx], pred))
+                return float(np.mean(scores))
+
+            try:
+                study = optuna.create_study(direction="maximize")
+                study.optimize(_xgb_objective, n_trials=n_trials, show_progress_bar=False)
+                best_params["xgb"] = study.best_params
+                logger.info("T5-003: XGBoost best score=%.4f", study.best_value)
+            except Exception as e:
+                logger.warning("T5-003: XGBoost optimization failed: %s", e)
+
+        # --- Optimize CatBoost ---
+        if _HAS_CATBOOST:
+            def _cb_objective(trial):
+                params = {
+                    "depth": trial.suggest_int("depth", 3, 10),
+                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+                    "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 0.1, 10.0, log=True),
+                    "iterations": trial.suggest_int("iterations", 100, 500),
+                    "border_count": trial.suggest_int("border_count", 32, 255),
+                    "verbose": 0,
+                    "allow_writing_files": False,
+                    "random_seed": 42,
+                }
+                scores = []
+                for train_idx, test_idx in splits:
+                    if self.model_type == "classification":
+                        m = cb.CatBoostClassifier(**params)
+                    else:
+                        m = cb.CatBoostRegressor(**params)
+                    m.fit(X_scaled[train_idx], y[train_idx], verbose=False)
+                    pred = m.predict(X_scaled[test_idx])
+                    if self.model_type == "classification":
+                        pred = pred.flatten()
+                        pred_binary = (pred > 0.5).astype(int)
+                        scores.append(accuracy_score(y[test_idx].astype(int), pred_binary))
+                    else:
+                        scores.append(-mean_squared_error(y[test_idx], pred.flatten()))
+                return float(np.mean(scores))
+
+            try:
+                study = optuna.create_study(direction="maximize")
+                study.optimize(_cb_objective, n_trials=n_trials, show_progress_bar=False)
+                best_params["catboost"] = study.best_params
+                logger.info("T5-003: CatBoost best score=%.4f", study.best_value)
+            except Exception as e:
+                logger.warning("T5-003: CatBoost optimization failed: %s", e)
+
+        logger.info("T5-003: Optimization complete. Best params for %d models.", len(best_params))
+        return best_params
+
+    def train_with_optimized_params(
+        self,
+        features_df: pd.DataFrame,
+        labels: pd.Series,
+        optimized_params: Dict[str, Dict[str, Any]],
+        **train_kwargs,
+    ) -> "TrainedModel":
+        """Train using Optuna-optimized hyperparameters.
+
+        Args:
+            features_df: Feature DataFrame.
+            labels: Target labels.
+            optimized_params: Dict from optimize_hyperparameters().
+            **train_kwargs: Passed to self.train().
+
+        Returns:
+            TrainedModel trained with optimized parameters.
+        """
+        if "lgbm" in optimized_params:
+            self.lgbm_params.update(optimized_params["lgbm"])
+        if "xgb" in optimized_params:
+            self.xgb_params.update(optimized_params["xgb"])
+        if "catboost" in optimized_params:
+            self.catboost_params.update(optimized_params["catboost"])
+
+        logger.info("T5-003: Training with optimized hyperparameters")
+        return self.train(features_df, labels, **train_kwargs)
 
     def _compute_fold_metrics(
         self, y_true: np.ndarray, y_pred: np.ndarray

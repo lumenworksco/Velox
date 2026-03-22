@@ -19,9 +19,13 @@ from data.fetcher import (
     get_filled_exit_price,
     get_snapshot,
     get_snapshots,
+    get_snapshots_batch,
     verify_connectivity,
     verify_data_feed,
 )
+
+# --- T4-001: Shared bar cache ---
+from data.bar_cache import BarCache, bar_cache
 
 # --- V11 additions ---
 from data.feature_store import FeatureStore, get_feature_store
@@ -49,8 +53,12 @@ __all__ = [
     "get_filled_exit_price",
     "get_snapshot",
     "get_snapshots",
+    "get_snapshots_batch",
     "verify_connectivity",
     "verify_data_feed",
+    # Bar cache (T4-001)
+    "BarCache",
+    "bar_cache",
     # Feature store
     "FeatureStore",
     "get_feature_store",

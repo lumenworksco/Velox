@@ -401,6 +401,11 @@ class KalmanPairsTrader:
             f"expected (2, 2), got {P.shape}"
         )
 
+        # T1-007: Ensure hedge_ratio is scalar float at every Kalman update boundary
+        hedge_ratio = float(np.squeeze(theta[0]))
+        assert np.isfinite(hedge_ratio), f"Non-finite hedge_ratio after Kalman update for {pair_key}: {hedge_ratio}"
+        theta[0] = hedge_ratio
+
         # Store updated state
         state['theta'] = theta
         state['P'] = P
@@ -454,7 +459,8 @@ class KalmanPairsTrader:
                 zscore = self._update_kalman(pair_key, price1, price2)
 
                 state = self.kalman_state.get(pair_key, {})
-                hedge_ratio = float(state.get('theta', [1.0, 0.0])[0])
+                # T1-007: Ensure hedge_ratio is scalar float (theta[0] may be ndarray element)
+                hedge_ratio = float(np.squeeze(state.get('theta', [1.0, 0.0])[0]))
 
                 # --- Spread too wide (z > entry): short sym1, long sym2
                 if zscore > config.PAIRS_ZSCORE_ENTRY:

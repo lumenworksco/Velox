@@ -12,7 +12,7 @@ All modules follow fail-open design: if data is unavailable, they return
 neutral defaults and never block trading.
 """
 
-from data.alternative.sec_filings import SECFilingAnalyzer
+from data.alternative.sec_filings import SECFilingAnalyzer, EdgarMonitor
 from data.alternative.options_flow import OptionsFlowDetector
 from data.alternative.short_interest import ShortInterestTracker
 from data.alternative.institutional_holdings import InstitutionalHoldingsTracker
@@ -21,6 +21,7 @@ from data.alternative.macro_surprise import MacroSurpriseIndex
 
 __all__ = [
     "SECFilingAnalyzer",
+    "EdgarMonitor",
     "OptionsFlowDetector",
     "ShortInterestTracker",
     "InstitutionalHoldingsTracker",

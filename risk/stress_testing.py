@@ -660,6 +660,102 @@ class StressTestFramework:
         )
 
     # ------------------------------------------------------------------
+    # T7-002: VAE-generated tail scenarios
+    # ------------------------------------------------------------------
+
+    def run_vae_stress_tests(
+        self,
+        positions: dict[str, Any],
+        portfolio_equity: float | None = None,
+        n_scenarios: int = 1000,
+        tail_multiplier: float = 2.0,
+    ) -> list[StressTestResult]:
+        """T7-002: Generate and run VAE-sampled tail-risk scenarios.
+
+        Uses MarketScenarioVAE to generate synthetic market scenarios,
+        filters for extreme losses (> tail_multiplier × historical max daily
+        loss), and runs them as stress tests.
+
+        Falls back to parametric tail sampling if PyTorch is unavailable.
+
+        Args:
+            positions: Dict of symbol -> position info.
+            portfolio_equity: Total portfolio equity.
+            n_scenarios: Number of scenarios to generate from VAE.
+            tail_multiplier: Only keep scenarios with loss > this × historical max.
+
+        Returns:
+            List of StressTestResult from tail scenarios.
+        """
+        if not positions:
+            return []
+
+        pos_list = self._normalize_positions(positions)
+        if not pos_list:
+            return []
+
+        if portfolio_equity is None:
+            portfolio_equity = sum(p["notional"] for p in pos_list) * 2.0
+
+        try:
+            vae = MarketScenarioVAE()
+            # Generate scenarios as arrays of equity moves per position
+            n_assets = len(pos_list)
+            tail_scenarios = vae.generate_tail_scenarios(
+                n_generate=n_scenarios,
+                n_assets=n_assets,
+                tail_multiplier=tail_multiplier,
+            )
+
+            if not tail_scenarios:
+                logger.info("T7-002: No tail scenarios exceeded threshold")
+                return []
+
+            # Convert VAE scenarios to stress test results
+            results: list[StressTestResult] = []
+            for i, scenario_returns in enumerate(tail_scenarios[:20]):  # Cap at 20
+                total_pnl = 0.0
+                worst_sym = ""
+                worst_pnl = 0.0
+                pos_details = {}
+
+                for j, pos in enumerate(pos_list):
+                    asset_return = scenario_returns[j % len(scenario_returns)]
+                    pos_pnl = pos["notional"] * asset_return * pos["side_mult"]
+                    total_pnl += pos_pnl
+
+                    if pos_pnl < worst_pnl:
+                        worst_pnl = pos_pnl
+                        worst_sym = pos["symbol"]
+                    pos_details[pos["symbol"]] = round(pos_pnl, 2)
+
+                pnl_pct = total_pnl / portfolio_equity if portfolio_equity > 0 else 0.0
+
+                results.append(StressTestResult(
+                    scenario_name=f"VAE Tail Scenario #{i+1}",
+                    scenario_type=ScenarioType.FLASH_CRASH,
+                    estimated_pnl_pct=pnl_pct,
+                    estimated_pnl_dollars=total_pnl,
+                    positions_affected=len(pos_list),
+                    worst_position=worst_sym,
+                    worst_position_pnl=worst_pnl,
+                    details={"position_pnl": pos_details, "source": "vae_tail"},
+                ))
+
+            if results:
+                worst = min(results, key=lambda r: r.estimated_pnl_pct)
+                logger.info(
+                    f"T7-002: Generated {len(results)} VAE tail scenarios. "
+                    f"Worst: {worst.estimated_pnl_pct:.2%} (${worst.estimated_pnl_dollars:+,.0f})"
+                )
+
+            return results
+
+        except Exception as e:
+            logger.warning(f"T7-002: VAE stress test failed: {e}", exc_info=True)
+            return []
+
+    # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
 
@@ -684,3 +780,339 @@ class StressTestFramework:
                 "blocking_new_positions": self.should_block_new_positions(),
                 "block_threshold": f"{self._block_threshold:.2%}",
             }
+
+
+# ======================================================================
+# T7-002: Generative Scenario Modeling with VAE
+# ======================================================================
+
+# Conditional PyTorch import
+_TORCH_AVAILABLE = False
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None  # type: ignore
+    nn = None     # type: ignore
+
+
+class MarketScenarioVAE:
+    """T7-002: Variational Autoencoder for generating synthetic market scenarios.
+
+    Learns the joint distribution of daily asset returns from the trading
+    universe, then generates tail-risk scenarios by sampling from the latent
+    space and filtering for extreme losses.
+
+    Architecture (when PyTorch available):
+        Encoder: input_dim → 64 → 32 → (mu, log_var) [latent_dim]
+        Decoder: latent_dim → 32 → 64 → input_dim
+
+    Fallback (numpy only):
+        Parametric tail sampling using Student-t distribution with
+        fat tails (df=3) and empirical correlation structure.
+
+    Usage:
+        vae = MarketScenarioVAE(latent_dim=8)
+        vae.fit(daily_returns_matrix)  # (n_days, n_assets)
+        tail = vae.generate_tail_scenarios(n_generate=10000)
+    """
+
+    def __init__(self, latent_dim: int = 8, learning_rate: float = 1e-3):
+        self._latent_dim = latent_dim
+        self._lr = learning_rate
+        self._fitted = False
+        self._model = None
+        self._optimizer = None
+
+        # Fallback parameters (fitted from data)
+        self._mean: np.ndarray | None = None
+        self._cov: np.ndarray | None = None
+        self._std: np.ndarray | None = None
+        self._n_assets: int = 0
+        self._historical_max_loss: float = 0.05  # Default 5%
+
+        if _TORCH_AVAILABLE:
+            logger.debug("T7-002: MarketScenarioVAE initialized with PyTorch backend")
+        else:
+            logger.debug("T7-002: MarketScenarioVAE using numpy parametric fallback")
+
+    def fit(self, daily_returns: np.ndarray, n_epochs: int = 50, batch_size: int = 32):
+        """Train the VAE on historical daily returns.
+
+        Args:
+            daily_returns: (n_days, n_assets) array of daily return percentages.
+            n_epochs: Training epochs (PyTorch only).
+            batch_size: Mini-batch size (PyTorch only).
+        """
+        if daily_returns.ndim != 2 or daily_returns.shape[0] < 10:
+            logger.warning("T7-002: Insufficient data for VAE training")
+            return
+
+        self._n_assets = daily_returns.shape[1]
+
+        # Compute empirical statistics (used by both backends)
+        self._mean = np.mean(daily_returns, axis=0)
+        self._cov = np.cov(daily_returns.T) if self._n_assets > 1 else np.array([[np.var(daily_returns)]])
+        self._std = np.std(daily_returns, axis=0)
+
+        # Historical max portfolio loss (equal-weight)
+        portfolio_returns = np.mean(daily_returns, axis=1)
+        self._historical_max_loss = abs(float(np.min(portfolio_returns)))
+
+        if _TORCH_AVAILABLE:
+            self._fit_torch(daily_returns, n_epochs, batch_size)
+        else:
+            logger.info(
+                f"T7-002: Fitted parametric model on {daily_returns.shape[0]} days, "
+                f"{self._n_assets} assets. Max daily loss: {self._historical_max_loss:.2%}"
+            )
+
+        self._fitted = True
+
+    def _fit_torch(self, data: np.ndarray, n_epochs: int, batch_size: int):
+        """Train the VAE using PyTorch."""
+        input_dim = data.shape[1]
+
+        # Build VAE model
+        class VAE(nn.Module):
+            def __init__(self, in_dim, latent):
+                super().__init__()
+                # Encoder
+                self.enc1 = nn.Linear(in_dim, 64)
+                self.enc2 = nn.Linear(64, 32)
+                self.fc_mu = nn.Linear(32, latent)
+                self.fc_logvar = nn.Linear(32, latent)
+                # Decoder
+                self.dec1 = nn.Linear(latent, 32)
+                self.dec2 = nn.Linear(32, 64)
+                self.dec3 = nn.Linear(64, in_dim)
+
+            def encode(self, x):
+                h = torch.relu(self.enc1(x))
+                h = torch.relu(self.enc2(h))
+                return self.fc_mu(h), self.fc_logvar(h)
+
+            def reparameterize(self, mu, logvar):
+                std = torch.exp(0.5 * logvar)
+                eps = torch.randn_like(std)
+                return mu + eps * std
+
+            def decode(self, z):
+                h = torch.relu(self.dec1(z))
+                h = torch.relu(self.dec2(h))
+                return self.dec3(h)
+
+            def forward(self, x):
+                mu, logvar = self.encode(x)
+                z = self.reparameterize(mu, logvar)
+                recon = self.decode(z)
+                return recon, mu, logvar
+
+        self._model = VAE(input_dim, self._latent_dim)
+        self._optimizer = optim.Adam(self._model.parameters(), lr=self._lr)
+
+        # Normalize data
+        data_tensor = torch.FloatTensor(data)
+        data_mean = data_tensor.mean(dim=0)
+        data_std = data_tensor.std(dim=0).clamp(min=1e-8)
+        data_norm = (data_tensor - data_mean) / data_std
+
+        self._model.train()
+        n_samples = len(data_norm)
+        best_loss = float("inf")
+
+        for epoch in range(n_epochs):
+            perm = torch.randperm(n_samples)
+            epoch_loss = 0.0
+            n_batches = 0
+
+            for i in range(0, n_samples, batch_size):
+                batch = data_norm[perm[i:i + batch_size]]
+                if len(batch) < 2:
+                    continue
+
+                recon, mu, logvar = self._model(batch)
+
+                # Reconstruction loss (MSE)
+                recon_loss = nn.functional.mse_loss(recon, batch, reduction="sum")
+                # KL divergence
+                kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+                loss = recon_loss + kl_loss
+
+                self._optimizer.zero_grad()
+                loss.backward()
+                self._optimizer.step()
+
+                epoch_loss += loss.item()
+                n_batches += 1
+
+            avg_loss = epoch_loss / max(1, n_batches)
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+
+        self._model.eval()
+        # Store normalization params for generation
+        self._data_mean = data_mean
+        self._data_std = data_std
+
+        logger.info(
+            f"T7-002: VAE trained for {n_epochs} epochs on {n_samples} samples, "
+            f"{input_dim} assets. Best loss: {best_loss:.2f}"
+        )
+
+    def generate_scenarios(self, n: int = 10000) -> np.ndarray:
+        """Generate synthetic market scenarios.
+
+        Args:
+            n: Number of scenarios to generate.
+
+        Returns:
+            (n, n_assets) array of synthetic daily returns.
+        """
+        if not self._fitted:
+            logger.warning("T7-002: VAE not fitted, returning empty scenarios")
+            return np.array([])
+
+        if _TORCH_AVAILABLE and self._model is not None:
+            return self._generate_torch(n)
+        else:
+            return self._generate_parametric(n)
+
+    def _generate_torch(self, n: int) -> np.ndarray:
+        """Generate scenarios using the trained VAE decoder."""
+        with torch.no_grad():
+            z = torch.randn(n, self._latent_dim)
+            samples = self._model.decode(z)
+            # Denormalize
+            samples = samples * self._data_std + self._data_mean
+        return samples.numpy()
+
+    def _generate_parametric(self, n: int) -> np.ndarray:
+        """Fallback: generate scenarios using Student-t with empirical correlation.
+
+        Uses df=3 for fat tails (heavier than normal), preserving the
+        empirical correlation structure via Cholesky decomposition.
+        """
+        if self._cov is None or self._mean is None:
+            return np.array([])
+
+        df = 3  # Degrees of freedom for Student-t (fat tails)
+        n_assets = self._n_assets
+
+        # Generate correlated Student-t samples
+        try:
+            # Cholesky decomposition of correlation matrix
+            D = np.diag(self._std) if self._std is not None else np.eye(n_assets)
+            corr = np.diag(1.0 / np.diag(D)) @ self._cov @ np.diag(1.0 / np.diag(D))
+            # Ensure positive definite
+            eigvals = np.linalg.eigvalsh(corr)
+            if np.min(eigvals) < 1e-8:
+                corr += np.eye(n_assets) * (1e-6 - np.min(eigvals))
+            L = np.linalg.cholesky(corr)
+        except np.linalg.LinAlgError:
+            L = np.eye(n_assets)
+
+        # Student-t = Normal / sqrt(chi2/df)
+        z = np.random.standard_normal((n, n_assets))
+        chi2 = np.random.chisquare(df, size=(n, 1))
+        t_samples = z @ L.T / np.sqrt(chi2 / df)
+
+        # Scale to empirical distribution
+        scenarios = self._mean + t_samples * self._std
+
+        return scenarios
+
+    def generate_tail_scenarios(
+        self,
+        n_generate: int = 10000,
+        n_assets: int | None = None,
+        tail_multiplier: float = 2.0,
+    ) -> list[np.ndarray]:
+        """Generate scenarios and filter for extreme tail events.
+
+        Args:
+            n_generate: Total scenarios to generate before filtering.
+            n_assets: Override number of assets (for unfitted VAE).
+            tail_multiplier: Keep scenarios with portfolio loss > this × historical max.
+
+        Returns:
+            List of (n_assets,) arrays — each is a vector of asset returns
+            representing a tail scenario.
+        """
+        if not self._fitted:
+            # Generate with default parameters if not fitted
+            if n_assets is None:
+                n_assets = 10  # Default
+            self._n_assets = n_assets
+            self._mean = np.zeros(n_assets)
+            self._std = np.full(n_assets, 0.02)  # 2% daily vol
+            self._cov = np.eye(n_assets) * 0.0004  # Diagonal
+            self._fitted = True
+            logger.debug("T7-002: Using default parameters for unfitted VAE")
+
+        scenarios = self.generate_scenarios(n_generate)
+        if len(scenarios) == 0:
+            return []
+
+        # Compute equal-weight portfolio return per scenario
+        portfolio_returns = np.mean(scenarios, axis=1)
+
+        # Filter for tail: loss exceeds tail_multiplier × historical max
+        threshold = -self._historical_max_loss * tail_multiplier
+        tail_mask = portfolio_returns < threshold
+
+        tail_scenarios = scenarios[tail_mask]
+
+        # Sort by severity (most extreme first)
+        if len(tail_scenarios) > 0:
+            severity = np.mean(tail_scenarios, axis=1)
+            sort_idx = np.argsort(severity)
+            tail_scenarios = tail_scenarios[sort_idx]
+
+        logger.info(
+            f"T7-002: Generated {n_generate} scenarios, "
+            f"{len(tail_scenarios)} passed tail filter "
+            f"(threshold: {threshold:.2%}, multiplier: {tail_multiplier}x)"
+        )
+
+        return [tail_scenarios[i] for i in range(len(tail_scenarios))]
+
+    def augment_var_data(
+        self,
+        historical_returns: np.ndarray,
+        n_synthetic: int = 5000,
+        tail_multiplier: float = 2.0,
+    ) -> np.ndarray:
+        """Augment VaR calibration data with synthetic tail scenarios.
+
+        Fits the VAE on historical returns, generates tail scenarios,
+        and appends them to the calibration dataset.
+
+        Args:
+            historical_returns: (n_days, n_assets) historical daily returns.
+            n_synthetic: Number of synthetic scenarios to generate.
+            tail_multiplier: Tail filter multiplier.
+
+        Returns:
+            Augmented returns array (n_days + n_tail, n_assets).
+        """
+        self.fit(historical_returns)
+        tail = self.generate_tail_scenarios(
+            n_generate=n_synthetic,
+            tail_multiplier=tail_multiplier,
+        )
+
+        if not tail:
+            return historical_returns
+
+        tail_array = np.array(tail)
+        augmented = np.vstack([historical_returns, tail_array])
+
+        logger.info(
+            f"T7-002: Augmented VaR data: {len(historical_returns)} historical + "
+            f"{len(tail_array)} synthetic tail = {len(augmented)} total samples"
+        )
+
+        return augmented

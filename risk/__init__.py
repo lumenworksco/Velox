@@ -22,6 +22,7 @@ from risk.dynamic_hedging import DynamicHedgingEngine
 from risk.margin_monitor import MarginMonitor
 from risk.corporate_actions import CorporateActionDetector
 from risk.conformal_stops import ConformalStopEngine
+from risk.black_litterman import BlackLittermanOptimizer
 
 # Backward compatibility: re-export RiskManager, TradeRecord, VIX functions
 from risk.risk_manager import (
@@ -52,6 +53,8 @@ __all__ = [
     "MarginMonitor",
     "CorporateActionDetector",
     "ConformalStopEngine",
+    # T7-005: Black-Litterman
+    "BlackLittermanOptimizer",
     # V1-V5 backward compat
     "RiskManager",
     "TradeRecord",

@@ -47,11 +47,12 @@ class ConnectionPool:
     Connections are borrowed via `get()` and returned via `put()`, or used
     as a context manager.
 
-    Note: SQLite has limited concurrency (WAL mode helps), so pool_size
-    should be kept small (default 3).
+    QW-011: Default pool_size raised from 3 to 10 to reduce contention
+    under concurrent strategy scanning + signal processing + dashboard queries.
+    SQLite WAL mode supports this level of concurrency safely.
     """
 
-    def __init__(self, db_path: str, pool_size: int = 3):
+    def __init__(self, db_path: str, pool_size: int = 10):
         """Initialize the connection pool.
 
         Args:
@@ -81,23 +82,30 @@ class ConnectionPool:
         conn.execute("PRAGMA synchronous=FULL")
         return conn
 
-    def get(self, timeout: float = 5.0) -> sqlite3.Connection:
-        """Borrow a connection from the pool.
+    def get(self, timeout: float = 5.0, retries: int = 2) -> sqlite3.Connection:
+        """Borrow a connection from the pool with retry logic.
+
+        T4-004: Added retry with backoff. On final failure, creates overflow connection.
 
         Args:
-            timeout: Max seconds to wait for an available connection.
+            timeout: Max seconds to wait for an available connection per attempt.
+            retries: Number of retry attempts before creating overflow connection.
 
         Returns:
             A SQLite connection.
-
-        Raises:
-            queue.Empty: If no connection is available within timeout.
         """
-        try:
-            return self._pool.get(timeout=timeout)
-        except queue.Empty:
-            logger.warning("PROD-009: Connection pool exhausted, creating overflow connection")
-            return self._create_connection()
+        import time as _time
+        for attempt in range(retries + 1):
+            try:
+                return self._pool.get(timeout=timeout)
+            except queue.Empty:
+                if attempt < retries:
+                    backoff = 0.1 * (2 ** attempt)
+                    logger.debug("PROD-009: Pool get attempt %d failed, retrying in %.1fs", attempt + 1, backoff)
+                    _time.sleep(backoff)
+
+        logger.warning("T4-004: Connection pool exhausted after %d attempts, creating overflow connection", retries + 1)
+        return self._create_connection()
 
     def put(self, conn: sqlite3.Connection):
         """Return a connection to the pool."""
@@ -140,7 +148,7 @@ def get_connection_pool() -> ConnectionPool:
     global _connection_pool
     with _pool_lock:
         if _connection_pool is None:
-            pool_size = int(getattr(config, "DB_POOL_SIZE", 3))
+            pool_size = int(getattr(config, "DB_POOL_SIZE", 10))  # QW-011: default 10
             _connection_pool = ConnectionPool(config.DB_FILE, pool_size=pool_size)
     return _connection_pool
 
@@ -165,7 +173,7 @@ def _get_conn() -> sqlite3.Connection:
 # =============================================================================
 
 # Current schema version — bump this when adding a new migration
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 6
 
 
 def _ensure_schema_version_table(conn: sqlite3.Connection):
@@ -211,9 +219,104 @@ def _migrate_1(conn: sqlite3.Connection):
     logger.info("PROD-005: Migration 1 applied — schema versioning baseline established")
 
 
+def _migrate_2(conn: sqlite3.Connection):
+    """Migration 2: T1-008 — Add overnight_hold column to open_positions.
+
+    Tracks which positions are designated as overnight holds so the EOD
+    close logic can survive bot restarts without losing the hold registry.
+    """
+    cursor = conn.execute("PRAGMA table_info(open_positions)")
+    existing_cols = {row["name"] for row in cursor.fetchall()}
+    if "overnight_hold" not in existing_cols:
+        conn.execute("ALTER TABLE open_positions ADD COLUMN overnight_hold INTEGER DEFAULT 0")
+        logger.info("T1-008: Added overnight_hold column to open_positions")
+
+
+def _migrate_3(conn: sqlite3.Connection):
+    """Migration 3: QW-009 — Add composite index on (symbol, created_at) for trades table.
+
+    Speeds up per-symbol time-range queries used by analytics and dashboards.
+    Also adds (symbol, entry_time) index on open_positions.
+    """
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol_exit_time ON trades(symbol, exit_time)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_ts ON signals(symbol, timestamp)")
+    logger.info("QW-009: Added composite indexes for (symbol, time) queries")
+
+
+def _migrate_4(conn: sqlite3.Connection):
+    """Migration 4: T4-005 — Add indexes for hot query columns.
+
+    Speeds up frequently-run queries during market hours:
+    - trades(symbol, exit_time) — already covered by migration 3 as (symbol, exit_time)
+    - signals(strategy, timestamp) — strategy + time range queries
+    - execution_analytics(symbol, submitted_at) — fill analytics lookups
+    - open_positions(symbol) — position lookups (already PK, but add status-aware index pattern)
+    - event_log(event_type, timestamp) — audit log queries
+
+    SQLite does not support partial indexes with WHERE clauses on all versions,
+    so we use full indexes.
+    """
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_strategy_ts ON signals(strategy, timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_exec_symbol_time ON execution_analytics(symbol, submitted_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_event_type_ts ON event_log(event_type, timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_exit_reason ON trades(exit_reason)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_shadow_exit_time ON shadow_trades(exit_time)")
+    logger.info("T4-005: Added hot query indexes for signals, execution_analytics, event_log, trades")
+
+
+def _migrate_5(conn: sqlite3.Connection):
+    """Migration 5: T2-006 — Create audit_log table for V11.2 compliance.
+
+    Stores structured audit entries for order submissions, risk decisions,
+    circuit breaker trips, and system events.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            source TEXT NOT NULL,
+            symbol TEXT,
+            strategy TEXT,
+            details TEXT,
+            severity TEXT DEFAULT 'INFO',
+            session_id TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_event_type ON audit_log(event_type)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_symbol ON audit_log(symbol)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_severity ON audit_log(severity)")
+    logger.info("T2-006: Created audit_log table with indexes")
+
+
+def _migrate_6(conn: sqlite3.Connection):
+    """Migration 6: T2-006 — Add overnight_hold and partial tracking indexes.
+
+    Adds performance indexes for overnight position queries and
+    partial exit tracking that were identified as slow in V11.1 profiling.
+    """
+    # Index for overnight hold position queries
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_open_positions_overnight "
+        "ON open_positions(overnight_hold)"
+    )
+    # Index for partial exit queries on trades
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trades_strategy_exit_reason "
+        "ON trades(strategy, exit_reason)"
+    )
+    logger.info("T2-006: Added overnight and partial-exit performance indexes")
+
+
 # Registry of all migrations: version -> (function, description)
 _MIGRATIONS: dict[int, tuple] = {
     1: (_migrate_1, "Baseline schema versioning"),
+    2: (_migrate_2, "T1-008: Add overnight_hold column to open_positions"),
+    3: (_migrate_3, "QW-009: Add composite indexes for (symbol, time) queries"),
+    4: (_migrate_4, "T4-005: Add hot query indexes for market-hours performance"),
+    5: (_migrate_5, "T2-006: Create audit_log table for V11.2 compliance"),
+    6: (_migrate_6, "T2-006: Add overnight and partial-exit performance indexes"),
 }
 
 
@@ -256,6 +359,24 @@ def run_migrations():
 
     final = _get_schema_version(conn)
     logger.info("PROD-005: All migrations complete (version=%d)", final)
+
+
+def assert_schema_version():
+    """T2-006: Startup assertion — verify schema version matches expected.
+
+    Call after init_db() + run_migrations(). Raises RuntimeError if the
+    database schema version does not match CURRENT_SCHEMA_VERSION, which
+    would indicate a failed migration or database tampering.
+    """
+    conn = _get_conn()
+    actual = _get_schema_version(conn)
+    if actual != CURRENT_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"T2-006: Schema version mismatch! "
+            f"Expected {CURRENT_SCHEMA_VERSION}, got {actual}. "
+            f"Run migrations or check database integrity."
+        )
+    logger.info("T2-006: Schema version assertion passed (version=%d)", actual)
 
 
 def init_db():
@@ -304,7 +425,8 @@ def init_db():
             partial_exits INTEGER DEFAULT 0,
             highest_price_seen REAL DEFAULT 0.0,
             lowest_price_seen REAL DEFAULT 0.0,
-            entry_atr REAL DEFAULT 0.0
+            entry_atr REAL DEFAULT 0.0,
+            overnight_hold INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS daily_snapshots (
@@ -492,6 +614,20 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_event_ts ON event_log(timestamp);
         CREATE INDEX IF NOT EXISTS idx_event_type ON event_log(event_type);
+
+        -- V11.2 T5-010: SEC 17a-4 inspired compliance audit log
+        -- Append-only (no UPDATE/DELETE) with SHA-256 hash chain for tamper detection
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            actor TEXT NOT NULL DEFAULT 'system',
+            payload_json TEXT NOT NULL,
+            signature_hash TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_audit_event_type ON audit_log(event_type);
+        CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor);
     """)
     conn.commit()
 
@@ -598,8 +734,9 @@ def save_open_positions(open_trades: dict):
                     """INSERT INTO open_positions (symbol, strategy, side, entry_price,
                        qty, entry_time, take_profit, stop_loss, alpaca_order_id,
                        hold_type, time_stop, max_hold_date,
-                       pair_id, partial_exits, highest_price_seen, lowest_price_seen, entry_atr)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       pair_id, partial_exits, highest_price_seen, lowest_price_seen, entry_atr,
+                       overnight_hold)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (symbol, trade.strategy, trade.side, trade.entry_price,
                      trade.qty, _to_iso(trade.entry_time), trade.take_profit,
                      trade.stop_loss, trade.order_id,
@@ -610,7 +747,8 @@ def save_open_positions(open_trades: dict):
                      getattr(trade, 'partial_exits', 0),
                      getattr(trade, 'highest_price_seen', 0.0),
                      getattr(trade, 'lowest_price_seen', 0.0),
-                     getattr(trade, 'entry_atr', 0.0)),
+                     getattr(trade, 'entry_atr', 0.0),
+                     1 if getattr(trade, 'overnight_hold', False) else 0),
                 )
             conn.execute("COMMIT")
         except Exception:
@@ -623,6 +761,44 @@ def load_open_positions() -> list[dict]:
     conn = _get_conn()
     rows = conn.execute("SELECT * FROM open_positions").fetchall()
     return [dict(row) for row in rows]
+
+
+# --- T1-008: Overnight Hold Persistence ---
+
+def save_overnight_holds(symbols: set[str]):
+    """T1-008: Mark symbols as overnight holds in open_positions.
+
+    Persists the overnight hold flag so it survives bot restarts.
+    Only marks symbols that currently exist in open_positions.
+    """
+    if not symbols:
+        return
+    conn = _get_conn()
+    with _db_lock:
+        # Reset all, then set the selected ones
+        conn.execute("UPDATE open_positions SET overnight_hold = 0")
+        for sym in symbols:
+            conn.execute(
+                "UPDATE open_positions SET overnight_hold = 1 WHERE symbol = ?",
+                (sym,),
+            )
+        conn.commit()
+    logger.info("T1-008: Persisted %d overnight hold symbols to DB", len(symbols))
+
+
+def load_overnight_holds() -> set[str]:
+    """T1-008: Load overnight hold symbols from DB.
+
+    Called on startup to restore the hold registry after a restart.
+    """
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT symbol FROM open_positions WHERE overnight_hold = 1"
+    ).fetchall()
+    symbols = {row["symbol"] for row in rows}
+    if symbols:
+        logger.info("T1-008: Loaded %d overnight hold symbols from DB: %s", len(symbols), list(symbols))
+    return symbols
 
 
 # --- Daily Snapshots ---

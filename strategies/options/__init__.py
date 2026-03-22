@@ -12,9 +12,11 @@ for options order types (which Alpaca does not yet fully support).
 from strategies.options.covered_calls import CoveredCallWriter
 from strategies.options.protective_puts import ProtectivePutBuyer
 from strategies.options.gamma_scalp import GammaScalper
+from strategies.options.skew_scanner import OptionsSkewScanner
 
 __all__ = [
     "CoveredCallWriter",
     "ProtectivePutBuyer",
     "GammaScalper",
+    "OptionsSkewScanner",
 ]

@@ -1,7 +1,17 @@
-# Velox V10 Prometheus Configuration
+# Velox V11.2 Prometheus Configuration
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
+
+# T6-002: Alert rules
+rule_files:
+  - "alerts.yml"
+
+# Alertmanager endpoint (configure host/port to match your deployment)
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["localhost:9093"]
 
 scrape_configs:
   - job_name: "velox"

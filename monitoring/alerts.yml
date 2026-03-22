@@ -1,0 +1,161 @@
+# T6-002: Prometheus Alert Rules for Velox Trading Bot
+#
+# Load into Prometheus via rule_files directive in prometheus.yml:
+#   rule_files:
+#     - "alerts.yml"
+#
+# Requires a running Alertmanager instance for notifications.
+
+groups:
+  - name: velox_trading_alerts
+    rules:
+
+      # --- Risk Alerts ---
+
+      - alert: CircuitBreakerTriggered
+        expr: velox_circuit_breaker_level >= 2
+        for: 0m
+        labels:
+          severity: critical
+          team: trading
+        annotations:
+          summary: "Circuit breaker triggered (level {{ $value }})"
+          description: >
+            The trading circuit breaker has been tripped to level {{ $value }}
+            (1=GREEN, 2=YELLOW, 3=RED, 4=BLACK). New entries are halted.
+            Check day P&L and market conditions.
+          runbook_url: "docs/runbooks/circuit_breaker_triggered.md"
+
+      - alert: DailyDrawdownExceeds3Pct
+        expr: velox_day_pnl_pct < -0.03
+        for: 1m
+        labels:
+          severity: critical
+          team: trading
+        annotations:
+          summary: "Daily drawdown exceeds 3% ({{ $value | humanizePercentage }})"
+          description: >
+            The portfolio day P&L has dropped below -3%. Current: {{ $value | humanizePercentage }}.
+            Circuit breaker should have engaged. Verify positions and risk limits.
+          runbook_url: "docs/runbooks/circuit_breaker_triggered.md"
+
+      - alert: VPINToxicitySpike
+        expr: velox_vpin_toxicity > 0.8
+        for: 2m
+        labels:
+          severity: warning
+          team: trading
+        annotations:
+          summary: "VPIN toxicity spike detected ({{ $value }})"
+          description: >
+            Volume-Synchronized Probability of Informed Trading (VPIN) has exceeded 0.8,
+            indicating high probability of toxic order flow. Consider reducing position sizes
+            or halting new entries until toxicity subsides.
+
+      # --- Infrastructure Alerts ---
+
+      - alert: APIFailureRate
+        expr: rate(velox_api_errors_total[5m]) / rate(velox_api_requests_total[5m]) > 0.1
+        for: 3m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "API failure rate > 10% ({{ $value | humanizePercentage }})"
+          description: >
+            More than 10% of API requests to Alpaca are failing over the last 5 minutes.
+            Check API credentials, rate limits, and network connectivity.
+          runbook_url: "docs/runbooks/api_credentials_expired.md"
+
+      - alert: APIFailureRateCritical
+        expr: rate(velox_api_errors_total[5m]) / rate(velox_api_requests_total[5m]) > 0.5
+        for: 1m
+        labels:
+          severity: critical
+          team: infrastructure
+        annotations:
+          summary: "API failure rate > 50% — data feed may be down"
+          description: >
+            More than 50% of API requests are failing. The bot may be unable to
+            fetch prices or submit orders. Immediate investigation required.
+          runbook_url: "docs/runbooks/api_credentials_expired.md"
+
+      - alert: ModelStale
+        expr: (time() - velox_model_last_trained_timestamp) > 604800
+        for: 5m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "ML model has not been retrained in > 7 days"
+          description: >
+            The ML signal scoring model was last trained {{ $value | humanizeDuration }} ago.
+            Stale models may produce degraded predictions. Run walk-forward validation
+            and retrain if needed.
+          runbook_url: "docs/runbooks/model_degradation.md"
+
+      - alert: ScanLatencyHigh
+        expr: velox_scan_cycle_duration_seconds > 30
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Scan cycle latency > 30s ({{ $value }}s)"
+          description: >
+            The main scan cycle is taking longer than 30 seconds, which may cause
+            the bot to miss trading opportunities. Check API latency, database
+            performance, and indicator computation times.
+
+      - alert: ScanLatencyCritical
+        expr: velox_scan_cycle_duration_seconds > 60
+        for: 2m
+        labels:
+          severity: critical
+          team: infrastructure
+        annotations:
+          summary: "Scan cycle latency > 60s — bot may be stuck"
+          description: >
+            The scan cycle is exceeding 60 seconds. The bot may be stuck or
+            experiencing severe performance degradation. Check for deadlocks,
+            database locks, or API timeouts.
+
+      # --- Operational Alerts ---
+
+      - alert: WatchdogHeartbeatMissing
+        expr: (time() - velox_last_heartbeat_timestamp) > 180
+        for: 0m
+        labels:
+          severity: critical
+          team: infrastructure
+        annotations:
+          summary: "Main loop heartbeat missing for > 3 minutes"
+          description: >
+            The watchdog has not received a heartbeat from the main trading loop
+            in over 3 minutes. The bot process may have crashed or be deadlocked.
+            Check process status and logs.
+
+      - alert: HighMemoryUsage
+        expr: process_resident_memory_bytes > 2147483648
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Process memory usage > 2GB"
+          description: >
+            The trading bot process is using more than 2GB of RAM. This may indicate
+            a memory leak. Consider restarting during non-market hours.
+
+      - alert: DatabaseConnectionPoolExhausted
+        expr: velox_db_pool_available == 0
+        for: 1m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Database connection pool exhausted"
+          description: >
+            All database connections are in use. Queries may be waiting or
+            creating overflow connections. Check for long-running transactions
+            or increase DB_POOL_SIZE.

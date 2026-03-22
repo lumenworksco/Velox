@@ -111,6 +111,67 @@ class FactorRiskModel:
     # Public API
     # ------------------------------------------------------------------
 
+    def get_factor_exposures(
+        self,
+        symbol: str,
+        returns_data: dict[str, pd.Series],
+    ) -> dict[str, float]:
+        """Compute factor exposures for a single symbol via OLS regression.
+
+        V11.2 convenience wrapper: runs rolling OLS of symbol returns on factor
+        return proxies and returns the betas.
+
+        Args:
+            symbol: Ticker symbol.
+            returns_data: symbol -> daily return series (must include factor proxies).
+
+        Returns:
+            Dict of factor name -> beta (exposure). Returns zeros if data insufficient.
+        """
+        sym_returns = returns_data.get(symbol)
+        if sym_returns is None or len(sym_returns) < self._rolling_window:
+            return {f: 0.0 for f in self._factor_limits}
+
+        factor_returns = self._build_factor_returns(returns_data)
+        if factor_returns.empty:
+            return {f: 0.0 for f in self._factor_limits}
+
+        betas = self._rolling_regression(sym_returns, factor_returns)
+        with self._lock:
+            self._exposure_cache[symbol] = betas
+        return betas
+
+    def portfolio_factor_risk(
+        self,
+        positions: dict[str, float],
+        returns_data: dict[str, pd.Series],
+    ) -> dict:
+        """Compute portfolio-level factor exposures and flag concentrations.
+
+        V11.2: Sum of (weight x exposure) per factor with 0.40 concentration flag.
+
+        Args:
+            positions: symbol -> dollar exposure.
+            returns_data: symbol -> daily return series.
+
+        Returns:
+            Dict with keys: exposures (dict), violations (list), concentrated (bool).
+        """
+        exposures = self.compute_factor_exposures(positions, returns_data)
+        violations = []
+        for factor, exp in exposures.items():
+            if factor.startswith("sector_"):
+                continue
+            if abs(exp) > 0.40:
+                violations.append(
+                    f"{factor} concentration={exp:+.3f} exceeds 0.40 limit"
+                )
+        return {
+            "exposures": exposures,
+            "violations": violations,
+            "concentrated": len(violations) > 0,
+        }
+
     def compute_factor_exposures(
         self,
         positions: dict[str, float],

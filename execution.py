@@ -13,6 +13,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 import config
 from data import get_trading_client
 from strategies.base import Signal
+from engine.failure_modes import FailureMode, handle_failure
 
 logger = logging.getLogger(__name__)
 
@@ -243,8 +244,10 @@ def submit_bracket_order(signal: Signal, qty: int) -> str | list[str] | None:
                             f"Order {last_order_id} already {status} — skipping retry"
                         )
                         return str(last_order_id)
-                except Exception:
-                    pass  # Order not found or API error — proceed with retry
+                except Exception as exc:
+                    handle_failure(FailureMode.DEGRADE_GRACEFULLY,
+                                   "execution.order_status_check", exc,
+                                   symbol=signal.symbol, strategy=signal.strategy)
 
             order = _submit_order(signal, qty, client)
             logger.info(

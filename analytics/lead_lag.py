@@ -27,6 +27,8 @@ Usage::
 """
 
 import logging
+import threading
+import time as _time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -541,3 +543,147 @@ class LeadLagAnalyzer:
             dates.append(aligned.index[i])
 
         return pd.Series(correlations, index=dates)
+
+
+# ---------------------------------------------------------------------------
+# T5-013: Real-Time Lead-Lag Signal for Strategy Integration
+# ---------------------------------------------------------------------------
+
+# Cache for sector ETF recent moves
+_sector_move_cache: Dict[str, Tuple[float, float]] = {}  # etf -> (move_pct, timestamp)
+_sector_cache_lock = threading.Lock()
+_SECTOR_CACHE_TTL_SEC = 60  # Refresh every 60 seconds
+_SECTOR_MOVE_THRESHOLD = 0.5  # 0.5% move threshold
+_BIAS_DURATION_MIN = 30  # Bias lasts 30 minutes
+
+# Active biases: symbol -> (bias_direction, expiry_timestamp)
+_active_biases: Dict[str, Tuple[float, float]] = {}
+_bias_lock = threading.Lock()
+
+
+def _get_sector_etf_move(etf_symbol: str) -> float:
+    """Get the recent (5-min) return for a sector ETF.
+
+    Uses cached data when available. Returns 0.0 on failure (fail-open).
+    """
+    now = _time.time()
+
+    with _sector_cache_lock:
+        if etf_symbol in _sector_move_cache:
+            cached_move, cached_ts = _sector_move_cache[etf_symbol]
+            if now - cached_ts < _SECTOR_CACHE_TTL_SEC:
+                return cached_move
+
+    try:
+        from data import get_snapshot
+        snapshot = get_snapshot(etf_symbol)
+        if snapshot is None:
+            return 0.0
+
+        # Compute 5-minute move from minute bar if available
+        bar = snapshot.minute_bar if hasattr(snapshot, 'minute_bar') else None
+        if bar is None:
+            return 0.0
+
+        open_price = float(bar.open) if hasattr(bar, 'open') else 0.0
+        close_price = float(bar.close) if hasattr(bar, 'close') else 0.0
+        if open_price <= 0:
+            return 0.0
+
+        move_pct = (close_price - open_price) / open_price * 100
+
+        with _sector_cache_lock:
+            _sector_move_cache[etf_symbol] = (move_pct, now)
+
+        return move_pct
+
+    except Exception as e:
+        logger.debug("T5-013: Failed to get sector ETF move for %s: %s", etf_symbol, e)
+        return 0.0
+
+
+def get_lead_lag_signal(symbol: str) -> float:
+    """T5-013: Get directional bias for a symbol based on sector ETF lead-lag.
+
+    If the sector ETF moves > 0.5% in the last 5 minutes, we bias the
+    constituent stock in the same direction for 30 minutes.
+
+    Args:
+        symbol: Stock ticker (e.g., "AAPL").
+
+    Returns:
+        Directional bias as a confidence multiplier adjustment:
+        - Positive (up to +0.2): sector ETF moved up significantly
+        - Negative (down to -0.2): sector ETF moved down significantly
+        - 0.0: no significant lead-lag signal
+
+    Never raises.
+    """
+    try:
+        import config as _cfg
+        if not getattr(_cfg, "LEAD_LAG_ENABLED", False):
+            return 0.0
+
+        now = _time.time()
+
+        # Check for existing active bias
+        with _bias_lock:
+            if symbol in _active_biases:
+                bias_dir, expiry = _active_biases[symbol]
+                if now < expiry:
+                    return bias_dir
+                else:
+                    del _active_biases[symbol]
+
+        # Look up sector ETF for this symbol
+        sector_map = getattr(_cfg, "SECTOR_MAP", {})
+        sector_etf = sector_map.get(symbol)
+        if not sector_etf:
+            return 0.0
+
+        # Get recent sector ETF move
+        etf_move = _get_sector_etf_move(sector_etf)
+
+        if abs(etf_move) < _SECTOR_MOVE_THRESHOLD:
+            return 0.0
+
+        # Significant sector move detected — create bias
+        # Scale bias: 0.5% move -> 0.1 bias, 1.0% move -> 0.2 bias (capped)
+        bias = min(0.2, max(-0.2, etf_move / 5.0))
+        expiry = now + _BIAS_DURATION_MIN * 60
+
+        with _bias_lock:
+            _active_biases[symbol] = (bias, expiry)
+
+        logger.info(
+            "T5-013: Lead-lag bias for %s: %.3f (sector %s moved %.2f%%)",
+            symbol, bias, sector_etf, etf_move,
+        )
+        return bias
+
+    except Exception as e:
+        logger.debug("T5-013: Lead-lag signal failed for %s (fail-open): %s", symbol, e)
+        return 0.0
+
+
+def get_lead_lag_size_multiplier(symbol: str) -> float:
+    """T5-013: Convert lead-lag signal to a position sizing multiplier.
+
+    Returns:
+        Multiplier in [0.8, 1.2]. 1.0 = no adjustment.
+    """
+    bias = get_lead_lag_signal(symbol)
+    if bias == 0.0:
+        return 1.0
+    # Map bias [-0.2, +0.2] to multiplier [0.8, 1.2]
+    return 1.0 + bias
+
+
+def clear_lead_lag_cache():
+    """Clear all cached sector moves and active biases (call at EOD)."""
+    global _sector_move_cache, _active_biases
+    with _sector_cache_lock:
+        _sector_move_cache.clear()
+    with _bias_lock:
+        _active_biases.clear()
+    logger.debug("T5-013: Lead-lag cache cleared")

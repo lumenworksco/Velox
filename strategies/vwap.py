@@ -8,6 +8,7 @@ Exit:  Handled by ExitManager (time stops, trailing stops, scaled TP)
 """
 
 import logging
+import math
 from datetime import datetime
 
 import pandas_ta as ta
@@ -77,13 +78,19 @@ class VWAPStrategy:
                 rsi = rsi_series.iloc[-1]
 
                 # OU z-score confirmation on intraday bars
-                # V10 BUG-011: Use None instead of 0.0 to distinguish fit failure from neutral z
-                ou_zscore = None
+                # T1-010: Use NaN instead of None to distinguish fit failure from neutral z=0.0
+                # (None is falsy and downstream code could conflate it with 0.0)
+                ou_zscore = float('nan')
+                ou = None
                 try:
                     close = bars["close"]
-                    ou = fit_ou_params(close)
+                    # T1-006: Exclude current bar to prevent look-ahead bias in OU fitting
+                    assert len(close) >= 2, f"Need >=2 bars for OU fit, got {len(close)}"
+                    ou = fit_ou_params(close.iloc[:-1])
                     if ou:
                         ou_zscore = compute_zscore(last_price, ou['mu'], ou['sigma'])
+                    else:
+                        logger.debug("T1-010: OU fit returned empty for %s, z-score=NaN", symbol)
                 except Exception as e:
                     logger.warning(f"OU fit failed for {symbol}: {e}")  # V10: WARNING not debug
 
@@ -112,8 +119,8 @@ class VWAPStrategy:
                         vol_ratio = bars["volume"].iloc[-1] / avg_vol
 
                 # BUY signal: price touched lower band and bounced back above
-                # Require valid OU z-score — skip symbol if OU fit failed
-                if ou_zscore is None:
+                # T1-010: Require valid OU z-score — skip symbol if OU fit failed (NaN)
+                if math.isnan(ou_zscore):
                     continue
                 ou_buy_ok = ou_zscore < -config.VWAP_OU_ZSCORE_MIN
                 if (prev_bar["low"] <= lower
@@ -138,7 +145,7 @@ class VWAPStrategy:
 
                     # Use tighter of VWAP and OU targets
                     vwap_target = vwap
-                    if ou and ou_zscore is not None and ou_zscore < -1.5:
+                    if ou and not math.isnan(ou_zscore) and ou_zscore < -1.5:
                         ou_target = ou['mu']
                         target = min(vwap_target, ou_target)  # More conservative
                     else:
@@ -157,7 +164,7 @@ class VWAPStrategy:
                         entry_price=round(entry, 2),
                         take_profit=round(target, 2),
                         stop_loss=round(stop_loss, 2),
-                        reason=f"VWAP+OU bounce z={ou_zscore if ou_zscore is not None else 'N/A'}, RSI={rsi:.1f}",
+                        reason=f"VWAP+OU bounce z={ou_zscore if not math.isnan(ou_zscore) else 'N/A'}, RSI={rsi:.1f}",
                         hold_type="day",
                     ))
                     self.triggered[symbol] = now
@@ -189,7 +196,7 @@ class VWAPStrategy:
 
                     # Use tighter of VWAP and OU targets
                     vwap_target = vwap
-                    if ou and ou_zscore is not None and ou_zscore > 1.5:
+                    if ou and not math.isnan(ou_zscore) and ou_zscore > 1.5:
                         ou_target = ou['mu']
                         target = max(vwap_target, ou_target)
                     else:
@@ -208,7 +215,7 @@ class VWAPStrategy:
                         entry_price=round(entry, 2),
                         take_profit=round(target, 2),
                         stop_loss=round(stop_loss, 2),
-                        reason=f"VWAP+OU rejection z={ou_zscore if ou_zscore is not None else 'N/A'}, RSI={rsi:.1f}",
+                        reason=f"VWAP+OU rejection z={ou_zscore if not math.isnan(ou_zscore) else 'N/A'}, RSI={rsi:.1f}",
                         hold_type="day",
                     ))
                     self.triggered[symbol] = now

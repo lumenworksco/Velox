@@ -202,15 +202,23 @@ def eod_close(
     overnight_manager=None,
     regime: str = "UNKNOWN",
 ):
-    """Close all day-hold positions at EOD. Respects overnight holds (BUG-034)."""
+    """Close all day-hold positions at EOD. Respects overnight holds (BUG-034).
+
+    T1-008: Overnight holds are persisted to DB so they survive bot restarts.
+    On startup, load_overnight_holds() restores the registry.
+    """
     # V10 BUG-034: Track overnight hold symbols to skip in EOD close
-    overnight_hold_symbols: set[str] = set()
+    # T1-008: First reload any persisted overnight holds (survives restart)
+    overnight_hold_symbols: set[str] = database.load_overnight_holds()
+
     if overnight_manager:
         try:
             holds = overnight_manager.select_overnight_holds(risk.open_trades, regime)
             if holds:
-                overnight_hold_symbols = {h.symbol for h in holds}
+                overnight_hold_symbols |= {h.symbol for h in holds}
                 logger.info(f"Overnight holds selected: {list(overnight_hold_symbols)}")
+                # T1-008: Persist to DB at registration time
+                database.save_overnight_holds(overnight_hold_symbols)
         except Exception as e:
             logger.error(f"Overnight hold selection failed: {e}")
 
@@ -254,5 +262,12 @@ def eod_close(
                     logger.info("WIRE-012: Tax harvest candidates: %d positions", len(harvest_candidates))
     except Exception as e:
         logger.debug("WIRE-012: Tax harvesting scan failed (fail-open): %s", e)
+
+    # T1-009: Clean up stale VPIN instances at EOD to prevent memory leak
+    try:
+        from engine.signal_processor import cleanup_stale_vpin_instances
+        cleanup_stale_vpin_instances(active_symbols=None)  # Clear all at EOD
+    except Exception as e:
+        logger.debug("T1-009: VPIN cleanup failed (fail-open): %s", e)
 
     return closed_count

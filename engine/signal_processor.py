@@ -20,6 +20,7 @@ from earnings import has_earnings_soon
 from correlation import is_too_correlated
 
 from engine.event_log import log_event, EventType
+from engine.failure_modes import FailureMode, handle_failure
 
 logger = logging.getLogger(__name__)
 
@@ -36,20 +37,58 @@ try:
 except ImportError:
     _FEATURE_STORE_AVAILABLE = False
 
-# WIRE-002: ML model integration (fail-open)
-_ml_model = None
-_ml_model_load_attempted = False
-_ml_model_lock = threading.Lock()
+# =============================================================================
+# T2-004: Unified SignalProcessorState — single RLock replaces 5 fine-grained
+# locks (_ml_model_lock, _vpin_lock, _seasonality_lock, _pair_lock,
+# _asset_status_lock) to eliminate deadlock risk from inconsistent lock ordering.
+# =============================================================================
 
+from dataclasses import dataclass as _dataclass, field as _field
+
+
+@_dataclass
+class SignalProcessorState:
+    """T2-004: Consolidated mutable state for the signal processor.
+
+    All mutable state that was previously guarded by separate locks is
+    collected here and protected by a single RLock.
+    """
+    lock: threading.RLock = _field(default_factory=threading.RLock, repr=False)
+
+    # ML model (WIRE-002)
+    ml_model: object = None
+    ml_model_load_attempted: bool = False
+
+    # VPIN instances (WIRE-003)
+    vpin_instances: dict = _field(default_factory=dict)  # symbol -> VPIN
+
+    # Seasonality singleton (BUG-042)
+    seasonality_instance: object = None
+
+    # T5-004: FinBERT NLP sentiment (fail-open)
+    finbert_sentiment: object = None
+    finbert_load_attempted: bool = False
+
+    # Halted / asset status blocklists (BUG-024, RISK-005)
+    halted_symbols: dict = _field(default_factory=dict)        # symbol -> expiry_ts
+    asset_status_blocklist: dict = _field(default_factory=dict) # symbol -> expiry_ts
+    last_asset_status_refresh: float = 0.0
+    last_successful_asset_refresh: float = 0.0
+
+
+# Module-level singleton
+_state = SignalProcessorState()
+
+
+# WIRE-002: ML model integration (fail-open)
 def _get_ml_model():
     """Lazy-load the most recent trained ML model (singleton, fail-open)."""
-    global _ml_model, _ml_model_load_attempted
-    if _ml_model_load_attempted:
-        return _ml_model
-    with _ml_model_lock:
-        if _ml_model_load_attempted:
-            return _ml_model
-        _ml_model_load_attempted = True
+    if _state.ml_model_load_attempted:
+        return _state.ml_model
+    with _state.lock:
+        if _state.ml_model_load_attempted:
+            return _state.ml_model
+        _state.ml_model_load_attempted = True
         try:
             import glob
             import os
@@ -57,13 +96,35 @@ def _get_ml_model():
             model_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
             model_files = sorted(glob.glob(os.path.join(model_dir, "model_*.pkl")))
             if model_files:
-                _ml_model = ModelTrainer.load_model(model_files[-1])
+                _state.ml_model = ModelTrainer.load_model(model_files[-1])
                 logger.info("WIRE-002: ML model loaded: %s", model_files[-1])
             else:
                 logger.info("WIRE-002: No trained ML model found in %s", model_dir)
         except Exception as e:
             logger.info("WIRE-002: ML model load skipped (fail-open): %s", e)
-    return _ml_model
+    return _state.ml_model
+
+
+# T5-004: FinBERT NLP sentiment integration (fail-open)
+def _get_finbert_sentiment():
+    """Lazy-load FinBERTSentiment (singleton, fail-open)."""
+    if _state.finbert_load_attempted:
+        return _state.finbert_sentiment
+    with _state.lock:
+        if _state.finbert_load_attempted:
+            return _state.finbert_sentiment
+        _state.finbert_load_attempted = True
+        try:
+            if getattr(config, "NLP_SENTIMENT_ENABLED", False):
+                from ml.models.fingpt import FinBERTSentiment
+                _state.finbert_sentiment = FinBERTSentiment()
+                logger.info("T5-004: FinBERTSentiment loaded successfully")
+            else:
+                logger.info("T5-004: NLP_SENTIMENT_ENABLED=False, skipping FinBERT")
+        except Exception as e:
+            logger.info("T5-004: FinBERTSentiment load skipped (fail-open): %s", e)
+    return _state.finbert_sentiment
+
 
 # WIRE-003: VPIN integration (fail-open)
 try:
@@ -72,21 +133,62 @@ try:
 except ImportError:
     _VPIN_AVAILABLE = False
 
-_vpin_instances: dict[str, object] = {}
-_vpin_lock = threading.Lock()
+# T5-013: Lead-lag signal integration (fail-open)
+try:
+    from analytics.lead_lag import get_lead_lag_size_multiplier as _get_lead_lag_mult
+    _LEAD_LAG_AVAILABLE = True
+except ImportError:
+    _LEAD_LAG_AVAILABLE = False
+
+# T5-012: Alpha agent integration (fail-open)
+try:
+    from ml.alpha_agents import get_alpha_orchestrator as _get_alpha_orch
+    _ALPHA_AGENTS_AVAILABLE = True
+except ImportError:
+    _ALPHA_AGENTS_AVAILABLE = False
+
+
+def cleanup_stale_vpin_instances(active_symbols: set[str] | None = None) -> int:
+    """T1-009: Evict VPIN instances for symbols no longer in the active universe.
+
+    Call at EOD or universe refresh to prevent unbounded memory growth.
+
+    Args:
+        active_symbols: Set of currently active symbols. If None, clears all instances.
+
+    Returns:
+        Number of evicted instances.
+    """
+    with _state.lock:
+        if active_symbols is None:
+            count = len(_state.vpin_instances)
+            _state.vpin_instances.clear()
+            if count:
+                logger.info("T1-009: Cleared all %d VPIN instances (EOD)", count)
+            return count
+
+        stale = [sym for sym in _state.vpin_instances if sym not in active_symbols]
+        for sym in stale:
+            del _state.vpin_instances[sym]
+        if stale:
+            logger.info("T1-009: Evicted %d stale VPIN instances: %s", len(stale), stale[:10])
+        return len(stale)
+
 
 # V10 BUG-042: Singleton IntradaySeasonality (created once, not per-signal)
-# BUG-008: Thread-safe singleton creation via double-checked locking
-_seasonality_instance = None
-_seasonality_lock = threading.Lock()
-
 def _get_seasonality():
-    global _seasonality_instance
-    if _seasonality_instance is None and IntradaySeasonality:
-        with _seasonality_lock:
-            if _seasonality_instance is None:
-                _seasonality_instance = IntradaySeasonality()
-    return _seasonality_instance
+    if _state.seasonality_instance is None and IntradaySeasonality:
+        with _state.lock:
+            if _state.seasonality_instance is None:
+                _state.seasonality_instance = IntradaySeasonality()
+    return _state.seasonality_instance
+
+
+# Legacy aliases for backward compatibility with code referencing module-level dicts
+# These are now proxied through _state
+_vpin_instances = _state.vpin_instances
+_halted_symbols = _state.halted_symbols
+_asset_status_blocklist = _state.asset_status_blocklist
 
 # OMS integration (fail-open: if OMS not available, orders still go through)
 try:
@@ -110,13 +212,13 @@ _order_manager = None
 # BUG-024 + RISK-005: Halted/delisted symbol blocklist with Alpaca asset status
 _halted_symbols: dict[str, float] = {}  # symbol -> expiry timestamp
 _HALT_BLOCKLIST_TTL_SEC = 300  # Block for 5 minutes after detection
-_pair_lock = threading.Lock()  # CRIT-009: Lock for atomic pair trade submission
-
-# RISK-005: Alpaca asset status blocklist — refreshed every 5 minutes
-_asset_status_blocklist: dict[str, float] = {}  # symbol -> expiry timestamp
-_asset_status_lock = threading.Lock()
+# CRIT-009: Pair lock now uses _state.lock (T2-004)
 _ASSET_STATUS_REFRESH_SEC = 300  # Refresh every 5 minutes
-_last_asset_status_refresh: float = 0.0
+_ASSET_STALE_THRESHOLD_SEC = 600  # 10 minutes — if stale, block unknown symbols
+_last_successful_asset_refresh: float = 0.0
+
+# T1-005: Emergency escape hatch — bypass OMS requirement (paper trading only)
+_force_no_oms: bool = False
 
 
 def _refresh_asset_status_blocklist() -> None:
@@ -125,11 +227,11 @@ def _refresh_asset_status_blocklist() -> None:
     Called automatically when the blocklist is stale (> 5 minutes old).
     Fail-open: if the API call fails, the stale blocklist is kept.
     """
-    global _last_asset_status_refresh
+    # T2-004: asset status refresh uses _state.last_asset_status_refresh
 
     current_ts = _time.time()
-    with _asset_status_lock:
-        if (current_ts - _last_asset_status_refresh) < _ASSET_STATUS_REFRESH_SEC:
+    with _state.lock:
+        if (current_ts - _state.last_asset_status_refresh) < _ASSET_STATUS_REFRESH_SEC:
             return  # Still fresh
 
     try:
@@ -149,19 +251,25 @@ def _refresh_asset_status_blocklist() -> None:
                 if not asset.tradable or asset.status == "inactive":
                     new_blocklist[symbol] = expiry
                     logger.info(f"RISK-005: {symbol} is not tradable (status={asset.status}), blocking")
-            except Exception:
-                pass  # If we can't check a specific asset, skip it
+            except Exception as e:
+                # T1-002: Fail-safe — if we can't verify, mark UNKNOWN and block
+                new_blocklist[symbol] = expiry
+                logger.warning(f"T1-002: asset status unavailable, blocking {symbol}: {e}")
 
-        with _asset_status_lock:
+        with _state.lock:
             _asset_status_blocklist.update(new_blocklist)
-            _last_asset_status_refresh = current_ts
+            _state.last_asset_status_refresh = current_ts
+
+        # T1-002: Track successful refresh for staleness detection
+        global _last_successful_asset_refresh
+        _last_successful_asset_refresh = current_ts
 
         logger.debug(f"RISK-005: Asset status blocklist refreshed, {len(new_blocklist)} blocked symbols")
 
     except Exception as e:
-        logger.warning(f"RISK-005: Asset status refresh failed (fail-open): {e}")
-        with _asset_status_lock:
-            _last_asset_status_refresh = current_ts  # Don't retry immediately
+        logger.warning(f"RISK-005: Asset status refresh failed (fail-safe): {e}")
+        with _state.lock:
+            _state.last_asset_status_refresh = current_ts  # Don't retry immediately
 
 
 def _is_asset_blocked(symbol: str) -> bool:
@@ -176,28 +284,41 @@ def _is_asset_blocked(symbol: str) -> bool:
     _refresh_asset_status_blocklist()
 
     # Check blocklist
-    with _asset_status_lock:
+    with _state.lock:
         if symbol in _asset_status_blocklist:
             if current_ts < _asset_status_blocklist[symbol]:
                 return True
             else:
                 del _asset_status_blocklist[symbol]
 
+    # T1-002: If asset status data is stale (> 10 min since last successful refresh),
+    # block unknown symbols as a fail-safe
+    if _last_successful_asset_refresh > 0 and (current_ts - _last_successful_asset_refresh) > _ASSET_STALE_THRESHOLD_SEC:
+        logger.warning(f"T1-002: asset status data stale (>{_ASSET_STALE_THRESHOLD_SEC}s), blocking {symbol}")
+        return True
+
     # On-demand check for symbols not in blocklist
-    try:
-        from broker.alpaca_client import get_trading_client
+    # Only do on-demand checks if we've had at least one successful refresh
+    # (i.e., the broker API is actually available in this environment)
+    if _last_successful_asset_refresh > 0:
+        try:
+            from broker.alpaca_client import get_trading_client
 
-        client = get_trading_client()
-        asset = client.get_asset(symbol)
+            client = get_trading_client()
+            asset = client.get_asset(symbol)
 
-        if not asset.tradable or asset.status == "inactive":
-            with _asset_status_lock:
+            if not asset.tradable or asset.status == "inactive":
+                with _state.lock:
+                    _asset_status_blocklist[symbol] = current_ts + _ASSET_STATUS_REFRESH_SEC
+                logger.warning(f"RISK-005: {symbol} is not tradable (status={asset.status}), blocking")
+                return True
+
+        except Exception as e:
+            # T1-002: Fail-safe — if on-demand check fails, block the symbol
+            with _state.lock:
                 _asset_status_blocklist[symbol] = current_ts + _ASSET_STATUS_REFRESH_SEC
-            logger.warning(f"RISK-005: {symbol} is not tradable (status={asset.status}), blocking")
+            logger.warning(f"T1-002: asset status unavailable, blocking {symbol}: {e}")
             return True
-
-    except Exception as e:
-        logger.debug(f"RISK-005: Asset status check failed for {symbol} (fail-open): {e}")
 
     return False
 
@@ -268,6 +389,38 @@ def _emit_event(event_type: str, data: dict, source: str = "signal_processor"):
             logger.debug(f"Event bus publish failed: {e}")
 
 
+def _pairs_atomic_rollback(leg1_order_id: str, symbol: str) -> bool:
+    """T1-001: Roll back leg 1 of a pairs trade if leg 2 fails.
+
+    Submits a market close order for the given symbol with retry logic.
+    Returns True if rollback succeeded, False if all attempts exhausted.
+    """
+    for attempt in range(3):
+        try:
+            close_position(symbol, reason="pair_atomic_rollback")
+            logger.warning(f"T1-001: Pairs rollback succeeded for {symbol} (order {leg1_order_id}) on attempt {attempt + 1}")
+            _emit_event("PAIRS_ROLLBACK_TRIGGERED", {
+                "symbol": symbol,
+                "leg1_order_id": str(leg1_order_id),
+                "attempt": attempt + 1,
+                "status": "success",
+            })
+            return True
+        except Exception as e:
+            logger.error(f"T1-001: Pairs rollback attempt {attempt + 1}/3 failed for {symbol}: {e}")
+            if attempt < 2:
+                _time.sleep(0.5 * (attempt + 1))  # 500ms backoff
+
+    logger.critical(f"T1-001: PAIRS ROLLBACK FAILED after 3 attempts for {symbol} (order {leg1_order_id}) — manual intervention required")
+    _emit_event("PAIRS_ROLLBACK_TRIGGERED", {
+        "symbol": symbol,
+        "leg1_order_id": str(leg1_order_id),
+        "attempt": 3,
+        "status": "FAILED",
+    })
+    return False
+
+
 def process_signals(
     signals: list[Signal],
     risk: RiskManager,
@@ -311,7 +464,7 @@ def process_signals(
 
     # Process pairs atomically (both legs or neither)
     # CRIT-009: Lock around pair submission to prevent unhedged exposure
-    with _pair_lock:
+    with _state.lock:
         for pair_id, pair_signals in pair_groups.items():
             if len(pair_signals) != 2:
                 logger.warning(f"Pair {pair_id} has {len(pair_signals)} signals, skipping")
@@ -328,43 +481,31 @@ def process_signals(
                     break
 
             if all_ok:
-                # V10 BUG-030: Submit both legs with rollback if second fails
+                # T1-001 + CRIT-009: Submit both legs atomically with rollback if second fails
                 first_sig, second_sig = pair_signals[0], pair_signals[1]
                 _process_single_signal(first_sig, risk, regime, now, vol_engine, pnl_lock, ws_monitor,
                                        news_sentiment, llm_scorer, regime_detector, cross_asset_monitor,
                                        var_monitor, corr_limiter)
 
                 if first_sig.symbol in risk.open_trades:
+                    # T1-001: Track leg 1 order ID before submitting leg 2
+                    leg1_trade = risk.open_trades.get(first_sig.symbol)
+                    leg1_order_id = leg1_trade.order_id if leg1_trade else ""
+
                     _process_single_signal(second_sig, risk, regime, now, vol_engine, pnl_lock, ws_monitor,
                                            news_sentiment, llm_scorer, regime_detector, cross_asset_monitor,
                                            var_monitor, corr_limiter)
 
+                    # T1-001: If leg 2 failed (rejected or not in open_trades), roll back leg 1
                     if second_sig.symbol not in risk.open_trades:
-                        logger.warning(f"Pair {pair_id}: second leg {second_sig.symbol} failed, closing first leg {first_sig.symbol}")
-                        rollback_ok = False
-                        for attempt in range(3):
-                            try:
-                                close_position(first_sig.symbol, reason="pair_rollback")
-                                trade = risk.open_trades.get(first_sig.symbol)
-                                if trade:
-                                    risk.close_trade(first_sig.symbol, trade.entry_price, now, exit_reason="pair_rollback")
-                                rollback_ok = True
-                                # CRIT-009: Verify fill after rollback
-                                _time.sleep(0.5)  # Brief wait for fill
-                                try:
-                                    from data import get_positions
-                                    broker_pos = {p.symbol: p for p in get_positions()}
-                                    if first_sig.symbol in broker_pos:
-                                        logger.warning(f"CRIT-009: Rollback position still exists at broker for {first_sig.symbol}")
-                                        rollback_ok = False
-                                        continue  # Retry
-                                except Exception:
-                                    pass  # If we can't verify, assume OK
-                                break
-                            except Exception as e:
-                                logger.error(f"Pair rollback attempt {attempt+1}/3 failed for {first_sig.symbol}: {e}")
+                        logger.warning(f"T1-001: Pair {pair_id}: second leg {second_sig.symbol} failed, rolling back first leg {first_sig.symbol}")
+                        rollback_ok = _pairs_atomic_rollback(leg1_order_id, first_sig.symbol)
+                        # Also clean up risk manager state for leg 1
+                        trade = risk.open_trades.get(first_sig.symbol)
+                        if trade:
+                            risk.close_trade(first_sig.symbol, trade.entry_price, now, exit_reason="pair_atomic_rollback")
                         if not rollback_ok:
-                            logger.critical(f"PAIR ROLLBACK FAILED after 3 attempts for {first_sig.symbol} — manual intervention required")
+                            logger.critical(f"T1-001: PAIR ROLLBACK FAILED for {first_sig.symbol} — manual intervention required")
                 else:
                     database.log_signal(now, second_sig.symbol, second_sig.strategy, second_sig.side, False, "pair_first_leg_failed")
             else:
@@ -403,11 +544,12 @@ def _process_single_signal(
         database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
         return
 
-    # 1b. PDT rule check for day trades
-    if signal.hold_type == "day":
+    # 1b. T5-008: Enhanced PDT rule enforcement
+    # Uses both PDTTracker (simple) and PDTCompliance (full) for defense-in-depth.
+    if signal.hold_type == "day" and getattr(config, "PDT_PROTECTION_ENABLED", True):
         try:
+            # Primary: PDTTracker (simple, already integrated)
             from risk.pdt_tracker import PDTTracker
-            # Access global PDT tracker via risk manager or create check
             if not getattr(risk, '_pdt', None):
                 risk._pdt = PDTTracker()
             if not risk._pdt.can_day_trade(risk.current_equity):
@@ -418,6 +560,25 @@ def _process_single_signal(
                           details=f"Day trade blocked — PDT limit reached")
                 database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
                 return
+
+            # T5-008: Secondary: PDTCompliance (full compliance with persistence)
+            try:
+                from compliance.pdt import PDTCompliance
+                if not getattr(risk, '_pdt_compliance', None):
+                    risk._pdt_compliance = PDTCompliance()
+                allowed, remaining, reason = risk._pdt_compliance.can_day_trade(risk.current_equity)
+                if not allowed:
+                    skip_reason = "pdt_compliance_limit"
+                    logger.warning(f"PDT Compliance: Blocked day trade for {signal.symbol} — {reason}")
+                    log_event(EventType.PDT_BLOCKED, "signal_processor",
+                              symbol=signal.symbol, strategy=signal.strategy,
+                              details=f"PDT compliance block: {reason}")
+                    database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
+                    return
+                elif remaining == 1:
+                    logger.warning(f"PDT: LAST day trade available for {signal.symbol} — use with caution")
+            except ImportError:
+                pass  # PDTCompliance not available, PDTTracker is sufficient
         except Exception as e:
             logger.warning(f"PDT check failed for {signal.symbol} (fail-open): {e}")
 
@@ -478,7 +639,10 @@ def _process_single_signal(
             if news_mult == 0.0:
                 database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, news_reason)
                 return
-        except Exception:
+        except Exception as exc:
+            handle_failure(FailureMode.DEGRADE_GRACEFULLY,
+                           "signal_processor.news_sentiment", exc,
+                           symbol=signal.symbol, strategy=signal.strategy)
             news_mult = 1.0
 
     # 5c. LLM signal scoring (optional, fail-open)
@@ -496,7 +660,10 @@ def _process_single_signal(
                 return
             if config.LLM_SCORE_SIZE_MULT:
                 llm_mult = scored.size_mult
-        except Exception:
+        except Exception as exc:
+            handle_failure(FailureMode.DEGRADE_GRACEFULLY,
+                           "signal_processor.llm_scoring", exc,
+                           symbol=signal.symbol, strategy=signal.strategy)
             llm_mult = 1.0
 
     # 6. Position sizing via vol-targeting engine
@@ -517,7 +684,10 @@ def _process_single_signal(
     if regime_detector and getattr(config, "HMM_REGIME_ENABLED", False):
         try:
             regime_mult = regime_detector.get_regime_affinity(signal.strategy)
-        except Exception:
+        except Exception as exc:
+            handle_failure(FailureMode.DEGRADE_GRACEFULLY,
+                           "signal_processor.regime_affinity", exc,
+                           symbol=signal.symbol, strategy=signal.strategy)
             regime_mult = 1.0
 
     # V10 BUG-042: Intraday seasonality multiplier (singleton, fail-open)
@@ -525,7 +695,10 @@ def _process_single_signal(
     if getattr(config, "INTRADAY_SEASONALITY_ENABLED", False) and IntradaySeasonality:
         try:
             seasonality_mult = _get_seasonality().get_window_score(signal.strategy, now)
-        except Exception:
+        except Exception as exc:
+            handle_failure(FailureMode.DEGRADE_GRACEFULLY,
+                           "signal_processor.seasonality", exc,
+                           symbol=signal.symbol, strategy=signal.strategy)
             seasonality_mult = 1.0
 
     # Cross-asset bias multiplier (fail-open)
@@ -535,7 +708,10 @@ def _process_single_signal(
             bias = cross_asset_monitor.get_equity_bias()
             if bias < -0.5:
                 cross_asset_mult = getattr(config, "CROSS_ASSET_FLIGHT_REDUCTION", 0.30)
-        except Exception:
+        except Exception as exc:
+            handle_failure(FailureMode.DEGRADE_GRACEFULLY,
+                           "signal_processor.cross_asset_bias", exc,
+                           symbol=signal.symbol, strategy=signal.strategy)
             cross_asset_mult = 1.0
 
     # V10: VaR risk budget multiplier (fail-open: 1.0)
@@ -543,7 +719,10 @@ def _process_single_signal(
     if var_monitor:
         try:
             var_mult = var_monitor.size_multiplier
-        except Exception:
+        except Exception as exc:
+            handle_failure(FailureMode.DEGRADE_GRACEFULLY,
+                           "signal_processor.var_monitor", exc,
+                           symbol=signal.symbol, strategy=signal.strategy)
             var_mult = 1.0
 
     # WIRE-001: Feature store — fetch features for ML/sizing enrichment (fail-open)
@@ -575,23 +754,72 @@ def _process_single_signal(
             logger.debug("WIRE-002: ML prediction failed for %s (fail-open): %s", signal.symbol, e)
             ml_conf_mult = 1.0
 
-    # WIRE-003: VPIN toxicity check — reduce size by 50% when VPIN > 0.7 (fail-open)
+    # WIRE-003 + T5-007: VPIN toxicity-adjusted position sizing (fail-open)
+    # T5-007: toxicity_multiplier = max(0.3, 1.0 - 2.0 * (vpin - 0.25)) for vpin in [0.25, 0.60]
+    # Replaces the simple >0.7 threshold with a continuous adjustment curve.
     vpin_mult = 1.0
     if _VPIN_AVAILABLE:
         try:
-            with _vpin_lock:
+            with _state.lock:
                 vpin_inst = _vpin_instances.get(signal.symbol)
             if vpin_inst is not None:
                 vpin_value = vpin_inst.compute_vpin()
-                if vpin_value > 0.7:
-                    vpin_mult = 0.5
-                    logger.info("WIRE-003: VPIN=%.2f for %s — reducing size by 50%%", vpin_value, signal.symbol)
+                if vpin_value > 0.25:
+                    # T5-007: Continuous toxicity adjustment
+                    toxicity_multiplier = max(0.3, 1.0 - 2.0 * (vpin_value - 0.25))
+                    vpin_mult = toxicity_multiplier
+                    logger.info(
+                        "T5-007: VPIN=%.2f for %s — toxicity_mult=%.2f (size reduction %.0f%%)",
+                        vpin_value, signal.symbol, toxicity_multiplier,
+                        (1.0 - toxicity_multiplier) * 100,
+                    )
         except Exception as e:
             logger.debug("WIRE-003: VPIN check failed for %s (fail-open): %s", signal.symbol, e)
 
+    # T5-004: FinBERT NLP sentiment multiplier (fail-open)
+    finbert_mult = 1.0
+    if getattr(config, "NLP_SENTIMENT_ENABLED", False):
+        try:
+            finbert = _get_finbert_sentiment()
+            if finbert is not None and news_sentiment:
+                # Use existing news headlines if available from news_sentiment module
+                headlines = []
+                try:
+                    headlines = news_sentiment.get_recent_headlines(signal.symbol)
+                except (AttributeError, Exception):
+                    pass
+                if headlines:
+                    finbert_mult, finbert_reason = finbert.get_sentiment_signal(signal.symbol, headlines)
+                    if finbert_mult == 0.0:
+                        database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, finbert_reason)
+                        return
+        except Exception as e:
+            logger.debug("T5-004: FinBERT check failed for %s (fail-open): %s", signal.symbol, e)
+
+    # T5-013: Lead-lag bias multiplier (fail-open)
+    lead_lag_mult = 1.0
+    if _LEAD_LAG_AVAILABLE and getattr(config, "LEAD_LAG_ENABLED", False):
+        try:
+            lead_lag_mult = _get_lead_lag_mult(signal.symbol)
+        except Exception as e:
+            logger.debug("T5-013: Lead-lag check failed for %s (fail-open): %s", signal.symbol, e)
+
+    # T5-012: Alpha agent sizing multiplier (fail-open)
+    alpha_agent_mult = 1.0
+    if _ALPHA_AGENTS_AVAILABLE and getattr(config, "ALPHA_AGENTS_ENABLED", False):
+        try:
+            orch = _get_alpha_orch()
+            alpha_result = orch.get_alpha_score(signal.symbol, {
+                "vix_level": getattr(vol_engine, '_last_vix', 20.0),
+                "spy_return": getattr(risk, 'day_pnl', 0.0),
+            })
+            alpha_agent_mult = alpha_result.size_multiplier
+        except Exception as e:
+            logger.debug("T5-012: Alpha agent check failed for %s (fail-open): %s", signal.symbol, e)
+
     # Apply all multipliers
     # CRIT-008: Cap combined multipliers to prevent position size overflow (3x+ leverage)
-    combined_mult = news_mult * llm_mult * regime_mult * seasonality_mult * cross_asset_mult * var_mult * ml_conf_mult * vpin_mult
+    combined_mult = news_mult * llm_mult * regime_mult * seasonality_mult * cross_asset_mult * var_mult * ml_conf_mult * vpin_mult * finbert_mult * lead_lag_mult * alpha_agent_mult
     combined_mult = min(combined_mult, 2.0)  # Hard cap at 2x base size
     qty = int(qty * combined_mult)
 
@@ -632,7 +860,7 @@ def _process_single_signal(
         except Exception as e:
             logger.debug(f"Cost filter failed (proceeding): {e}")
 
-    # 7. Submit bracket order (with OMS tracking if available)
+    # 7. Submit bracket order (with OMS tracking as pre-condition — T1-005)
     oms_order = None
     if _OMS_AVAILABLE and _order_manager:
         try:
@@ -649,7 +877,17 @@ def _process_single_signal(
                 idempotency_key=f"{signal.symbol}_{signal.strategy}_{now.strftime('%Y%m%d%H%M%S')}",
             )
         except Exception as e:
-            logger.debug(f"OMS order creation failed (proceeding): {e}")
+            # T1-005: OMS registration failed — abort order to prevent orphaned orders
+            if not _force_no_oms:
+                logger.critical(f"T1-005: OMS registration failed for {signal.symbol}, aborting order submission: {e}")
+                database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, "oms_registration_failed")
+                _emit_event("order.oms_failed", {"symbol": signal.symbol, "strategy": signal.strategy, "error": str(e)})
+                return
+            else:
+                logger.warning(f"T1-005: OMS registration failed but _force_no_oms=True, proceeding: {e}")
+    elif _OMS_AVAILABLE and not _order_manager:
+        # OMS module importable but order_manager never initialized — proceed without OMS tracking
+        logger.debug(f"T1-005: OMS module available but order_manager not set for {signal.symbol}, proceeding without OMS tracking")
 
     order_id = submit_bracket_order(signal, qty)
 

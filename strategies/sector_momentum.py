@@ -40,8 +40,11 @@ MOMENTUM_WEIGHTS = {
     "6m": 0.25,
 }
 
-# Allowed HMM regimes for this strategy
-ALLOWED_REGIMES = {"LOW_VOL_BULL", "MEAN_REVERTING"}
+# Allowed HMM regimes for this strategy (V11.2: BULLISH only per regime guard)
+ALLOWED_REGIMES = {"LOW_VOL_BULL", "MEAN_REVERTING", "BULLISH"}
+
+# Relative-strength threshold: only enter if symbol RS vs sector ETF > this
+RS_THRESHOLD = 0.15
 
 # Number of sectors to go long/short
 TOP_N = 3
@@ -86,7 +89,9 @@ class SectorMomentumStrategy:
     def reset_daily(self):
         """Clear per-day state. Preserve weekly rebalance state."""
         # Do NOT clear _last_rebalance_date or current positions — weekly strategy
-        pass
+        # Clear per-sector scores so they are recomputed on the next scan
+        self.sector_scores.clear()
+        self._universe_ready = False
 
     def prepare_universe(self, date: datetime) -> List[str]:
         """Verify sector ETFs are available and liquid.
@@ -174,9 +179,18 @@ class SectorMomentumStrategy:
         # Bottom N for shorts
         bottom_sectors = [s.symbol for s in ranked[-BOTTOM_N:]]
 
-        # Generate long signals
+        # Generate long signals (with RS filter)
         for symbol in top_sectors:
             score = self.sector_scores[symbol]
+
+            # V11.2 RS filter: sector must outperform SPY by RS_THRESHOLD
+            rs_vs_spy = self._compute_rs_vs_spy(symbol, bars.get(symbol), bars.get("SPY"))
+            if rs_vs_spy is not None and rs_vs_spy < RS_THRESHOLD:
+                logger.debug(
+                    f"Sector momentum: skipping {symbol}, RS vs SPY={rs_vs_spy:.3f} < {RS_THRESHOLD}"
+                )
+                continue
+
             try:
                 price = self._get_current_price(symbol, bars.get(symbol))
                 if price is None or price <= 0:
@@ -334,6 +348,30 @@ class SectorMomentumStrategy:
             pass
 
         return None
+
+    def _compute_rs_vs_spy(self, symbol: str,
+                           bars_df: Optional[pd.DataFrame],
+                           spy_bars: Optional[pd.DataFrame]) -> Optional[float]:
+        """Compute 20-day relative strength of symbol vs SPY.
+
+        Returns the difference in 20-day returns (symbol - SPY), or None
+        if data is insufficient.
+        """
+        lookback = MOMENTUM_WINDOWS["1m"]  # 21 trading days
+
+        if bars_df is None or bars_df.empty:
+            bars_df = get_daily_bars(symbol, days=lookback + 5)
+        if bars_df is None or len(bars_df) < lookback:
+            return None
+
+        if spy_bars is None or spy_bars.empty:
+            spy_bars = get_daily_bars("SPY", days=lookback + 5)
+        if spy_bars is None or len(spy_bars) < lookback:
+            return None
+
+        sym_ret = (bars_df["close"].iloc[-1] - bars_df["close"].iloc[-lookback]) / bars_df["close"].iloc[-lookback]
+        spy_ret = (spy_bars["close"].iloc[-1] - spy_bars["close"].iloc[-lookback]) / spy_bars["close"].iloc[-lookback]
+        return float(sym_ret - spy_ret)
 
     def get_rankings(self) -> List[Dict]:
         """Return current sector rankings for dashboard/logging."""

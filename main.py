@@ -398,6 +398,78 @@ def is_trading_hours(t: time) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# T4-006: Dynamic scan interval tied to VIX regime
+# ---------------------------------------------------------------------------
+_last_dynamic_interval: int | None = None
+
+
+def compute_dynamic_scan_interval(base_interval: int = 120,
+                                   open_positions: int = 0,
+                                   signal_quality: float = 0.5) -> int:
+    """T4-006 + T5-015: Compute scan interval.
+
+    If ADAPTIVE_SCAN_ENABLED, uses RL-based ScanScheduler.
+    Otherwise falls back to VIX-based scaling:
+        VIX < 15  -> 180s (calm market, scan less frequently)
+        VIX 15-25 -> 120s (normal)
+        VIX 25-35 -> 60s  (elevated vol, scan more frequently)
+        VIX > 35  -> 30s  (crisis, maximum scan frequency)
+
+    Returns:
+        Scan interval in seconds.
+    """
+    global _last_dynamic_interval
+    try:
+        from risk import get_vix_level
+        vix = get_vix_level()
+
+        if vix <= 0:
+            vix = 20.0
+
+        # T5-015: Try RL-based scheduler first
+        if getattr(config, "ADAPTIVE_SCAN_ENABLED", False):
+            try:
+                from engine.scanner import get_scan_scheduler
+                scheduler = get_scan_scheduler()
+                interval = scheduler.get_interval(
+                    vix=vix,
+                    open_positions=open_positions,
+                    signal_quality=signal_quality,
+                )
+                if _last_dynamic_interval is not None and interval != _last_dynamic_interval:
+                    logger.info(
+                        "T5-015: RL scan interval changed %ds -> %ds (VIX=%.1f, pos=%d)",
+                        _last_dynamic_interval, interval, vix, open_positions,
+                    )
+                _last_dynamic_interval = interval
+                return interval
+            except Exception as e:
+                logger.debug("T5-015: RL scheduler failed, falling back to VIX: %s", e)
+
+        # VIX-based fallback (original T4-006 logic)
+        if vix < 15:
+            interval = 180
+        elif vix < 25:
+            interval = 120
+        elif vix < 35:
+            interval = 60
+        else:
+            interval = 30
+
+        if _last_dynamic_interval is not None and interval != _last_dynamic_interval:
+            logger.info(
+                "T4-006: Scan interval changed %ds -> %ds (VIX=%.1f)",
+                _last_dynamic_interval, interval, vix,
+            )
+        _last_dynamic_interval = interval
+        return interval
+
+    except Exception as e:
+        logger.debug("T4-006: VIX fetch failed, using base interval %ds: %s", base_interval, e)
+        return base_interval
+
+
+# ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
 
@@ -604,6 +676,8 @@ def main():
 
     # Initialize database
     database.init_db()
+    database.run_migrations()
+    database.assert_schema_version()  # T2-006: Fail fast if schema is stale
     database.migrate_from_json()
 
     # Startup checks
@@ -768,6 +842,18 @@ def main():
 
     logger.info(f"V11 modules initialized: {v11_active} active (via Container)")
 
+    # --- T2-005: Register live instances into the Container ---
+    # This ensures that V11 modules resolved through the container can access
+    # the same risk_manager, vol_engine, etc. that the main loop uses.
+    _ctr.register_instance("risk_manager", risk)
+    _ctr.register_instance("vol_engine", vol_engine)
+    _ctr.register_instance("pnl_lock", pnl_lock)
+    if order_manager:
+        _ctr.register_instance("oms", order_manager)
+    if tiered_cb:
+        _ctr.register_instance("circuit_breaker", tiered_cb)
+    logger.info("T2-005: Live instances registered into Container (risk_manager, vol_engine, pnl_lock, oms, circuit_breaker)")
+
     features_str = ", ".join(features)
     console.print(f"\n[bold green]Velox V11 is running. Press Ctrl+C to stop.[/bold green]")
     console.print(f"[dim]Strategies: STAT_MR + VWAP + KALMAN_PAIRS + ORB + MICRO_MOM + PEAD[/dim]")
@@ -900,6 +986,13 @@ def main():
                                 )
                         except Exception as e:
                             logger.debug(f"Dynamic universe failed (using static): {e}")
+
+                        # T4-001: Pre-warm bar cache for all universe symbols
+                        try:
+                            from data.bar_cache import bar_cache
+                            bar_cache.pre_warm(scan_symbols)
+                        except Exception as e:
+                            logger.debug(f"T4-001: Bar cache pre-warm failed (non-critical): {e}")
 
                         try:
                             stat_mr.prepare_universe(scan_symbols, current)
@@ -1260,8 +1353,9 @@ def main():
                     )
                 )
 
-                # Sleep until next scan — interruptible 1s ticks
-                for _ in range(config.SCAN_INTERVAL_SEC):
+                # T4-006: Dynamic scan interval — adjusts based on VIX regime
+                scan_interval = compute_dynamic_scan_interval(config.SCAN_INTERVAL_SEC)
+                for _ in range(scan_interval):
                     time_mod.sleep(1)
 
     except KeyboardInterrupt:

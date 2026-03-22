@@ -201,6 +201,245 @@ class PEADStrategy:
 
         return exits
 
+    # ------------------------------------------------------------------
+    # T5-001: Pre-Earnings Implied-Move Exploitation
+    # ------------------------------------------------------------------
+
+    def scan_pre_earnings(self, now: datetime, regime: str = "UNKNOWN") -> list[Signal]:
+        """Scan for pre-earnings implied-move exploitation opportunities.
+
+        Screens for stocks where historical post-earnings realized move > 1.5x
+        the implied move (ATR proxy). Enter 2 days before earnings, sized at
+        50% of normal. Exit within 2 days post-earnings or at 1.5x ATR stop.
+        """
+        if not getattr(config, "PEAD_PRE_EARNINGS_ENABLED", False):
+            return []
+
+        if regime == "HIGH_VOL_BEAR":
+            return []
+
+        active_count = len(self.triggered)
+        if active_count >= config.PEAD_MAX_POSITIONS:
+            return []
+
+        symbols = config.STANDARD_SYMBOLS
+        upcoming = self._get_upcoming_earnings(symbols, days_ahead=config.PEAD_PRE_ENTRY_DAYS)
+        if not upcoming:
+            return []
+
+        signals = []
+        slots_remaining = config.PEAD_MAX_POSITIONS - active_count
+
+        for data in upcoming:
+            if slots_remaining <= 0:
+                break
+
+            symbol = data["symbol"]
+
+            # Skip if already triggered recently
+            if symbol in self.triggered:
+                last = self.triggered[symbol]
+                if (now - last).days < 30:
+                    continue
+
+            # Compute implied move (ATR proxy)
+            implied_move = self._compute_implied_move(symbol)
+            if implied_move <= 0:
+                continue
+
+            # Check historical realized move vs implied
+            realized_move = data.get("avg_realized_move", 0.0)
+            if realized_move <= 0:
+                continue
+
+            ratio = realized_move / implied_move
+            if ratio < config.PEAD_IMPLIED_MOVE_RATIO_THRESHOLD:
+                continue
+
+            # Determine direction from historical earnings drift bias
+            drift_bias = data.get("drift_bias", 0.0)
+            entry_price = data.get("current_price", 0.0)
+            if entry_price <= 0:
+                continue
+
+            atr_stop = implied_move * config.PEAD_PRE_ATR_STOP_MULT
+
+            if drift_bias >= 0:
+                side = "buy"
+                stop_loss = round(entry_price - atr_stop, 2)
+                take_profit = round(entry_price + atr_stop, 2)
+            else:
+                if not config.ALLOW_SHORT:
+                    continue
+                if symbol in config.NO_SHORT_SYMBOLS:
+                    continue
+                side = "sell"
+                stop_loss = round(entry_price + atr_stop, 2)
+                take_profit = round(entry_price - atr_stop, 2)
+
+            reason = (
+                f"PEAD pre-earnings: implied={implied_move:.2f} "
+                f"realized={realized_move:.2f} ratio={ratio:.1f}x "
+                f"bias={'long' if drift_bias >= 0 else 'short'}"
+            )
+
+            signals.append(Signal(
+                symbol=symbol,
+                strategy="PEAD",
+                side=side,
+                entry_price=entry_price,
+                take_profit=take_profit,
+                stop_loss=stop_loss,
+                reason=reason,
+                hold_type="swing",
+            ))
+            self.triggered[symbol] = now
+            slots_remaining -= 1
+
+        logger.info(f"PEAD pre-earnings scan: {len(signals)} signals from {len(upcoming)} upcoming")
+        return signals
+
+    def _compute_implied_move(self, symbol: str) -> float:
+        """Estimate implied move from ATR as proxy for options implied volatility.
+
+        Uses 14-day ATR on daily bars as a proxy for the expected move.
+        If options data were available, we'd use at-the-money straddle pricing.
+
+        Returns:
+            Estimated implied move in dollar terms, or 0.0 on failure.
+        """
+        try:
+            import yfinance as yf
+            import pandas as pd
+
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period="30d")
+            if hist is None or len(hist) < 14:
+                return 0.0
+
+            # ATR-14 calculation
+            high = hist["High"].values
+            low = hist["Low"].values
+            close = hist["Close"].values
+
+            tr = []
+            for i in range(1, len(high)):
+                tr.append(max(
+                    high[i] - low[i],
+                    abs(high[i] - close[i - 1]),
+                    abs(low[i] - close[i - 1]),
+                ))
+
+            if len(tr) < 14:
+                return 0.0
+
+            atr = float(pd.Series(tr).rolling(14).mean().iloc[-1])
+            return atr if not pd.isna(atr) else 0.0
+
+        except Exception as e:
+            logger.debug(f"PEAD implied move computation failed for {symbol}: {e}")
+            return 0.0
+
+    def _get_upcoming_earnings(self, symbols: list[str], days_ahead: int = 2) -> list[dict]:
+        """Get symbols with earnings in the next `days_ahead` days.
+
+        Returns list of dicts with: symbol, earnings_date, avg_realized_move,
+        drift_bias, current_price.
+        """
+        results = []
+        try:
+            import yfinance as yf
+            import pandas as pd
+
+            now = pd.Timestamp.now(tz="America/New_York")
+            cutoff = now + pd.Timedelta(days=days_ahead)
+
+            for symbol in symbols:
+                try:
+                    ticker = yf.Ticker(symbol)
+                    earnings = getattr(ticker, "earnings_dates", None)
+                    if earnings is None or (hasattr(earnings, "empty") and earnings.empty):
+                        continue
+
+                    # Find next upcoming earnings
+                    future_earnings = earnings[earnings.index > now]
+                    if future_earnings.empty:
+                        continue
+
+                    next_earnings = future_earnings.index[-1]  # Earliest future date
+                    if next_earnings > cutoff:
+                        continue
+
+                    # Get historical realized moves around past earnings
+                    past_earnings = earnings[earnings.index <= now]
+                    realized_moves = []
+                    drift_biases = []
+
+                    if not past_earnings.empty and "Surprise(%)" in past_earnings.columns:
+                        for idx, row in past_earnings.head(8).iterrows():
+                            surprise = row.get("Surprise(%)")
+                            if pd.notna(surprise):
+                                realized_moves.append(abs(float(surprise)))
+                                drift_biases.append(float(surprise))
+
+                    avg_realized = float(pd.Series(realized_moves).mean()) if realized_moves else 0.0
+                    avg_drift = float(pd.Series(drift_biases).mean()) if drift_biases else 0.0
+
+                    # Convert surprise % to dollar move using current price
+                    hist = ticker.history(period="5d")
+                    if hist is None or len(hist) < 1:
+                        continue
+                    current_price = float(hist["Close"].iloc[-1])
+                    dollar_realized = current_price * (avg_realized / 100.0)
+
+                    if current_price > 0:
+                        results.append({
+                            "symbol": symbol,
+                            "earnings_date": str(next_earnings.date()),
+                            "avg_realized_move": dollar_realized,
+                            "drift_bias": avg_drift,
+                            "current_price": current_price,
+                        })
+
+                except Exception as e:
+                    logger.debug(f"PEAD upcoming earnings check failed for {symbol}: {e}")
+                    continue
+
+        except Exception as e:
+            logger.warning(f"PEAD upcoming earnings scan failed: {e}")
+
+        return results
+
+    def check_pre_earnings_exits(self, open_trades: dict, now: datetime) -> list[dict]:
+        """Check exits for pre-earnings positions.
+
+        Exit within 2 days post-earnings or at 1.5x ATR stop.
+        """
+        exits = []
+        for symbol, trade in open_trades.items():
+            if trade.strategy != "PEAD":
+                continue
+            if "pre-earnings" not in getattr(trade, 'exit_reason', ''):
+                # Check if this is a pre-earnings trade by reason
+                if not hasattr(trade, 'reason'):
+                    continue
+
+            try:
+                if hasattr(trade, "entry_time") and trade.entry_time:
+                    hold_days = (now - trade.entry_time).days
+                    # Pre-earnings trades exit faster: entry_days + post_days
+                    max_hold = config.PEAD_PRE_ENTRY_DAYS + config.PEAD_POST_EXIT_DAYS
+                    if hold_days >= max_hold:
+                        exits.append({
+                            "symbol": symbol,
+                            "action": "full",
+                            "reason": f"PEAD pre-earnings time stop ({hold_days}d >= {max_hold}d)",
+                        })
+            except Exception as e:
+                logger.debug(f"PEAD pre-earnings exit check error for {symbol}: {e}")
+
+        return exits
+
     def reset_daily(self):
         """Clear daily state (allow re-scan next day)."""
         self._scanned_today = False

@@ -19,11 +19,15 @@ Usage::
 import logging
 import re
 import time
+import time as _time
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from collections import Counter
 import math
+
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -489,3 +493,440 @@ class SECFilingAnalyzer:
         """Clear all cached filings and CIK lookups."""
         self._filings_cache.clear()
         self._cik_cache.clear()
+
+
+# ======================================================================
+# T7-003: SEC EDGAR Real-Time 8-K Parser
+# ======================================================================
+
+# 8-K Item type classification
+_8K_ITEM_CLASSIFICATION: Dict[str, Dict[str, Any]] = {
+    "1.01": {"label": "Entry into Material Agreement (M&A)", "strength": "strong", "bias_mult": 1.5},
+    "1.02": {"label": "Termination of Material Agreement", "strength": "strong", "bias_mult": -1.0},
+    "1.03": {"label": "Bankruptcy/Receivership", "strength": "strong", "bias_mult": -2.0},
+    "2.01": {"label": "Completion of Acquisition/Disposition", "strength": "strong", "bias_mult": 1.2},
+    "2.02": {"label": "Results of Operations (Earnings)", "strength": "covered_by_pead", "bias_mult": 0.0},
+    "2.03": {"label": "Creation of Financial Obligation", "strength": "moderate", "bias_mult": -0.3},
+    "2.04": {"label": "Triggering Events", "strength": "moderate", "bias_mult": -0.5},
+    "2.05": {"label": "Costs of Exit/Disposal", "strength": "moderate", "bias_mult": -0.6},
+    "2.06": {"label": "Material Impairment", "strength": "strong", "bias_mult": -1.2},
+    "3.01": {"label": "Delisting Notice", "strength": "strong", "bias_mult": -1.5},
+    "4.01": {"label": "Auditor Change", "strength": "moderate", "bias_mult": -0.4},
+    "4.02": {"label": "Non-Reliance on Financial Statements", "strength": "strong", "bias_mult": -1.8},
+    "5.01": {"label": "Changes in Control", "strength": "strong", "bias_mult": 0.8},
+    "5.02": {"label": "Director/Officer Changes", "strength": "moderate", "bias_mult": -0.2},
+    "5.03": {"label": "Amendments to Articles", "strength": "weak", "bias_mult": 0.0},
+    "5.07": {"label": "Submission of Matters to Vote", "strength": "weak", "bias_mult": 0.0},
+    "7.01": {"label": "Regulation FD Disclosure", "strength": "moderate", "bias_mult": 0.3},
+    "8.01": {"label": "Other Events", "strength": "weak", "bias_mult": 0.1},
+    "9.01": {"label": "Financial Statements and Exhibits", "strength": "weak", "bias_mult": 0.0},
+}
+
+# Sentiment keyword dictionaries for 8-K text scoring
+_POSITIVE_KEYWORDS = {
+    "growth", "exceeded", "strong", "positive", "record", "increased",
+    "expansion", "partnership", "agreement", "awarded", "approved",
+    "upgrade", "innovation", "synergy", "profitable", "outperform",
+    "momentum", "breakthrough", "favorable", "exceeded expectations",
+}
+
+_NEGATIVE_KEYWORDS = {
+    "loss", "decline", "negative", "impairment", "bankruptcy", "default",
+    "investigation", "lawsuit", "termination", "restructuring", "layoff",
+    "downgrade", "concern", "weakness", "deterioration", "shortfall",
+    "restatement", "fraud", "violation", "penalty", "recall", "warning",
+}
+
+
+@dataclass
+class Filing8KResult:
+    """Result from parsing a single 8-K filing."""
+    symbol: str
+    cik: str
+    filed_date: str
+    accession: str
+    item_types: List[str]                  # e.g., ["1.01", "9.01"]
+    item_labels: List[str]                 # Human-readable labels
+    strength: str                          # "strong", "moderate", "weak", "covered_by_pead"
+    sentiment_score: float                 # [-1, 1] from text analysis
+    signal_bias: float                     # Combined directional bias for signal_processor
+    summary_text: str = ""                 # First ~500 chars of filing
+    url: str = ""
+
+
+@dataclass
+class EdgarMonitorStatus:
+    """Status of the EDGAR monitor."""
+    enabled: bool = False
+    last_poll: Optional[str] = None
+    filings_found_today: int = 0
+    signals_emitted: int = 0
+    rate_limit_remaining: int = 60
+    errors_today: int = 0
+
+
+class EdgarMonitor:
+    """T7-003: Real-time SEC EDGAR 8-K filing monitor.
+
+    Polls the EDGAR full-text search API every 5 minutes during market hours,
+    filters for universe symbols, classifies 8-K items, and produces signal
+    biases for the signal processor.
+
+    Rate limiting: max 1 API call per minute (SEC guideline: 10 req/sec,
+    but we are conservative to avoid blocks).
+
+    Gate: EDGAR_MONITOR_ENABLED config flag.
+
+    Usage:
+        monitor = EdgarMonitor(universe=["AAPL", "MSFT", "GOOG"])
+        await monitor.poll()  # or monitor.poll_sync()
+        for result in monitor.get_recent_filings():
+            signal_processor.apply_soft_bias(result.symbol, result.signal_bias)
+    """
+
+    # EDGAR EFTS (full-text search) endpoint
+    EFTS_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
+    COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+
+    def __init__(
+        self,
+        universe: List[str] | None = None,
+        user_agent: str = "VeloxBot admin@velox.dev",
+        poll_interval_sec: int = 300,      # 5 minutes
+        min_request_interval: float = 60.0, # 1 minute between API calls
+    ):
+        self._enabled = getattr(config, "EDGAR_MONITOR_ENABLED", False)
+        self._universe = set(s.upper() for s in (universe or []))
+        self._user_agent = user_agent
+        self._poll_interval = poll_interval_sec
+        self._min_request_interval = min_request_interval
+
+        # CIK <-> Ticker mapping
+        self._cik_to_ticker: Dict[str, str] = {}
+        self._ticker_to_cik: Dict[str, str] = {}
+
+        # State
+        self._last_poll: Optional[datetime] = None
+        self._last_request: float = 0.0
+        self._recent_filings: List[Filing8KResult] = []
+        self._seen_accessions: set = set()
+        self._lock = threading.Lock()
+        self._running = False
+        self._poll_thread: Optional[threading.Thread] = None
+
+        # Daily counters
+        self._filings_today = 0
+        self._signals_today = 0
+        self._errors_today = 0
+
+        if not self._enabled:
+            logger.info("T7-003: EDGAR monitor disabled (EDGAR_MONITOR_ENABLED=False)")
+
+    def start(self):
+        """Start background polling thread."""
+        if not self._enabled:
+            return
+        if self._running:
+            return
+
+        self._running = True
+        self._poll_thread = threading.Thread(
+            target=self._poll_loop, daemon=True, name="edgar-monitor"
+        )
+        self._poll_thread.start()
+        logger.info("T7-003: EDGAR monitor started (polling every %ds)", self._poll_interval)
+
+    def stop(self):
+        """Stop background polling."""
+        self._running = False
+        if self._poll_thread:
+            self._poll_thread.join(timeout=10)
+        logger.info("T7-003: EDGAR monitor stopped")
+
+    def poll_sync(self) -> List[Filing8KResult]:
+        """Synchronous poll for new 8-K filings. Safe to call manually."""
+        if not self._enabled:
+            return []
+
+        try:
+            # Ensure CIK mapping is loaded
+            if not self._cik_to_ticker:
+                self._load_cik_mapping()
+
+            filings = self._fetch_recent_8k()
+            new_filings = []
+
+            for filing in filings:
+                if filing.accession in self._seen_accessions:
+                    continue
+                self._seen_accessions.add(filing.accession)
+                new_filings.append(filing)
+                self._filings_today += 1
+
+            with self._lock:
+                self._recent_filings.extend(new_filings)
+                # Keep last 500 filings
+                if len(self._recent_filings) > 500:
+                    self._recent_filings = self._recent_filings[-500:]
+                self._last_poll = datetime.now(config.ET)
+
+            if new_filings:
+                logger.info(
+                    f"T7-003: Found {len(new_filings)} new 8-K filings: "
+                    f"{', '.join(f.symbol for f in new_filings[:5])}"
+                    f"{'...' if len(new_filings) > 5 else ''}"
+                )
+
+            return new_filings
+
+        except Exception as e:
+            self._errors_today += 1
+            logger.warning(f"T7-003: Poll failed: {e}")
+            return []
+
+    def get_recent_filings(self, symbol: str | None = None) -> List[Filing8KResult]:
+        """Get recent 8-K filings, optionally filtered by symbol."""
+        with self._lock:
+            if symbol:
+                return [f for f in self._recent_filings if f.symbol == symbol.upper()]
+            return list(self._recent_filings)
+
+    def get_signal_bias(self, symbol: str) -> float:
+        """Get the aggregate signal bias for a symbol from recent 8-K filings.
+
+        Returns a value in [-1, 1] where:
+        - Positive = bullish signal (e.g., M&A, positive earnings surprise)
+        - Negative = bearish signal (e.g., bankruptcy, restatement)
+        - 0.0 = neutral (no recent filings or covered by PEAD)
+        """
+        filings = self.get_recent_filings(symbol)
+        if not filings:
+            return 0.0
+
+        # Weight more recent filings higher
+        total_bias = 0.0
+        total_weight = 0.0
+        now = datetime.now(config.ET)
+
+        for f in filings:
+            try:
+                filed = datetime.fromisoformat(f.filed_date)
+                age_hours = max(1, (now - filed).total_seconds() / 3600)
+            except (ValueError, TypeError):
+                age_hours = 24.0
+
+            # Decay: full weight at 0h, half at 24h, quarter at 48h
+            weight = 1.0 / (1.0 + age_hours / 24.0)
+            total_bias += f.signal_bias * weight
+            total_weight += weight
+
+        if total_weight > 0:
+            return max(-1.0, min(1.0, total_bias / total_weight))
+        return 0.0
+
+    @property
+    def status(self) -> dict:
+        """Return monitor status."""
+        return {
+            "enabled": self._enabled,
+            "running": self._running,
+            "last_poll": self._last_poll.isoformat() if self._last_poll else None,
+            "universe_size": len(self._universe),
+            "filings_today": self._filings_today,
+            "signals_today": self._signals_today,
+            "errors_today": self._errors_today,
+            "cached_filings": len(self._recent_filings),
+        }
+
+    # ------------------------------------------------------------------
+    # Internal: Background polling
+    # ------------------------------------------------------------------
+
+    def _poll_loop(self):
+        """Background polling loop."""
+        while self._running:
+            try:
+                # Only poll during market hours (roughly 9:00-16:30 ET)
+                now = datetime.now(config.ET)
+                hour = now.hour
+                if 9 <= hour <= 16 and now.weekday() < 5:
+                    self.poll_sync()
+            except Exception as e:
+                self._errors_today += 1
+                logger.warning(f"T7-003: Poll loop error: {e}")
+
+            # Sleep in small increments for responsive shutdown
+            for _ in range(self._poll_interval):
+                if not self._running:
+                    return
+                _time.sleep(1)
+
+    # ------------------------------------------------------------------
+    # Internal: CIK mapping
+    # ------------------------------------------------------------------
+
+    def _load_cik_mapping(self):
+        """Load CIK <-> ticker mapping from SEC."""
+        try:
+            import urllib.request
+            import json
+
+            elapsed = _time.time() - self._last_request
+            if elapsed < self._min_request_interval:
+                _time.sleep(self._min_request_interval - elapsed)
+
+            req = urllib.request.Request(
+                self.COMPANY_TICKERS_URL,
+                headers={"User-Agent": self._user_agent},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                self._last_request = _time.time()
+                data = json.loads(resp.read().decode("utf-8"))
+
+            for entry in data.values():
+                ticker = entry.get("ticker", "").upper()
+                cik = str(entry.get("cik_str", "")).zfill(10)
+                if ticker and cik:
+                    self._cik_to_ticker[cik] = ticker
+                    self._ticker_to_cik[ticker] = cik
+
+            logger.info(f"T7-003: Loaded {len(self._cik_to_ticker)} CIK->ticker mappings")
+
+        except Exception as e:
+            logger.warning(f"T7-003: Failed to load CIK mapping: {e}")
+
+    # ------------------------------------------------------------------
+    # Internal: Fetch and parse 8-K filings
+    # ------------------------------------------------------------------
+
+    def _fetch_recent_8k(self) -> List[Filing8KResult]:
+        """Fetch recent 8-K filings from EDGAR EFTS."""
+        import urllib.request
+        import json
+
+        # Rate limit
+        elapsed = _time.time() - self._last_request
+        if elapsed < self._min_request_interval:
+            _time.sleep(self._min_request_interval - elapsed)
+
+        # Search for recent 8-K filings
+        now = datetime.now(config.ET)
+        start_date = (now - timedelta(hours=6)).strftime("%Y-%m-%d")
+        end_date = now.strftime("%Y-%m-%d")
+
+        url = (
+            f"{self.EFTS_SEARCH_URL}?q=*&forms=8-K"
+            f"&dateRange=custom&startdt={start_date}&enddt={end_date}"
+            f"&from=0&size=50"
+        )
+
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": self._user_agent})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                self._last_request = _time.time()
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            logger.debug(f"T7-003: EFTS search failed: {e}")
+            return []
+
+        filings: List[Filing8KResult] = []
+        hits = data.get("hits", {}).get("hits", [])
+
+        for hit in hits:
+            try:
+                source = hit.get("_source", {})
+                cik = str(source.get("entity_id", "")).zfill(10)
+                accession = source.get("file_num", "") or hit.get("_id", "")
+                filed_date = source.get("file_date", "")
+
+                # Filter by universe
+                ticker = self._cik_to_ticker.get(cik, "")
+                if not ticker:
+                    continue
+                if self._universe and ticker not in self._universe:
+                    continue
+
+                # Extract and classify 8-K items from the filing text
+                text = source.get("text", "") or source.get("display_names", [""])[0]
+                items = self._extract_8k_items(text)
+                if not items:
+                    items = ["8.01"]  # Default: Other Events
+
+                # Classify
+                classifications = [_8K_ITEM_CLASSIFICATION.get(item, {}) for item in items]
+                labels = [c.get("label", f"Item {item}") for c, item in zip(classifications, items)]
+
+                # Determine overall strength (strongest wins)
+                strength_order = {"strong": 3, "moderate": 2, "covered_by_pead": 1, "weak": 0}
+                strengths = [c.get("strength", "weak") for c in classifications]
+                overall_strength = max(strengths, key=lambda s: strength_order.get(s, 0))
+
+                # Sentiment scoring
+                sentiment = self._score_sentiment(text)
+
+                # Combined signal bias
+                bias_mults = [c.get("bias_mult", 0.0) for c in classifications]
+                avg_bias_mult = sum(bias_mults) / len(bias_mults) if bias_mults else 0.0
+
+                # If covered by PEAD, set bias to 0 (let PEAD handle it)
+                if overall_strength == "covered_by_pead":
+                    signal_bias = 0.0
+                else:
+                    signal_bias = avg_bias_mult * (0.5 + 0.5 * sentiment)
+                    signal_bias = max(-1.0, min(1.0, signal_bias))
+
+                filings.append(Filing8KResult(
+                    symbol=ticker,
+                    cik=cik,
+                    filed_date=filed_date,
+                    accession=accession,
+                    item_types=items,
+                    item_labels=labels,
+                    strength=overall_strength,
+                    sentiment_score=sentiment,
+                    signal_bias=signal_bias,
+                    summary_text=text[:500] if text else "",
+                ))
+
+            except Exception as e:
+                logger.debug(f"T7-003: Failed to parse 8-K hit: {e}")
+                continue
+
+        return filings
+
+    @staticmethod
+    def _extract_8k_items(text: str) -> List[str]:
+        """Extract 8-K item numbers from filing text."""
+        # Match patterns like "Item 1.01", "Item 2.02", etc.
+        pattern = r"Item\s+(\d+\.\d+)"
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        # Deduplicate while preserving order
+        seen = set()
+        items = []
+        for m in matches:
+            if m not in seen:
+                seen.add(m)
+                items.append(m)
+        return items
+
+    @staticmethod
+    def _score_sentiment(text: str) -> float:
+        """Simple keyword-based sentiment score for 8-K text.
+
+        Returns:
+            Float in [-1, 1]. Positive = bullish, negative = bearish.
+        """
+        if not text:
+            return 0.0
+
+        text_lower = text.lower()
+        words = set(re.findall(r"[a-z]+", text_lower))
+
+        pos_count = len(words & _POSITIVE_KEYWORDS)
+        neg_count = len(words & _NEGATIVE_KEYWORDS)
+        total = pos_count + neg_count
+
+        if total == 0:
+            return 0.0
+
+        return (pos_count - neg_count) / total

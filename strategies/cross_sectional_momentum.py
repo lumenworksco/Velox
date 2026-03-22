@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Lookback: 1-month return minus most recent week
 MOMENTUM_LOOKBACK_DAYS = 21  # ~1 month of trading days
-SKIP_RECENT_DAYS = 5         # Skip most recent week (short-term reversal)
+SKIP_RECENT_DAYS = 1         # Skip most recent day to avoid reversal
 
 # Decile thresholds
 TOP_DECILE_PCT = 0.10
@@ -39,6 +39,9 @@ REBALANCE_DAY = 0  # Monday
 # Position parameters
 DEFAULT_TP_PCT = 0.03   # 3% take-profit target
 DEFAULT_SL_PCT = 0.02   # 2% stop-loss
+
+# V11.2: Maximum portfolio turnover per rebalance (fraction of portfolio)
+MAX_TURNOVER_PCT = 0.20
 
 
 @dataclass
@@ -83,7 +86,10 @@ class CrossSectionalMomentum:
 
     def reset_daily(self):
         """Clear per-day state. Preserve weekly rebalance state."""
-        pass
+        # Clear rankings so they are recomputed on the next signal generation.
+        # Preserve _last_rebalance_date and current long/short lists (weekly strategy).
+        self.rankings.clear()
+        self._data_pipeline_ok = False
 
     def verify_data_pipeline(self, symbols: Optional[List[str]] = None) -> Dict:
         """Verify that the data pipeline can provide sufficient history.
@@ -251,7 +257,12 @@ class CrossSectionalMomentum:
         return signals
 
     def _generate_universe_signals(self, now: datetime) -> List[Signal]:
-        """Generate signals using universe-wide ranking."""
+        """Generate signals using universe-wide ranking.
+
+        V11.2 enhancements:
+        - Turnover limit: max MAX_TURNOVER_PCT portfolio turnover per rebalance.
+        - Rank-score sizing: position size proportional to rank-score within decile.
+        """
         # Sort by return
         sorted_ranks = sorted(self.rankings, key=lambda r: r.return_1m_skip, reverse=True)
         n = len(sorted_ranks)
@@ -268,24 +279,71 @@ class CrossSectionalMomentum:
         bottom_cutoff = max(1, int(n * BOTTOM_DECILE_PCT))
         bottom_stocks = sorted_ranks[-bottom_cutoff:]
 
+        # V11.2: Turnover limit — cap the number of new names we add
+        prev_longs = set(self._current_longs)
+        prev_shorts = set(self._current_shorts)
+        prev_all = prev_longs | prev_shorts
+        new_candidates_long = [r for r in top_stocks]
+        new_candidates_short = [r for r in bottom_stocks]
+        total_positions = max(len(new_candidates_long) + len(new_candidates_short), 1)
+
+        if prev_all:
+            new_names_long = [r for r in new_candidates_long if r.symbol not in prev_longs]
+            new_names_short = [r for r in new_candidates_short if r.symbol not in prev_shorts]
+            total_new = len(new_names_long) + len(new_names_short)
+            turnover_ratio = total_new / total_positions
+            if turnover_ratio > MAX_TURNOVER_PCT:
+                # Trim new entries to respect turnover limit
+                max_new = max(1, int(total_positions * MAX_TURNOVER_PCT))
+                # Prioritize strongest new signals
+                new_names_long.sort(key=lambda r: r.return_1m_skip, reverse=True)
+                new_names_short.sort(key=lambda r: r.return_1m_skip)
+                allowed_new = set()
+                for r in (new_names_long + new_names_short)[:max_new]:
+                    allowed_new.add(r.symbol)
+                # Keep previous holdings + allowed new names
+                new_candidates_long = [
+                    r for r in new_candidates_long
+                    if r.symbol in prev_longs or r.symbol in allowed_new
+                ]
+                new_candidates_short = [
+                    r for r in new_candidates_short
+                    if r.symbol in prev_shorts or r.symbol in allowed_new
+                ]
+                logger.info(
+                    f"XS momentum: turnover capped at {MAX_TURNOVER_PCT:.0%} — "
+                    f"allowed {len(allowed_new)} new names out of {total_new}"
+                )
+
+        # V11.2: Compute rank-score weights within decile for proportional sizing
+        long_scores = [abs(r.return_1m_skip) for r in new_candidates_long]
+        long_total = sum(long_scores) if long_scores else 1.0
+        short_scores = [abs(r.return_1m_skip) for r in new_candidates_short]
+        short_total = sum(short_scores) if short_scores else 1.0
+
         signals = []
         self._current_longs = []
         self._current_shorts = []
 
-        # Long signals
-        for rank in top_stocks:
+        # Long signals with rank-proportional sizing
+        for i, rank in enumerate(new_candidates_long):
             sig = self._create_long_signal(rank, now)
             if sig:
+                # Store rank-proportional weight in metadata
+                weight = long_scores[i] / long_total if long_total > 0 else 1.0 / max(len(new_candidates_long), 1)
+                sig.metadata["rank_weight"] = round(weight, 4)
                 signals.append(sig)
                 self._current_longs.append(rank.symbol)
 
-        # Short signals
+        # Short signals with rank-proportional sizing
         if config.ALLOW_SHORT:
-            for rank in bottom_stocks:
+            for i, rank in enumerate(new_candidates_short):
                 if rank.symbol in config.NO_SHORT_SYMBOLS:
                     continue
                 sig = self._create_short_signal(rank, now)
                 if sig:
+                    weight = short_scores[i] / short_total if short_total > 0 else 1.0 / max(len(new_candidates_short), 1)
+                    sig.metadata["rank_weight"] = round(weight, 4)
                     signals.append(sig)
                     self._current_shorts.append(rank.symbol)
 

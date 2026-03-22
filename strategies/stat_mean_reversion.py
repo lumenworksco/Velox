@@ -98,7 +98,9 @@ class StatMeanReversion:
 
                 # 2. Fit OU parameters (also serves as ADF-like stationarity check:
                 #    fit_ou_params returns {} if b >= 0, i.e. not mean-reverting)
-                ou = fit_ou_params(close)
+                # T1-006: Exclude current bar to prevent look-ahead bias
+                assert len(close) >= 2, f"Need >=2 bars for OU fit, got {len(close)}"
+                ou = fit_ou_params(close.iloc[:-1])
                 if not ou:
                     continue
 

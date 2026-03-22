@@ -338,6 +338,38 @@ class FinGPT:
             chunks.append(current.strip())
         return chunks or [text[:max_chars]]
 
+    def score_headlines(self, headlines: List[str]) -> List[Dict[str, float]]:
+        """T5-004: Score headlines returning positive/negative/neutral probabilities.
+
+        Args:
+            headlines: List of headline strings.
+
+        Returns:
+            List of dicts with keys: positive_prob, negative_prob, neutral_prob, score.
+        """
+        results = []
+        for headline in headlines:
+            score = self._score_single(headline)
+            # Convert scalar score to probability triplet
+            if score > 0:
+                pos = min(0.5 + score * 0.5, 1.0)
+                neg = max(0.5 - score * 0.5, 0.0)
+                neu = max(1.0 - pos - neg, 0.0)
+            elif score < 0:
+                neg = min(0.5 + abs(score) * 0.5, 1.0)
+                pos = max(0.5 - abs(score) * 0.5, 0.0)
+                neu = max(1.0 - pos - neg, 0.0)
+            else:
+                pos, neg, neu = 0.33, 0.33, 0.34
+
+            results.append({
+                "positive_prob": round(pos, 4),
+                "negative_prob": round(neg, 4),
+                "neutral_prob": round(neu, 4),
+                "score": round(score, 4),
+            })
+        return results
+
     @staticmethod
     def _split_filing_sections(text: str) -> Dict[str, str]:
         """Attempt to split an SEC filing into named sections."""
@@ -356,3 +388,95 @@ class FinGPT:
             if len(body) > 50:
                 sections[name] = body
         return sections
+
+
+# ---------------------------------------------------------------------------
+# T5-004: FinBERTSentiment — dedicated wrapper for signal processor integration
+# ---------------------------------------------------------------------------
+
+class FinBERTSentiment:
+    """T5-004: FinBERT-powered headline sentiment scorer.
+
+    Wraps the FinGPT class to provide a clean interface for the signal
+    processor. Scores headlines and provides positive/negative/neutral
+    probabilities for trading signal enrichment.
+
+    Usage::
+
+        sentiment = FinBERTSentiment()
+        result = sentiment.score("AAPL beats earnings expectations")
+        # result = {"positive_prob": 0.82, "negative_prob": 0.08, "neutral_prob": 0.10, "score": 0.74}
+    """
+
+    def __init__(self, backend: str = "auto"):
+        """Initialize FinBERT sentiment scorer.
+
+        Args:
+            backend: Backend to use. "auto" selects best available
+                     (transformers > openai > keyword).
+        """
+        self._engine = FinGPT(FinGPTConfig(backend=backend))
+        self._enabled = True
+        logger.info("T5-004: FinBERTSentiment initialized (backend=%s)", self._engine._backend)
+
+    def score(self, headline: str) -> Dict[str, float]:
+        """Score a single headline.
+
+        Args:
+            headline: News headline or short text.
+
+        Returns:
+            Dict with positive_prob, negative_prob, neutral_prob, score.
+        """
+        if not self._enabled or not headline:
+            return {"positive_prob": 0.33, "negative_prob": 0.33, "neutral_prob": 0.34, "score": 0.0}
+
+        results = self._engine.score_headlines([headline])
+        return results[0] if results else {"positive_prob": 0.33, "negative_prob": 0.33, "neutral_prob": 0.34, "score": 0.0}
+
+    def score_batch(self, headlines: List[str]) -> List[Dict[str, float]]:
+        """Score multiple headlines.
+
+        Args:
+            headlines: List of headline strings.
+
+        Returns:
+            List of score dicts.
+        """
+        if not self._enabled or not headlines:
+            return [{"positive_prob": 0.33, "negative_prob": 0.33, "neutral_prob": 0.34, "score": 0.0}] * len(headlines)
+
+        return self._engine.score_headlines(headlines)
+
+    def get_sentiment_signal(self, symbol: str, headlines: List[str]) -> Tuple[float, str]:
+        """Get an aggregate sentiment signal for a symbol.
+
+        Args:
+            symbol: Ticker symbol.
+            headlines: Recent headlines for the symbol.
+
+        Returns:
+            Tuple of (sentiment_multiplier, reason).
+            Multiplier: 0.0 = block trade, 0.5 = reduce, 1.0 = neutral, 1.3 = boost.
+        """
+        if not headlines:
+            return 1.0, "no_headlines"
+
+        scores = self.score_batch(headlines)
+        avg_score = float(np.mean([s["score"] for s in scores]))
+
+        if avg_score > 0.5:
+            return 1.3, f"nlp_bullish_{avg_score:.2f}"
+        elif avg_score > 0.2:
+            return 1.1, f"nlp_mildly_bullish_{avg_score:.2f}"
+        elif avg_score < -0.5:
+            return 0.5, f"nlp_bearish_{avg_score:.2f}"
+        elif avg_score < -0.2:
+            return 0.8, f"nlp_mildly_bearish_{avg_score:.2f}"
+        else:
+            return 1.0, f"nlp_neutral_{avg_score:.2f}"
+
+    @property
+    def backend(self) -> str:
+        """Current backend being used."""
+        return self._engine._backend or "unknown"

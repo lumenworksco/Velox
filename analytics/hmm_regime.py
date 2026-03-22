@@ -508,6 +508,287 @@ class HMMRegimeDetector:
         return self._fitted
 
 
+# ---------------------------------------------------------------------------
+# T5-002: Intraday Regime States (3-state HMM on 5-minute SPY data)
+# ---------------------------------------------------------------------------
+
+class IntradayRegimeState(Enum):
+    """Three intraday market regimes identified by the 5-minute HMM."""
+    TRENDING_UP = "trending_up"
+    TRENDING_DOWN = "trending_down"
+    MEAN_REVERTING = "mean_reverting"
+
+
+INTRADAY_MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "hmm_intraday.pkl"
+
+
+def _compute_intraday_features(df: pd.DataFrame) -> np.ndarray:
+    """Compute features for the intraday 5-minute HMM.
+
+    Features (from 5-minute SPY bars):
+      - 5-minute return (log)
+      - 12-bar rolling volatility (1 hour)
+      - Volume ratio (current / 12-bar average)
+
+    Args:
+        df: DataFrame with columns [open, high, low, close, volume].
+
+    Returns:
+        np.ndarray of shape (n_samples, 3). NaN rows dropped.
+    """
+    close = df["close"].values.astype(float)
+    volume = df["volume"].values.astype(float)
+
+    # 5-minute log returns
+    log_returns = np.diff(np.log(np.maximum(close, 1e-8)))
+    n = len(log_returns)
+    if n < 12:
+        return np.array([]).reshape(0, 3)
+
+    # 12-bar rolling std (1 hour of 5-min bars)
+    vol_12 = np.full(n, np.nan)
+    cs = np.concatenate([[0], np.cumsum(log_returns)])
+    cs2 = np.concatenate([[0], np.cumsum(log_returns ** 2)])
+    window = 12
+    if n >= window:
+        win_sum = cs[window:] - cs[:-window]
+        win_sum2 = cs2[window:] - cs2[:-window]
+        variance = win_sum2 / window - (win_sum / window) ** 2
+        variance = np.maximum(variance, 0)
+        vol_12[window - 1:] = np.sqrt(variance)
+
+    # Volume ratio
+    vol_shifted = volume[1:]
+    vol_ratio = np.full(n, np.nan)
+    if n >= 12:
+        vcs = np.concatenate([[0], np.cumsum(vol_shifted)])
+        avg_vol = (vcs[12:] - vcs[:-12]) / 12.0
+        safe_avg = np.where(avg_vol > 0, avg_vol, 1.0)
+        vol_ratio[11:] = vol_shifted[11:] / safe_avg
+
+    features = np.column_stack([log_returns, vol_12, vol_ratio])
+    valid_mask = ~np.isnan(features).any(axis=1)
+    return features[valid_mask]
+
+
+def _label_intraday_states(model) -> dict[int, IntradayRegimeState]:
+    """Map 3-state HMM indices to IntradayRegimeState.
+
+    Sort by mean return:
+      - Lowest mean return -> TRENDING_DOWN
+      - Highest mean return -> TRENDING_UP
+      - Middle -> MEAN_REVERTING
+    """
+    means = model.means_
+    sorted_indices = np.argsort(means[:, 0])
+
+    label_map = {}
+    if len(sorted_indices) >= 3:
+        label_map[sorted_indices[0]] = IntradayRegimeState.TRENDING_DOWN
+        label_map[sorted_indices[1]] = IntradayRegimeState.MEAN_REVERTING
+        label_map[sorted_indices[2]] = IntradayRegimeState.TRENDING_UP
+    else:
+        for i in range(len(sorted_indices)):
+            if means[sorted_indices[i], 0] > 0:
+                label_map[sorted_indices[i]] = IntradayRegimeState.TRENDING_UP
+            elif means[sorted_indices[i], 0] < 0:
+                label_map[sorted_indices[i]] = IntradayRegimeState.TRENDING_DOWN
+            else:
+                label_map[sorted_indices[i]] = IntradayRegimeState.MEAN_REVERTING
+
+    return label_map
+
+
+class IntradayRegimeDetector:
+    """T5-002: Intraday HMM regime detector trained on 5-minute SPY data.
+
+    Uses a 3-state GaussianHMM to classify the current intraday regime
+    as TRENDING_UP, TRENDING_DOWN, or MEAN_REVERTING. Updates every 5 minutes.
+    """
+
+    def __init__(self, n_states: int = 3):
+        self.n_states = n_states
+        self.model = None
+        self._label_map: dict[int, IntradayRegimeState] = {}
+        self._feature_means: np.ndarray | None = None
+        self._feature_stds: np.ndarray | None = None
+        self._current_regime = IntradayRegimeState.MEAN_REVERTING
+        self._regime_probabilities: dict[IntradayRegimeState, float] = {
+            r: 1.0 / 3.0 for r in IntradayRegimeState
+        }
+        self._fitted = False
+        self._lock = threading.Lock()
+        self._last_update_ts: float = 0.0
+
+        # Try to load saved model
+        self._load_model()
+
+    def _load_model(self) -> bool:
+        """Load a previously fitted intraday model from disk."""
+        try:
+            if INTRADAY_MODEL_PATH.exists():
+                saved = joblib.load(INTRADAY_MODEL_PATH)
+                self.model = saved["model"]
+                self._label_map = saved["label_map"]
+                self._feature_means = saved.get("feature_means")
+                self._feature_stds = saved.get("feature_stds")
+                self._fitted = True
+                logger.info("Intraday HMM regime model loaded from disk")
+                return True
+        except Exception as e:
+            logger.warning(f"Failed to load intraday HMM model: {e}")
+        return False
+
+    def _save_model(self):
+        """Save fitted intraday model to disk."""
+        try:
+            INTRADAY_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            joblib.dump({
+                "model": self.model,
+                "label_map": self._label_map,
+                "feature_means": self._feature_means,
+                "feature_stds": self._feature_stds,
+            }, INTRADAY_MODEL_PATH)
+            logger.info(f"Intraday HMM model saved to {INTRADAY_MODEL_PATH}")
+        except Exception as e:
+            logger.warning(f"Failed to save intraday HMM model: {e}")
+
+    def fit(self, intraday_data: pd.DataFrame) -> bool:
+        """Fit the intraday HMM on 5-minute SPY data.
+
+        Args:
+            intraday_data: DataFrame with columns [open, high, low, close, volume].
+                Should contain multiple days of 5-minute bars.
+
+        Returns:
+            True if fitting succeeded, False otherwise.
+        """
+        try:
+            from hmmlearn.hmm import GaussianHMM
+        except ImportError:
+            logger.error("hmmlearn not installed — intraday HMM unavailable")
+            return False
+
+        raw_features = _compute_intraday_features(intraday_data)
+        if len(raw_features) < 50:
+            logger.warning(f"Insufficient intraday data for HMM: {len(raw_features)} (need 50+)")
+            return False
+
+        try:
+            features, means, stds = _normalize_features(raw_features)
+
+            model = GaussianHMM(
+                n_components=self.n_states,
+                covariance_type="diag",
+                n_iter=150,
+                random_state=42,
+                verbose=False,
+            )
+            model.fit(features)
+
+            # Reorder states by mean return
+            sorted_indices = np.argsort(model.means_[:, 0])
+            model.means_ = model.means_[sorted_indices]
+            if hasattr(model, '_covars_'):
+                model._covars_ = model._covars_[sorted_indices]
+            else:
+                model.covars_ = model.covars_[sorted_indices]
+            model.startprob_ = model.startprob_[sorted_indices]
+            model.transmat_ = model.transmat_[sorted_indices][:, sorted_indices]
+
+            self.model = model
+            self._label_map = _label_intraday_states(model)
+            self._feature_means = means
+            self._feature_stds = stds
+            self._fitted = True
+            self._save_model()
+
+            logger.info(f"Intraday HMM fitted on {len(features)} samples, {self.n_states} states")
+            return True
+
+        except Exception as e:
+            logger.error(f"Intraday HMM fitting failed: {e}")
+            return False
+
+    def update_intraday_regime(self, recent_5min_data: pd.DataFrame) -> IntradayRegimeState:
+        """Update intraday regime based on recent 5-minute bars.
+
+        Called every 5 minutes. Uses the fitted HMM to classify the
+        current intraday state.
+
+        Args:
+            recent_5min_data: Recent 5-minute bars (at least 20 bars).
+
+        Returns:
+            Current IntradayRegimeState.
+        """
+        if not getattr(config, "INTRADAY_REGIME_ENABLED", False):
+            return self._current_regime
+
+        if not self._fitted or self.model is None:
+            return self._current_regime
+
+        try:
+            raw = _compute_intraday_features(recent_5min_data)
+            if len(raw) == 0:
+                return self._current_regime
+
+            features, _, _ = _normalize_features(raw, self._feature_means, self._feature_stds)
+            if len(features) == 0:
+                return self._current_regime
+
+            log_prob, posteriors = self.model.score_samples(features)
+
+            if np.isnan(log_prob).any() or np.isnan(posteriors).any():
+                logger.warning("Intraday HMM produced NaN — returning fallback")
+                return self._current_regime
+
+            last_posteriors = posteriors[-1]
+
+            probs: dict[IntradayRegimeState, float] = {}
+            for state_idx, prob in enumerate(last_posteriors):
+                regime = self._label_map.get(state_idx, IntradayRegimeState.MEAN_REVERTING)
+                probs[regime] = probs.get(regime, 0.0) + prob
+
+            best_regime = max(probs, key=lambda r: probs[r])
+
+            with self._lock:
+                self._current_regime = best_regime
+                self._regime_probabilities = probs
+                self._last_update_ts = __import__('time').time()
+
+            return best_regime
+
+        except Exception as e:
+            logger.error(f"Intraday HMM update failed: {e}")
+            return self._current_regime
+
+    def get_intraday_regime(self) -> str:
+        """Get current intraday regime as string.
+
+        Returns:
+            One of 'trending_up', 'trending_down', 'mean_reverting'.
+        """
+        with self._lock:
+            return self._current_regime.value
+
+    @property
+    def intraday_regime(self) -> IntradayRegimeState:
+        """Current intraday regime (thread-safe)."""
+        with self._lock:
+            return self._current_regime
+
+    @property
+    def intraday_probabilities(self) -> dict[IntradayRegimeState, float]:
+        """Intraday regime probability distribution (thread-safe snapshot)."""
+        with self._lock:
+            return dict(self._regime_probabilities)
+
+    @property
+    def is_fitted(self) -> bool:
+        return self._fitted
+
+
 def get_strategy_regime_affinity() -> dict[str, dict[MarketRegimeState, float]]:
     """Return strategy-regime affinity mapping."""
     return STRATEGY_REGIME_AFFINITY

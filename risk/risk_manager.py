@@ -5,12 +5,14 @@ import threading
 import time as time_mod
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import NamedTuple, Optional
 
 import config
 import database
 from analytics.metrics import compute_sharpe as _compute_sharpe_fn
 
 from engine.event_log import log_event, EventType
+from engine.failure_modes import FailureMode, handle_failure
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +25,13 @@ except ImportError:
     _FRM = None
 
 # --- VIX Risk Scaling ---
-_vix_cache: tuple[float, float] | None = None  # (vix_value, fetch_timestamp)
+
+# T1-003: Replace bare tuple with immutable NamedTuple for atomic snapshot reads
+class VixSnapshot(NamedTuple):
+    value: float
+    timestamp: float
+
+_vix_cache: Optional[VixSnapshot] = None
 _vix_cache_lock = threading.Lock()  # MED-001: protect concurrent VIX cache access
 
 
@@ -32,9 +40,12 @@ def get_vix_level() -> float:
     global _vix_cache
 
     now = time_mod.time()
+    # T1-003: Atomic snapshot read under lock, use outside lock
     with _vix_cache_lock:
-        if _vix_cache and (now - _vix_cache[1]) < config.VIX_CACHE_SECONDS:
-            return _vix_cache[0]
+        snapshot = _vix_cache
+
+    if snapshot and (now - snapshot.timestamp) < config.VIX_CACHE_SECONDS:
+        return snapshot.value
 
     try:
         import yfinance as yf
@@ -44,14 +55,17 @@ def get_vix_level() -> float:
         if vix is None or not isinstance(vix, (int, float)) or math.isnan(vix):
             vix = 0
         if vix > 0:
+            new_snapshot = VixSnapshot(value=float(vix), timestamp=now)
             with _vix_cache_lock:
-                _vix_cache = (float(vix), now)
-            return float(vix)
+                _vix_cache = new_snapshot
+            return new_snapshot.value
     except Exception as e:
         logger.warning(f"Failed to fetch VIX: {e}")
 
+    # T1-003: Atomic snapshot read for fallback
     with _vix_cache_lock:
-        return _vix_cache[0] if _vix_cache else 20.0  # Default to 20 if unavailable
+        snapshot = _vix_cache
+    return snapshot.value if snapshot else 20.0  # Default to 20 if unavailable
 
 
 def get_vix_risk_scalar() -> float:
@@ -219,10 +233,9 @@ class RiskManager:
         position_value = shares * entry_price
 
         # V3: Apply dynamic capital allocation weight
-        # BUG-007: Protect _strategy_weights read with lock
+        # T1-004: Use immutable snapshot via get_strategy_weights() to avoid lock contention
         if config.DYNAMIC_ALLOCATION and strategy:
-            with self._lock:
-                weights = dict(self._strategy_weights) if self._strategy_weights else {}
+            weights = self.get_strategy_weights()  # Thread-safe snapshot copy
             if weights:
                 weight = weights.get(strategy, 1.0)
                 # Scale position by strategy weight relative to equal weight
@@ -314,16 +327,28 @@ class RiskManager:
                 pnl_pct=pnl_pct,
             )
         except Exception as e:
-            logger.error(f"Failed to log trade to DB: {e}")
+            handle_failure(FailureMode.SKIP_SIGNAL, "risk_manager.log_trade_to_db", e,
+                           symbol=trade.symbol, strategy=trade.strategy)
 
-        # V10: Record PDT if same-day close
+        # V10 + T5-008: Record PDT if same-day close (both trackers)
         try:
             if (trade.hold_type == "day" and trade.entry_time
                     and trade.entry_time.date() == now.date()):
                 if hasattr(self, '_pdt') and self._pdt:
                     self._pdt.record_day_trade(trade.symbol, now.date())
+                # T5-008: Also record with PDTCompliance for persistent tracking
+                if hasattr(self, '_pdt_compliance') and self._pdt_compliance:
+                    self._pdt_compliance.record_day_trade(
+                        symbol=trade.symbol,
+                        trade_date=now.date(),
+                        side=trade.side,
+                        qty=float(trade.qty),
+                        entry_price=trade.entry_price,
+                        exit_price=exit_price,
+                    )
         except Exception as e:
-            logger.warning(f"PDT recording failed for {symbol}: {e}")  # Fail-open
+            handle_failure(FailureMode.DEGRADE_GRACEFULLY, "risk_manager.pdt_recording", e,
+                           symbol=trade.symbol, strategy=trade.strategy)
 
     def partial_close(self, symbol: str, qty_to_close: int, exit_price: float,
                       now: datetime, exit_reason: str = "partial_tp"):
@@ -491,9 +516,10 @@ class RiskManager:
                     s: w / total_weight for s, w in new_weights.items()
                 }
 
-            # BUG-007: Atomically swap weights under lock
+            # T1-004 + BUG-007: Atomically swap immutable dict snapshot under lock
+            frozen_weights = dict(new_weights)  # Immutable copy for atomic swap
             with self._lock:
-                self._strategy_weights = new_weights
+                self._strategy_weights = frozen_weights
 
             logger.info(f"Capital allocation updated: {new_weights}")
             database.log_allocation_weights(new_weights)
@@ -506,6 +532,18 @@ class RiskManager:
         # BUG-007: Protect _strategy_weights read with lock
         with self._lock:
             return dict(self._strategy_weights)
+
+    def get_weight(self, strategy: str) -> float:
+        """T1-004: Get a single strategy's capital weight (thread-safe).
+
+        Returns the weight for the given strategy, or 1.0 if not found.
+        Encapsulates locking so callers don't need to manage it.
+        """
+        with self._lock:
+            weights = self._strategy_weights
+            if not weights:
+                return 1.0
+            return weights.get(strategy, 1.0)
 
     @staticmethod
     def _compute_strategy_daily_returns(trades: list[dict]) -> list[float]:

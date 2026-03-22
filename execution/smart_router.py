@@ -140,17 +140,46 @@ class SmartOrderRouter:
         self._route_counts: dict[str, int] = {t.value: 0 for t in OrderTypeChoice}
         self._total_routed: int = 0
 
-    def route_order(self, signal, market_data: MarketConditions) -> OrderParams:
+    def route_order(self, signal, market_data: MarketConditions,
+                    now: datetime | None = None) -> OrderParams:
         """Determine optimal order routing for a signal.
+
+        V11.2 enhancements:
+        - Avoid first 5 min (9:30-9:35) and last 5 min (15:55-16:00) for limit orders.
+        - Mid-quote improvement: for liquid symbols, try limit at mid for 30s before
+          falling back to market.
 
         Args:
             signal: Trading signal with symbol, strategy, side, entry_price.
             market_data: Current market microstructure snapshot.
+            now: Current datetime (defaults to datetime.now()).
 
         Returns:
             OrderParams with order type, price, and execution instructions.
         """
+        if now is None:
+            now = datetime.now()
+
         urgency = _STRATEGY_URGENCY.get(signal.strategy, UrgencyLevel.MEDIUM)
+
+        # V11.2: Timing guard — avoid first/last 5 minutes for limit orders
+        market_time = now.replace(tzinfo=None).time() if now.tzinfo else now.time()
+        from datetime import time as time_cls
+        in_open_auction = time_cls(9, 30) <= market_time < time_cls(9, 35)
+        in_close_auction = time_cls(15, 55) <= market_time <= time_cls(16, 0)
+
+        if in_open_auction or in_close_auction:
+            # Use market orders during volatile open/close periods
+            self._route_counts[OrderTypeChoice.MARKET.value] += 1
+            self._total_routed += 1
+            period = "open" if in_open_auction else "close"
+            return OrderParams(
+                order_type=OrderTypeChoice.MARKET,
+                limit_price=None,
+                urgency=urgency,
+                reason=f"Market order during {period} auction window",
+                chase_enabled=False,
+            )
 
         # Gather decision factors
         spread_bps = market_data.spread_bps
@@ -187,8 +216,22 @@ class SmartOrderRouter:
             twap_slices = min(20, max(3, int(size_ratio * 100)))
             reason += f" | TWAP {twap_slices} slices (size/ADV={size_ratio:.1%})"
 
+        # V11.2: Mid-quote improvement for liquid symbols
+        # If spread is tight (< 5 bps) and urgency is not critical, try mid-quote
+        # limit for 30s before escalating to market.
+        is_liquid = spread_bps < 5 and market_data.adv > 500_000
+        if is_liquid and order_type not in (OrderTypeChoice.MARKET,) and urgency != UrgencyLevel.CRITICAL:
+            order_type = OrderTypeChoice.LIMIT_PASSIVE
+            limit_price = round(market_data.mid, 2)
+            reason += " | mid-quote improvement (30s before fallback)"
+
         # Chase configuration
         chase_enabled = order_type != OrderTypeChoice.MARKET
+        chase_after = self._chase_after_sec
+        # For mid-quote improvement, chase after 30s instead of default
+        if is_liquid and chase_enabled:
+            chase_after = 30
+
         max_chase = None
         if chase_enabled and market_data.mid > 0:
             # Never chase more than 0.3% from mid
@@ -207,7 +250,7 @@ class SmartOrderRouter:
             urgency=urgency,
             reason=reason,
             chase_enabled=chase_enabled,
-            chase_after_sec=self._chase_after_sec,
+            chase_after_sec=chase_after,
             max_chase_price=max_chase,
             use_twap=use_twap,
             twap_slices=twap_slices,

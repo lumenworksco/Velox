@@ -236,6 +236,42 @@ PEAD_STOP_LOSS = 0.03
 PEAD_MAX_POSITIONS = 5
 PEAD_POSITION_SIZE_PCT = 0.02
 
+# --- T5-001: PEAD Pre-Earnings Implied-Move Exploitation ---
+PEAD_PRE_EARNINGS_ENABLED = os.getenv("PEAD_PRE_EARNINGS_ENABLED", "true") == "true"
+PEAD_IMPLIED_MOVE_RATIO_THRESHOLD = 1.5   # realized > 1.5x implied to qualify
+PEAD_PRE_ENTRY_DAYS = 2                   # enter 2 days before earnings
+PEAD_POST_EXIT_DAYS = 2                   # exit within 2 days post-earnings
+PEAD_PRE_SIZE_FRACTION = 0.50             # 50% of normal position size
+PEAD_PRE_ATR_STOP_MULT = 1.5             # 1.5x ATR stop
+
+# --- T5-002: Intraday Regime Switching (HMM) ---
+INTRADAY_REGIME_ENABLED = os.getenv("INTRADAY_REGIME_ENABLED", "true") == "true"
+INTRADAY_REGIME_UPDATE_MIN = 5            # update every 5 minutes
+INTRADAY_REGIME_STATES = 3               # Trending Up, Trending Down, Mean-Reverting
+
+# --- T5-003: ML Ensemble Upgrade ---
+ML_ENSEMBLE_ENABLED = os.getenv("ML_ENSEMBLE_ENABLED", "true") == "true"
+ML_BAYESIAN_OPTIM_TRIALS = 50            # Optuna trials for hyperparameter search
+
+# --- T5-004: NLP Sentiment (FinBERT) ---
+NLP_SENTIMENT_ENABLED = os.getenv("NLP_SENTIMENT_ENABLED", "true") == "true"
+
+# --- T5-005: Options Skew Signal ---
+OPTIONS_SKEW_ENABLED = os.getenv("OPTIONS_SKEW_ENABLED", "true") == "true"
+SKEW_ROLLING_WINDOW = 90                 # 90-day rolling mean for z-score
+SKEW_BULLISH_THRESHOLD = -1.5            # z < -1.5 -> bullish
+SKEW_BEARISH_THRESHOLD = 1.5             # z > 1.5 -> bearish
+SKEW_MAX_BOOST = 0.40                    # max +/-40% confidence adjustment
+
+# --- T5-006: Dark Pool Volume Detection ---
+DARK_POOL_ENABLED = os.getenv("DARK_POOL_ENABLED", "true") == "true"
+DARK_POOL_ROLLING_MINUTES = 30           # rolling window
+DARK_POOL_RATIO_THRESHOLD = 0.35         # 35% dark pool ratio
+DARK_POOL_ALPHA_WEIGHT = 0.15            # confidence multiplier weight
+
+# --- T5-008: PDT Protection ---
+PDT_PROTECTION_ENABLED = os.getenv("PDT_PROTECTION_ENABLED", "true") == "true"
+
 # ============================================================
 # RISK MANAGEMENT
 # ============================================================
@@ -271,6 +307,9 @@ KELLY_LOOKBACK = 100
 KELLY_FRACTION_MULT = 0.5          # Half-Kelly
 KELLY_MIN_RISK = 0.003
 KELLY_MAX_RISK = 0.02
+
+# --- T7-004: Bayesian Kelly Sizing ---
+BAYESIAN_KELLY_ENABLED = False          # Enable regime-weighted Kelly fractions
 
 # --- Daily P&L Controls ---
 PNL_GAIN_LOCK_PCT = 0.015
@@ -384,6 +423,15 @@ ATR_TRAIL_ACTIVATION = 0.5        # Activate after 0.5x ATR in profit
 EXECUTION_ANALYTICS_ENABLED = True
 EXECUTION_SLIPPAGE_ALERT_PCT = 0.001
 
+# --- T7-001: RL Execution Agent ---
+RL_EXECUTION_ENABLED = False            # Enable deep RL execution agent
+
+# --- T7-003: EDGAR 8-K Monitor ---
+EDGAR_MONITOR_ENABLED = False           # Enable real-time 8-K filing monitor
+
+# --- T7-005: Black-Litterman Portfolio Optimization ---
+BLACK_LITTERMAN_ENABLED = False         # Enable BL portfolio-level optimization
+
 # --- Scan Configuration ---
 SCAN_INTERVAL_SEC = 120
 # MED-030: Removed CLOSE_UNKNOWN_POSITIONS (dead code, never referenced)
@@ -479,6 +527,21 @@ WALK_FORWARD_MIN_SHARPE = 0.3
 SORTINO_ENABLED = True
 WALK_FORWARD_MIN_SORTINO = 0.5
 
+# --- T5-011: Temporal Fusion Transformer ---
+TFT_ENABLED = os.getenv("TFT_ENABLED", "false") == "true"
+
+# --- T5-012: LLM Multi-Agent Alpha Mining ---
+ALPHA_AGENTS_ENABLED = os.getenv("ALPHA_AGENTS_ENABLED", "false") == "true"
+
+# --- T5-013: Cross-Asset Lead-Lag Signal ---
+LEAD_LAG_ENABLED = os.getenv("LEAD_LAG_ENABLED", "true") == "true"
+
+# --- T5-014: Order Book Microstructure Signal ---
+ORDER_BOOK_SIGNAL_ENABLED = os.getenv("ORDER_BOOK_SIGNAL_ENABLED", "false") == "true"
+
+# --- T5-015: Adaptive RL-Informed Scan Scheduling ---
+ADAPTIVE_SCAN_ENABLED = os.getenv("ADAPTIVE_SCAN_ENABLED", "false") == "true"
+
 # ============================================================
 # MONITORING & ALERTS
 # ============================================================
@@ -515,6 +578,10 @@ DB_FILE = "bot.db"
 LOG_FILE = "bot.log"
 AUDIT_LOG_FILE = "audit.log"
 STATE_SAVE_INTERVAL_SEC = 60
+
+# T4-004: Connection pool tuning — increased from 3 to 10 for market hours throughput
+DB_POOL_SIZE = 10
+DB_POOL_TIMEOUT = 5.0   # seconds to wait for a connection before overflow
 
 # --- Watchdog & Reconciliation ---
 WATCHDOG_ENABLED = True
@@ -720,6 +787,37 @@ def start_yaml_watcher(poll_interval_sec: float = 30.0):
         "PROD-013: YAML config watcher started (poll_interval=%ds)",
         poll_interval_sec,
     )
+
+
+# =============================================================================
+# T2-002: Structured Config Shim
+# =============================================================================
+#
+# config.py is the legacy flat-variable entry point (44 files import it).
+# config/settings.py is the canonical source with structured dataclass groups.
+# This shim re-exports get_settings() so callers can migrate incrementally:
+#
+#   import config
+#   settings = config.get_settings()   # typed, grouped access
+#   config.MAX_POSITIONS               # legacy flat access (still works)
+
+try:
+    from config.settings import (
+        get_settings,
+        invalidate_settings_cache,
+        RiskSettings,
+        StrategySettings,
+        MLSettings,
+        ExecutionSettings,
+        OperationalSettings,
+        Settings,
+    )
+except ImportError:
+    # Fallback if config/settings.py is not yet available (e.g., during tests)
+    def get_settings():
+        return None
+    def invalidate_settings_cache():
+        pass
 
 
 def get_yaml_config() -> dict:

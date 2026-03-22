@@ -15,7 +15,8 @@ API_KEY = os.getenv("ALPACA_API_KEY", "")
 API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 
 # Validate API credentials at import time (skip in test environments)
-if not os.getenv("TESTING") and not os.getenv("PYTEST_CURRENT_TEST"):
+_IN_TEST = os.getenv("TESTING") or os.getenv("PYTEST_CURRENT_TEST") or "pytest" in __import__("sys").modules
+if not _IN_TEST:
     if not API_KEY:
         raise RuntimeError("ALPACA_API_KEY environment variable is required")
     if not API_SECRET:
@@ -468,6 +469,21 @@ WALK_FORWARD_MIN_SHARPE = 0.3
 SORTINO_ENABLED = True
 WALK_FORWARD_MIN_SORTINO = 0.5
 
+# --- T5-011: Temporal Fusion Transformer ---
+TFT_ENABLED = os.getenv("TFT_ENABLED", "false") == "true"
+
+# --- T5-012: LLM Multi-Agent Alpha Mining ---
+ALPHA_AGENTS_ENABLED = os.getenv("ALPHA_AGENTS_ENABLED", "false") == "true"
+
+# --- T5-013: Cross-Asset Lead-Lag Signal ---
+LEAD_LAG_ENABLED = os.getenv("LEAD_LAG_ENABLED", "true") == "true"
+
+# --- T5-014: Order Book Microstructure Signal ---
+ORDER_BOOK_SIGNAL_ENABLED = os.getenv("ORDER_BOOK_SIGNAL_ENABLED", "false") == "true"
+
+# --- T5-015: Adaptive RL-Informed Scan Scheduling ---
+ADAPTIVE_SCAN_ENABLED = os.getenv("ADAPTIVE_SCAN_ENABLED", "false") == "true"
+
 # ============================================================
 # MONITORING & ALERTS
 # ============================================================
@@ -885,6 +901,211 @@ def start_yaml_watcher(poll_interval_sec: float = 30.0):
         "PROD-013: YAML config watcher started (poll_interval=%ds)",
         poll_interval_sec,
     )
+
+
+# =============================================================================
+# T2-002: Structured Config Groups
+# =============================================================================
+#
+# These dataclasses provide typed, grouped access to settings. They are populated
+# from the module-level variables above, so config.yaml / env overrides are
+# reflected automatically.  The legacy flat-variable interface remains canonical
+# — these groups are a read-only convenience layer.
+
+from dataclasses import dataclass as _dataclass, field as _field
+
+
+@_dataclass(frozen=True)
+class RiskSettings:
+    """Grouped risk management parameters."""
+    risk_per_trade_pct: float = 0.0
+    max_position_pct: float = 0.0
+    min_position_value: float = 0.0
+    max_positions: int = 0
+    max_portfolio_deploy: float = 0.0
+    daily_loss_halt: float = 0.0
+    vol_target_daily: float = 0.0
+    vol_target_max: float = 0.0
+    vol_scalar_min: float = 0.0
+    vol_scalar_max: float = 0.0
+    kelly_enabled: bool = False
+    kelly_fraction_mult: float = 0.0
+    kelly_min_risk: float = 0.0
+    kelly_max_risk: float = 0.0
+    pnl_gain_lock_pct: float = 0.0
+    pnl_loss_halt_pct: float = 0.0
+    vix_risk_scaling_enabled: bool = False
+    vix_halt_threshold: int = 40
+    beta_max_abs: float = 0.0
+    correlation_threshold: float = 0.0
+
+
+@_dataclass(frozen=True)
+class StrategySettings:
+    """Grouped strategy configuration."""
+    strategy_allocations: dict = _field(default_factory=dict)
+    mr_zscore_entry: float = 0.0
+    mr_zscore_stop: float = 0.0
+    vwap_band_std: float = 0.0
+    vwap_min_stop_pct: float = 0.0
+    pairs_zscore_entry: float = 0.0
+    pairs_max_hold_days: int = 0
+    orb_enabled: bool = False
+    micro_max_hold_minutes: int = 0
+    pead_enabled: bool = False
+
+
+@_dataclass(frozen=True)
+class MLSettings:
+    """Grouped ML / analytics parameters."""
+    hmm_regime_enabled: bool = False
+    hmm_n_states: int = 5
+    llm_scoring_enabled: bool = False
+    llm_score_threshold: float = 0.0
+    signal_ranking_enabled: bool = False
+    alpha_decay_enabled: bool = False
+    walk_forward_enabled: bool = False
+    intraday_seasonality_enabled: bool = False
+    cross_asset_enabled: bool = False
+
+
+@_dataclass(frozen=True)
+class ExecutionSettings:
+    """Grouped execution / routing parameters."""
+    smart_routing_enabled: bool = False
+    spread_threshold_pct: float = 0.0
+    adaptive_twap_enabled: bool = False
+    scan_interval_sec: int = 0
+    overnight_hold_enabled: bool = False
+    overnight_max_positions: int = 0
+    cost_spread_bps: float = 0.0
+    cost_slippage_bps: float = 0.0
+
+
+@_dataclass(frozen=True)
+class OperationalSettings:
+    """Grouped operational / monitoring parameters."""
+    paper_mode: bool = True
+    telegram_enabled: bool = False
+    web_dashboard_enabled: bool = False
+    websocket_monitoring: bool = False
+    watchdog_enabled: bool = False
+    reconciliation_enabled: bool = False
+    structured_logging_enabled: bool = False
+    db_file: str = "bot.db"
+    log_file: str = "bot.log"
+
+
+@_dataclass
+class Settings:
+    """Top-level composite settings object (T2-002)."""
+    risk: RiskSettings = _field(default_factory=RiskSettings)
+    strategy: StrategySettings = _field(default_factory=StrategySettings)
+    ml: MLSettings = _field(default_factory=MLSettings)
+    execution: ExecutionSettings = _field(default_factory=ExecutionSettings)
+    ops: OperationalSettings = _field(default_factory=OperationalSettings)
+
+
+def _build_settings() -> Settings:
+    """Build a Settings snapshot from current module-level variables."""
+    import sys
+    _mod = sys.modules[__name__]
+
+    def _g(name, default=None):
+        return getattr(_mod, name, default)
+
+    return Settings(
+        risk=RiskSettings(
+            risk_per_trade_pct=_g("RISK_PER_TRADE_PCT", 0.008),
+            max_position_pct=_g("MAX_POSITION_PCT", 0.08),
+            min_position_value=_g("MIN_POSITION_VALUE", 100),
+            max_positions=_g("MAX_POSITIONS", 12),
+            max_portfolio_deploy=_g("MAX_PORTFOLIO_DEPLOY", 0.55),
+            daily_loss_halt=_g("DAILY_LOSS_HALT", -0.04),
+            vol_target_daily=_g("VOL_TARGET_DAILY", 0.01),
+            vol_target_max=_g("VOL_TARGET_MAX", 0.015),
+            vol_scalar_min=_g("VOL_SCALAR_MIN", 0.3),
+            vol_scalar_max=_g("VOL_SCALAR_MAX", 1.5),
+            kelly_enabled=_g("KELLY_ENABLED", True),
+            kelly_fraction_mult=_g("KELLY_FRACTION_MULT", 0.5),
+            kelly_min_risk=_g("KELLY_MIN_RISK", 0.003),
+            kelly_max_risk=_g("KELLY_MAX_RISK", 0.02),
+            pnl_gain_lock_pct=_g("PNL_GAIN_LOCK_PCT", 0.015),
+            pnl_loss_halt_pct=_g("PNL_LOSS_HALT_PCT", -0.01),
+            vix_risk_scaling_enabled=_g("VIX_RISK_SCALING_ENABLED", True),
+            vix_halt_threshold=_g("VIX_HALT_THRESHOLD", 40),
+            beta_max_abs=_g("BETA_MAX_ABS", 0.3),
+            correlation_threshold=_g("CORRELATION_THRESHOLD", 0.92),
+        ),
+        strategy=StrategySettings(
+            strategy_allocations=dict(_g("STRATEGY_ALLOCATIONS", {})),
+            mr_zscore_entry=_g("MR_ZSCORE_ENTRY", 1.5),
+            mr_zscore_stop=_g("MR_ZSCORE_STOP", 2.5),
+            vwap_band_std=_g("VWAP_BAND_STD", 2.0),
+            vwap_min_stop_pct=_g("VWAP_MIN_STOP_PCT", 0.01),
+            pairs_zscore_entry=_g("PAIRS_ZSCORE_ENTRY", 2.0),
+            pairs_max_hold_days=_g("PAIRS_MAX_HOLD_DAYS", 10),
+            orb_enabled=_g("ORB_ENABLED", True),
+            micro_max_hold_minutes=_g("MICRO_MAX_HOLD_MINUTES", 15),
+            pead_enabled=_g("PEAD_ENABLED", True),
+        ),
+        ml=MLSettings(
+            hmm_regime_enabled=_g("HMM_REGIME_ENABLED", True),
+            hmm_n_states=_g("HMM_N_STATES", 5),
+            llm_scoring_enabled=_g("LLM_SCORING_ENABLED", False),
+            llm_score_threshold=_g("LLM_SCORE_THRESHOLD", 0.45),
+            signal_ranking_enabled=_g("SIGNAL_RANKING_ENABLED", True),
+            alpha_decay_enabled=_g("ALPHA_DECAY_ENABLED", True),
+            walk_forward_enabled=_g("WALK_FORWARD_ENABLED", True),
+            intraday_seasonality_enabled=_g("INTRADAY_SEASONALITY_ENABLED", True),
+            cross_asset_enabled=_g("CROSS_ASSET_ENABLED", True),
+        ),
+        execution=ExecutionSettings(
+            smart_routing_enabled=_g("SMART_ROUTING_ENABLED", True),
+            spread_threshold_pct=_g("SPREAD_THRESHOLD_PCT", 0.0015),
+            adaptive_twap_enabled=_g("ADAPTIVE_TWAP_ENABLED", True),
+            scan_interval_sec=_g("SCAN_INTERVAL_SEC", 120),
+            overnight_hold_enabled=_g("OVERNIGHT_HOLD_ENABLED", True),
+            overnight_max_positions=_g("OVERNIGHT_MAX_POSITIONS", 4),
+            cost_spread_bps=_g("COST_SPREAD_BPS", 1.0),
+            cost_slippage_bps=_g("COST_SLIPPAGE_BPS", 0.5),
+        ),
+        ops=OperationalSettings(
+            paper_mode=_g("PAPER_MODE", True),
+            telegram_enabled=_g("TELEGRAM_ENABLED", False),
+            web_dashboard_enabled=_g("WEB_DASHBOARD_ENABLED", True),
+            websocket_monitoring=_g("WEBSOCKET_MONITORING", True),
+            watchdog_enabled=_g("WATCHDOG_ENABLED", True),
+            reconciliation_enabled=_g("RECONCILIATION_ENABLED", True),
+            structured_logging_enabled=_g("STRUCTURED_LOGGING_ENABLED", True),
+            db_file=_g("DB_FILE", "bot.db"),
+            log_file=_g("LOG_FILE", "bot.log"),
+        ),
+    )
+
+
+_settings_cache: Settings | None = None
+_settings_cache_lock = _threading.Lock()
+
+
+def get_settings() -> Settings:
+    """T2-002: Return the structured settings object (cached, rebuilt on YAML reload).
+
+    Call this from new code that prefers grouped access over flat variables.
+    The underlying module-level variables remain the source of truth.
+    """
+    global _settings_cache
+    with _settings_cache_lock:
+        if _settings_cache is None:
+            _settings_cache = _build_settings()
+        return _settings_cache
+
+
+def invalidate_settings_cache():
+    """Force rebuild of the structured settings object (call after YAML reload)."""
+    global _settings_cache
+    with _settings_cache_lock:
+        _settings_cache = None
 
 
 def get_yaml_config() -> dict:
