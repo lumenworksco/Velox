@@ -911,9 +911,14 @@ def main():
         console.print("[cyan]Initializing Kalman pairs at startup (none active)...[/cyan]")
         try:
             kalman_pairs.select_pairs_weekly(startup_now)
-            console.print(f"[green]Kalman pairs ready: {len(kalman_pairs.active_pairs)} pairs[/green]")
+            if kalman_pairs.active_pairs:
+                console.print(f"[green]Kalman pairs ready: {len(kalman_pairs.active_pairs)} pairs[/green]")
+            else:
+                console.print("[yellow]Kalman pairs: no cointegrated pairs found — will retry at next weekly selection[/yellow]")
+                logger.warning("No cointegrated pairs found at startup — KalmanPairs strategy will be idle until pairs are found")
         except Exception as e:
             console.print(f"[yellow]Kalman pairs init failed: {e}[/yellow]")
+            logger.error(f"Kalman pairs init error: {e}", exc_info=True)
     else:
         # Load existing pairs from DB into memory
         try:

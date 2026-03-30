@@ -75,6 +75,9 @@ class SignalProcessorState:
     last_asset_status_refresh: float = 0.0
     last_successful_asset_refresh: float = 0.0
 
+    # Stop-loss re-entry cooldown: symbol -> cooldown_expiry_datetime
+    stopout_cooldowns: dict = _field(default_factory=dict)
+
 
 # Module-level singleton
 _state = SignalProcessorState()
@@ -160,6 +163,28 @@ def set_edgar_monitor(monitor) -> None:
     """Inject the EdgarMonitor instance from main.py."""
     global _edgar_monitor
     _edgar_monitor = monitor
+
+
+def register_stopout(symbol: str) -> None:
+    """Register a stop-loss event — blocks re-entry for REENTRY_COOLDOWN_MIN minutes."""
+    cooldown_min = getattr(config, "REENTRY_COOLDOWN_MIN", 15)
+    expiry = datetime.now() + timedelta(minutes=cooldown_min)
+    with _state.lock:
+        _state.stopout_cooldowns[symbol] = expiry
+    logger.info("Cooldown: %s blocked for re-entry until %s (%d min)",
+                symbol, expiry.strftime("%H:%M"), cooldown_min)
+
+
+def _is_in_cooldown(symbol: str, now: datetime) -> bool:
+    """Check if a symbol is in post-stop-loss cooldown."""
+    with _state.lock:
+        expiry = _state.stopout_cooldowns.get(symbol)
+        if expiry is None:
+            return False
+        if now >= expiry:
+            del _state.stopout_cooldowns[symbol]
+            return False
+        return True
 
 
 def cleanup_stale_vpin_instances(active_symbols: set[str] | None = None) -> int:
@@ -555,6 +580,22 @@ def _process_single_signal(
     if _is_symbol_halted(signal.symbol, now):
         skip_reason = "symbol_halted"
         logger.info(f"Signal skipped for {signal.symbol}: appears halted (zero volume)")
+        database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
+        return
+
+    # 1a2. Re-entry cooldown after stop-loss
+    if _is_in_cooldown(signal.symbol, now):
+        skip_reason = "stopout_cooldown"
+        logger.info(f"Signal skipped for {signal.symbol}: in post-stop cooldown")
+        database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
+        return
+
+    # 1a3. Per-symbol daily loss cap
+    max_symbol_loss = getattr(config, "MAX_SYMBOL_DAILY_LOSS", 200.0)
+    symbol_pnl = risk._symbol_daily_pnl.get(signal.symbol, 0.0)
+    if symbol_pnl <= -max_symbol_loss:
+        skip_reason = f"symbol_daily_loss_cap_{symbol_pnl:.0f}"
+        logger.info(f"Signal skipped for {signal.symbol}: daily loss ${symbol_pnl:.2f} exceeds cap -${max_symbol_loss}")
         database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
         return
 

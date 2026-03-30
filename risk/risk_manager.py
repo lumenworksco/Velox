@@ -129,6 +129,9 @@ class RiskManager:
     _strategy_weights: dict = field(default_factory=dict)  # V3: strategy -> weight
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
+    # Per-symbol daily P&L tracking
+    _symbol_daily_pnl: dict = field(default_factory=dict)  # symbol -> cumulative day pnl $
+
     def reset_daily(self, equity: float, cash: float):
         """Reset daily state. Preserves swing (multi-day) trades."""
         self.starting_equity = equity
@@ -138,6 +141,7 @@ class RiskManager:
         self.circuit_breaker_active = False
         self.closed_trades.clear()
         self.signals_today = 0
+        self._symbol_daily_pnl.clear()
 
         # Preserve swing trades, clear day trades
         day_trades = [s for s, t in self.open_trades.items() if t.hold_type == "day"]
@@ -186,6 +190,9 @@ class RiskManager:
         max_deploy = self.current_equity * config.MAX_PORTFOLIO_DEPLOY
         if deployed >= max_deploy:
             return False, f"Max portfolio deployment ({config.MAX_PORTFOLIO_DEPLOY:.0%}) reached"
+
+        # Per-symbol daily loss cap — block if we've already lost too much on this symbol today
+        # (checked per-symbol in _process_single_signal via symbol parameter)
 
         # WIRE-006: Factor exposure limit check (fail-open)
         try:
@@ -303,6 +310,10 @@ class RiskManager:
         pnl_pct = trade.pnl / (trade.entry_price * trade.qty) if trade.entry_price * trade.qty > 0 else 0
 
         self.closed_trades.append(trade)
+
+        # Track per-symbol daily P&L
+        self._symbol_daily_pnl[symbol] = self._symbol_daily_pnl.get(symbol, 0.0) + trade.pnl
+
         logger.info(
             f"Trade closed: {trade.symbol} ({trade.strategy}) "
             f"P&L=${trade.pnl:+.2f} ({pnl_pct:.1%}) reason={exit_reason}"

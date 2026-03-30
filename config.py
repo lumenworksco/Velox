@@ -21,7 +21,7 @@ if not os.getenv("TESTING") and not os.getenv("PYTEST_CURRENT_TEST"):
     if not API_SECRET:
         raise RuntimeError("ALPACA_API_SECRET environment variable is required")
 
-ALLOW_SHORT = os.getenv("ALLOW_SHORT", "false") == "true"
+ALLOW_SHORT = os.getenv("ALLOW_SHORT", "true") == "true"
 
 # MED-030: Removed BROKER_ABSTRACTION_ENABLED and PAPER_BROKER_SPREAD_BPS (dead code, never referenced)
 
@@ -163,15 +163,15 @@ MR_HALFLIFE_MAX_HOURS = 48
 MR_UNIVERSE_SIZE = 40
 MR_UNIVERSE_PREP_TIME = time(9, 0)
 MR_MIN_GAIN_PCT = 0.002
-MR_MIN_RR_RATIO = 1.5
+MR_MIN_RR_RATIO = 2.0              # Raised from 1.5 — only take trades with 2:1 R/R
 
 # --- VWAP Mean Reversion ---
 VWAP_OU_ZSCORE_MIN   = 1.0        # OU z-score confirmation for entries
-VWAP_MAX_SPREAD_PCT  = 0.001      # Skip if bid-ask spread > 0.1%
+VWAP_MAX_SPREAD_PCT  = 0.002      # Skip if bid-ask spread > 0.2% (was 0.1% — too restrictive)
 VWAP_VOLUME_RATIO    = 0.8        # Volume ratio vs 20-bar average
 MAX_INTRADAY_MOVE_PCT = 0.03      # Skip if stock moved > 3% today
 VWAP_BAND_STD        = 2.0        # Standard deviation multiplier for VWAP bands
-VWAP_RSI_OVERSOLD    = 40         # RSI below this = oversold (buy signal, was 30)
+VWAP_RSI_OVERSOLD    = 45         # RSI below this = oversold (buy signal, raised from 40)
 VWAP_RSI_OVERBOUGHT  = 70         # RSI above this = overbought (short signal)
 VWAP_CONFIRMATION_BARS = 1        # Bars confirming bounce (1 = disabled)
 VWAP_STOP_EXTENSION  = 0.5        # Stop extension beyond band (in std devs)
@@ -183,8 +183,8 @@ PAIRS_ZSCORE_EXIT = 0.2
 PAIRS_ZSCORE_STOP = 3.0
 PAIRS_MAX_HOLD_DAYS = 10
 PAIRS_MAX_ACTIVE = 15
-PAIRS_MIN_CORRELATION = 0.80
-PAIRS_COINT_PVALUE = 0.05
+PAIRS_MIN_CORRELATION = 0.70       # Lowered from 0.80 — find more pairs
+PAIRS_COINT_PVALUE = 0.10          # Relaxed from 0.05 — accept more pairs (still statistically meaningful)
 KALMAN_DELTA = 1e-4
 KALMAN_OBS_NOISE = 0.001
 PAIRS_TP_PCT = 0.015   # V10: 1.5% take-profit (was 0.5% — negative EV after costs)
@@ -197,15 +197,15 @@ ORB_MAX_GAP_PCT      = 0.04       # Skip if gap > 4%
 ORB_MAX_RANGE_PCT    = 0.035      # Skip if range > 3.5%
 ORB_MIN_STOP_PCT     = 0.008      # Minimum 0.8% stop distance (was 0.3%)
 ORB_SCAN_SYMBOLS     = 15         # Top N by morning volume
-ORB_ACTIVE_UNTIL     = time(11, 30)
+ORB_ACTIVE_UNTIL     = time(12, 30)   # Extended from 11:30 — more signal window
 ORB_BREAKOUT_BUFFER  = 0.001      # 0.1% confirmation buffer above/below ORB range
 ORB_TP_MULT          = 1.5        # Take profit = entry ± 1.5x ORB range
 ORB_SL_MULT          = 0.5        # Stop loss = entry ∓ 0.5x ORB range
 ORB_TIME_STOP_HOURS  = 2          # Close after 2 hours
 
 # --- Micro Momentum ---
-MICRO_SPY_VOL_SPIKE_MULT = 2.0     # Was 3.0 — detect more events
-MICRO_SPY_MIN_MOVE_PCT = 0.001     # Was 0.0015 — 0.1% SPY move triggers event
+MICRO_SPY_VOL_SPIKE_MULT = 1.5     # Was 2.0 — detect more micro-events
+MICRO_SPY_MIN_MOVE_PCT = 0.0008    # Was 0.001 — 0.08% SPY move triggers event
 MICRO_MAX_HOLD_MINUTES = 15          # Was 8 — give trades room to work
 MICRO_STOP_PCT = 0.01                # Was 0.003 — 1% stop survives noise on beta=2 stocks
 MICRO_TARGET_PCT = 0.02              # Was 0.006 — 2% target keeps 2:1 R/R
@@ -227,8 +227,8 @@ MICRO_BETA_TABLE = {
 
 # --- Post-Earnings Announcement Drift ---
 PEAD_ENABLED = True
-PEAD_MIN_SURPRISE_PCT = 5.0
-PEAD_MIN_VOLUME_RATIO = 2.0
+PEAD_MIN_SURPRISE_PCT = 3.0        # Lowered from 5.0 — capture more earnings plays
+PEAD_MIN_VOLUME_RATIO = 1.5       # Lowered from 2.0 — less restrictive volume gate
 PEAD_HOLD_DAYS_MIN = 10
 PEAD_HOLD_DAYS_MAX = 20
 PEAD_TAKE_PROFIT = 0.05
@@ -287,12 +287,12 @@ PDT_ENFORCEMENT_ENABLED = os.getenv("PDT_ENFORCEMENT", "true") == "true"
 PDT_EQUITY_THRESHOLD = 25_000.0
 
 # --- Position Sizing ---
-RISK_PER_TRADE_PCT = 0.008          # Risk 0.8% of portfolio per trade
-MAX_POSITION_PCT = 0.08             # Hard cap: max 8% per position
+RISK_PER_TRADE_PCT = 0.005          # Risk 0.5% of portfolio per trade (was 0.8% — tighter)
+MAX_POSITION_PCT = 0.05             # Hard cap: max 5% per position (was 8% — tighter)
 MIN_POSITION_VALUE = 100            # Min $100 per trade
 MAX_POSITIONS = 12
 MAX_PORTFOLIO_DEPLOY = 0.55
-DAILY_LOSS_HALT = -0.04
+DAILY_LOSS_HALT = -0.025
 
 # --- Volatility Targeting ---
 VOL_TARGET_DAILY = 0.01
@@ -315,6 +315,12 @@ BAYESIAN_KELLY_ENABLED = False          # Enable regime-weighted Kelly fractions
 PNL_GAIN_LOCK_PCT = 0.015
 PNL_LOSS_HALT_PCT = -0.010
 PNL_GAIN_LOCK_SIZE_MULT = 0.30
+
+# --- Re-entry Cooldown ---
+REENTRY_COOLDOWN_MIN = 15          # Block re-entry for 15 min after stop-loss
+
+# --- Per-Symbol Daily Loss Cap ---
+MAX_SYMBOL_DAILY_LOSS = 200.0      # Max $200 loss per symbol per day
 
 # --- VIX Scaling ---
 VIX_RISK_SCALING_ENABLED = True

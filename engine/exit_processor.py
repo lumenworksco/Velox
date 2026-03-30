@@ -90,6 +90,14 @@ def handle_strategy_exits(exit_actions: list[dict], risk: RiskManager, now: date
 
             pnl = (exit_price - trade.entry_price) * trade.qty * (1 if trade.side == "buy" else -1)
             risk.close_trade(symbol, exit_price, now, exit_reason=reason)
+
+            # Register cooldown if this was a stop-loss exit
+            if "stop" in reason.lower():
+                try:
+                    from engine.signal_processor import register_stopout
+                    register_stopout(symbol)
+                except Exception:
+                    pass
             _emit_event(EventTypes.POSITION_CLOSED if _EVENTS_AVAILABLE else "position.closed", {
                 "symbol": symbol, "strategy": trade.strategy, "side": trade.side,
                 "entry_price": trade.entry_price, "exit_price": exit_price,

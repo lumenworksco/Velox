@@ -294,6 +294,7 @@ class TestCheckExits:
         trade = SimpleNamespace(
             strategy="STAT_MR", side="buy",
             entry_time=datetime(2026, 3, 13, 10, 0, tzinfo=ET),
+            stop_loss=102.0,  # Last close ~101.01 will be <= 102 → triggers stop
         )
 
         now = datetime(2026, 3, 13, 10, 30, tzinfo=ET)
@@ -320,6 +321,7 @@ class TestCheckExits:
         trade = SimpleNamespace(
             strategy="STAT_MR", side="sell",
             entry_time=datetime(2026, 3, 13, 10, 0, tzinfo=ET),
+            stop_loss=399.0,  # Price ~400 will be >= 399 → triggers stop
         )
 
         now = datetime(2026, 3, 13, 10, 30, tzinfo=ET)
