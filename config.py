@@ -164,6 +164,7 @@ MR_UNIVERSE_SIZE = 40
 MR_UNIVERSE_PREP_TIME = time(9, 0)
 MR_MIN_GAIN_PCT = 0.002
 MR_MIN_RR_RATIO = 2.0              # Raised from 1.5 — only take trades with 2:1 R/R
+MR_MIN_STOP_PCT = 0.005            # Minimum stop distance = 0.5% of price (prevents breakeven stops)
 
 # --- VWAP Mean Reversion ---
 VWAP_OU_ZSCORE_MIN   = 1.0        # OU z-score confirmation for entries
@@ -317,7 +318,7 @@ PNL_LOSS_HALT_PCT = -0.010
 PNL_GAIN_LOCK_SIZE_MULT = 0.30
 
 # --- Re-entry Cooldown ---
-REENTRY_COOLDOWN_MIN = 15          # Block re-entry for 15 min after stop-loss
+REENTRY_COOLDOWN_MIN = 30          # Block re-entry for 30 min after stop-loss (was 15 — too short)
 
 # --- Per-Symbol Daily Loss Cap ---
 MAX_SYMBOL_DAILY_LOSS = 200.0      # Max $200 loss per symbol per day

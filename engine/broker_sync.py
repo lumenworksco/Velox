@@ -71,6 +71,15 @@ def sync_positions_with_broker(risk: RiskManager, now: datetime, ws_monitor=None
             logger.info(f"Position {symbol} confirmed gone from broker — {broker_reason} at ${exit_price:.2f} (entry ${trade.entry_price:.2f})")
             _broker_miss_counts.pop(symbol, None)
 
+            # BUG-022: Register cooldown when bracket stop fires at broker
+            # Without this, the bot immediately re-enters the same symbol
+            if broker_reason and "stop" in broker_reason.lower():
+                try:
+                    from engine.signal_processor import register_stopout
+                    register_stopout(symbol)
+                except Exception:
+                    pass
+
             if ws_monitor:
                 ws_monitor.unsubscribe(symbol)
             if notif and config.TELEGRAM_ENABLED:

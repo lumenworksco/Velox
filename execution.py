@@ -223,7 +223,7 @@ def submit_bracket_order(signal: Signal, qty: int) -> str | list[str] | None:
     """
     # Auto-route large mean-reversion orders to TWAP
     order_value = qty * signal.entry_price
-    if order_value > 2000 and signal.strategy in ("STAT_MR", "KALMAN_PAIRS"):
+    if order_value > 25000 and signal.strategy in ("STAT_MR", "KALMAN_PAIRS"):
         return submit_twap_order(signal, qty)
 
     client = get_trading_client()

@@ -179,6 +179,15 @@ class StatMeanReversion:
 
                 zscore = compute_zscore(price, mu, sigma)
 
+                # BUG-021: OU sigma is std of price CHANGES (residuals), which is
+                # tiny on 2-min bars (~$0.05 for a $100 stock). Using it for
+                # stop/target distances produces stops <$0.15 from entry — normal
+                # tick noise triggers them instantly, causing rapid churning.
+                # Use rolling std of price LEVELS for meaningful stop distances.
+                price_sigma = float(close.iloc[:-1].std()) if len(close) > 2 else sigma
+                if price_sigma < 1e-8:
+                    price_sigma = sigma
+
                 # RSI(7) computation
                 rsi = self._compute_rsi(close, period=config.MR_RSI_PERIOD)
                 if rsi is None:
@@ -197,14 +206,20 @@ class StatMeanReversion:
                         and price < vwap):
 
                     # Target: revert to z=MR_ZSCORE_EXIT_FULL (near mean)
-                    target_price = mu + config.MR_ZSCORE_EXIT_FULL * sigma
+                    # BUG-021: Use price_sigma (rolling std of levels) not OU sigma
+                    # (std of changes) for meaningful stop/target distances
+                    target_price = mu + config.MR_ZSCORE_EXIT_FULL * price_sigma
                     expected_gain_pct = (target_price - price) / price
 
                     if expected_gain_pct < config.MR_MIN_GAIN_PCT:
                         continue
 
-                    # Stop at z = MR_ZSCORE_STOP
-                    stop_price = mu - config.MR_ZSCORE_STOP * sigma
+                    # Stop at z = MR_ZSCORE_STOP (using price_sigma)
+                    stop_price = mu - config.MR_ZSCORE_STOP * price_sigma
+                    # Enforce minimum stop distance (0.5% of price)
+                    min_stop_dist = price * getattr(config, 'MR_MIN_STOP_PCT', 0.005)
+                    if price - stop_price < min_stop_dist:
+                        stop_price = price - min_stop_dist
                     stop_dist = price - stop_price
                     gain_dist = target_price - price
 
@@ -230,13 +245,18 @@ class StatMeanReversion:
                       and config.ALLOW_SHORT
                       and symbol not in config.NO_SHORT_SYMBOLS):
 
-                    target_price = mu - config.MR_ZSCORE_EXIT_FULL * sigma
+                    # BUG-021: Use price_sigma for meaningful distances
+                    target_price = mu - config.MR_ZSCORE_EXIT_FULL * price_sigma
                     expected_gain_pct = (price - target_price) / price
 
                     if expected_gain_pct < config.MR_MIN_GAIN_PCT:
                         continue
 
-                    stop_price = mu + config.MR_ZSCORE_STOP * sigma
+                    stop_price = mu + config.MR_ZSCORE_STOP * price_sigma
+                    # Enforce minimum stop distance (0.5% of price)
+                    min_stop_dist = price * getattr(config, 'MR_MIN_STOP_PCT', 0.005)
+                    if stop_price - price < min_stop_dist:
+                        stop_price = price + min_stop_dist
                     stop_dist = stop_price - price
                     gain_dist = price - target_price
 

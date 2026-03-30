@@ -244,8 +244,8 @@ class TestV6StrategyRouting:
                 entry_price=150.0, take_profit=155.0, stop_loss=148.0,
                 reason="large order test",
             )
-            # qty=50 * $150 = $7500 > $2000 threshold
-            result = submit_bracket_order(signal, qty=50)
+            # qty=200 * $150 = $30000 > $25000 threshold
+            result = submit_bracket_order(signal, qty=200)
 
             assert isinstance(result, list)
             assert len(result) == 5  # default 5 slices
@@ -261,7 +261,7 @@ class TestV6StrategyRouting:
                 entry_price=100.0, take_profit=110.0, stop_loss=95.0,
                 reason="small order test",
             )
-            # qty=2 * $100 = $200 < $2000 threshold (but above $100 min notional)
+            # qty=2 * $100 = $200 < $25000 threshold (but above $100 min notional)
             result = submit_bracket_order(signal, qty=2)
 
             assert isinstance(result, str)
