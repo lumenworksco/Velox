@@ -112,8 +112,10 @@ class VolatilityTargetingRiskEngine:
         # 1. Base risk per trade (Kelly or flat)
         if self._kelly_engine is not None:
             risk_pct = self._kelly_engine.get_fraction(strategy)
+            sizing_path = "kelly"
         else:
             risk_pct = config.RISK_PER_TRADE_PCT
+            sizing_path = "flat"
         risk_dollars = equity * risk_pct
 
         # 2. Risk per share (distance to stop)
@@ -162,7 +164,15 @@ class VolatilityTargetingRiskEngine:
             return 0
 
         qty = int(safe_divide(position_value, entry_price, default=0.0))
-        return max(qty, 0)
+        qty = max(qty, 0)
+
+        # V11.3 T13: Log sizing path for diagnostics
+        logger.debug(
+            f"VolTarget sizing: {strategy} → {sizing_path} risk_pct={risk_pct:.4f} "
+            f"vol_scalar={vol_scalar:.2f} pnl_lock={pnl_lock_mult:.2f} "
+            f"alloc={allocation:.3f} → qty={qty} (${qty * entry_price:.0f})"
+        )
+        return qty
 
     @property
     def last_scalar(self) -> float:

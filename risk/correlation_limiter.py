@@ -20,8 +20,9 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# MED-037: Cache TTL for correlation matrix computation (seconds)
-_CORR_MATRIX_CACHE_TTL = 300  # 5 minutes
+# MED-037 + V11.3 T14: Cache TTL for correlation matrix computation (seconds)
+# V11.3: Increased from 5 min to 30 min — correlations don't change fast
+_CORR_MATRIX_CACHE_TTL = 1800  # 30 minutes
 
 
 @dataclass
@@ -61,6 +62,10 @@ class CorrelationLimiter:
         self._matrix_cache_key: tuple | None = None  # frozenset of symbols
         self._matrix_cache_result: np.ndarray | None = None
         self._matrix_cache_time: float = 0.0
+
+        # V11.3 T14: Store last valid matrix as fallback (instead of identity)
+        self._last_good_matrix: np.ndarray | None = None
+        self._last_good_matrix_key: tuple | None = None
 
     def set_sector_map(self, sector_map: dict[str, str]):
         """Set the symbol-to-sector mapping (thread-safe)."""
@@ -112,6 +117,9 @@ class CorrelationLimiter:
             self._matrix_cache_key = cache_key
             self._matrix_cache_result = corr_matrix
             self._matrix_cache_time = now
+            # V11.3 T14: Save as last known good matrix
+            self._last_good_matrix = corr_matrix.copy()
+            self._last_good_matrix_key = cache_key
 
         # 1. Max pairwise correlation check
         # Only check correlations involving the NEW symbol
@@ -184,8 +192,8 @@ class CorrelationLimiter:
             too_concentrated=False,
         )
 
-    @staticmethod
     def _build_corr_matrix(
+        self,
         all_symbols: list[str],
         corr_source: dict[tuple[str, str], float],
         n: int,
@@ -220,8 +228,13 @@ class CorrelationLimiter:
             # Simple shrinkage: proportional to how noisy the off-diag is
             # relative to the number of observations (use n as proxy)
             frobenius_sq = float(np.sum(off_diag ** 2))
-            # Shrinkage intensity: higher for smaller portfolios (less data)
-            alpha = min(1.0, max(0.0, 1.0 / (n + 1)))
+            # V11.3 T14: Improved shrinkage intensity based on Ledoit-Wolf
+            # Use ratio of off-diagonal Frobenius norm to total matrix size
+            # Higher shrinkage for noisier estimates (more off-diag elements)
+            n_off_diag = n * (n - 1) if n > 1 else 1
+            avg_off_diag_sq = frobenius_sq / n_off_diag if n_off_diag > 0 else 0.0
+            # Shrinkage scales with noise level, bounded [0.05, 0.5]
+            alpha = min(0.5, max(0.05, avg_off_diag_sq / (avg_off_diag_sq + 1.0)))
             shrunk = alpha * target + (1.0 - alpha) * raw
 
             # Verify positive semi-definiteness
@@ -240,6 +253,13 @@ class CorrelationLimiter:
             return shrunk
 
         except (np.linalg.LinAlgError, ValueError) as e:
+            # V11.3 T14: Use last valid matrix instead of identity when available
+            if (self._last_good_matrix is not None
+                    and self._last_good_matrix.shape[0] == n):
+                logger.warning(
+                    "Correlation matrix shrinkage failed (%s), using last valid matrix", e
+                )
+                return self._last_good_matrix
             logger.warning(
                 "Correlation matrix shrinkage failed (%s), falling back to identity", e
             )

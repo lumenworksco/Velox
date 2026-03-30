@@ -83,24 +83,64 @@ class SignalProcessorState:
 _state = SignalProcessorState()
 
 
-# WIRE-002: ML model integration (fail-open)
+# WIRE-002 + V11.3 T9: ML model integration via BatchInferenceEngine (fail-open)
+_ml_inference_engine = None
+_ml_inference_attempted = False
+
+
 def _get_ml_model():
-    """Lazy-load the most recent trained ML model (singleton, fail-open)."""
+    """Lazy-load the most recent trained ML model (singleton, fail-open).
+
+    V11.3 T9: Tries BatchInferenceEngine first (joblib models), then falls
+    back to the legacy ModelTrainer.load_model path.
+    """
+    global _ml_inference_engine, _ml_inference_attempted
+
     if _state.ml_model_load_attempted:
         return _state.ml_model
     with _state.lock:
         if _state.ml_model_load_attempted:
             return _state.ml_model
         _state.ml_model_load_attempted = True
+
+        # V11.3 T9: Try BatchInferenceEngine with joblib models first
         try:
             import glob
             import os
-            from ml.training import ModelTrainer
             model_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
-            model_files = sorted(glob.glob(os.path.join(model_dir, "model_*.pkl")))
-            if model_files:
-                _state.ml_model = ModelTrainer.load_model(model_files[-1])
-                logger.info("WIRE-002: ML model loaded: %s", model_files[-1])
+
+            # Look for joblib models first, then pkl
+            joblib_files = sorted(glob.glob(os.path.join(model_dir, "*.joblib")))
+            pkl_files = sorted(glob.glob(os.path.join(model_dir, "model_*.pkl")))
+
+            model_path = None
+            if joblib_files:
+                model_path = joblib_files[-1]
+            elif pkl_files:
+                model_path = pkl_files[-1]
+
+            if model_path:
+                try:
+                    from ml.inference import BatchInferenceEngine
+                    _ml_inference_engine = BatchInferenceEngine(model_path=model_path)
+                    if _ml_inference_engine.is_loaded:
+                        # Use the BatchInferenceEngine's internal model
+                        _state.ml_model = _ml_inference_engine
+                        logger.info("V11.3 T9: BatchInferenceEngine loaded: %s", model_path)
+                    else:
+                        logger.info("V11.3 T9: BatchInferenceEngine failed to load model, trying legacy")
+                        _ml_inference_engine = None
+                except ImportError:
+                    logger.debug("V11.3 T9: BatchInferenceEngine not available, trying legacy")
+
+                # Legacy fallback
+                if _state.ml_model is None and pkl_files:
+                    try:
+                        from ml.training import ModelTrainer
+                        _state.ml_model = ModelTrainer.load_model(pkl_files[-1])
+                        logger.info("WIRE-002: ML model loaded (legacy): %s", pkl_files[-1])
+                    except Exception as e:
+                        logger.info("WIRE-002: Legacy ML model load failed: %s", e)
             else:
                 logger.info("WIRE-002: No trained ML model found in %s", model_dir)
         except Exception as e:
@@ -149,6 +189,43 @@ try:
     _ALPHA_AGENTS_AVAILABLE = True
 except ImportError:
     _ALPHA_AGENTS_AVAILABLE = False
+
+# V11.3 T8: Data quality gate (fail-open)
+_DATA_QUALITY_AVAILABLE = False
+_data_quality_framework = None
+try:
+    from data.quality import DataQualityFramework
+    _DATA_QUALITY_AVAILABLE = True
+except ImportError:
+    pass
+
+
+def _check_data_quality(symbol: str, now) -> float | None:
+    """Quick data quality check — returns score 0.0-1.0 or None if unavailable."""
+    global _data_quality_framework
+    if not _DATA_QUALITY_AVAILABLE:
+        return None
+    try:
+        if _data_quality_framework is None:
+            _data_quality_framework = DataQualityFramework()
+        from data import get_snapshot
+        snap = get_snapshot(symbol)
+        if snap and snap.latest_trade:
+            # Check staleness: how old is the last trade?
+            trade_time = getattr(snap.latest_trade, 'timestamp', None)
+            if trade_time:
+                from datetime import timezone
+                if hasattr(trade_time, 'tzinfo') and trade_time.tzinfo:
+                    age_sec = (now.astimezone(timezone.utc) - trade_time.astimezone(timezone.utc)).total_seconds()
+                else:
+                    age_sec = 0
+                if age_sec > 300:  # > 5 min old
+                    return max(0.0, 1.0 - (age_sec / 600))  # Linear decay, 0 at 10 min
+            return 1.0
+        return 0.3  # No snapshot → low quality
+    except Exception:
+        return None
+
 
 # T7-003: EDGAR 8-K monitor integration (fail-open)
 _edgar_monitor = None
@@ -644,6 +721,23 @@ def _process_single_signal(
         database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
         return
 
+    # 2b. V11.3 T8: Data quality gate — skip signals on stale/low-quality data
+    _data_quality_mult = 1.0
+    if _DATA_QUALITY_AVAILABLE:
+        try:
+            dq_score = _check_data_quality(signal.symbol, now)
+            if dq_score is not None:
+                if dq_score < 0.5:
+                    skip_reason = f"low_data_quality_{dq_score:.2f}"
+                    logger.info(f"Signal skipped for {signal.symbol}: data quality {dq_score:.2f} < 0.5")
+                    database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
+                    return
+                elif dq_score < 0.8:
+                    # Reduce position size proportionally
+                    _data_quality_mult = dq_score / 0.8
+        except Exception:
+            pass  # Fail-open
+
     # 3. Correlation filter (skip for pairs — inherently correlated)
     if signal.strategy != "KALMAN_PAIRS":
         open_symbols = list(risk.open_trades.keys())
@@ -791,23 +885,52 @@ def _process_single_signal(
         except Exception as e:
             logger.debug("WIRE-001: Feature store lookup failed for %s (fail-open): %s", signal.symbol, e)
 
-    # WIRE-002: ML model confidence multiplier (fail-open)
+    # WIRE-002 + V11.3 T9: ML model confidence multiplier (fail-open)
+    # Uses BatchInferenceEngine when available, falls back to legacy model.predict()
     ml_conf_mult = 1.0
-    if _signal_features:
-        try:
-            model = _get_ml_model()
-            if model is not None:
-                import pandas as _pd
+    try:
+        model = _get_ml_model()
+        if model is not None:
+            import pandas as _pd
+            confidence = 0.5  # neutral default
+
+            # V11.3 T9: Use BatchInferenceEngine if available
+            if _ml_inference_engine is not None and _ml_inference_engine.is_loaded:
+                if _signal_features:
+                    feat_series = _pd.Series(_signal_features)
+                    confidence = _ml_inference_engine.predict_single(signal.symbol, feat_series)
+                else:
+                    # Even without feature store, try with basic features
+                    basic_features = {
+                        "price": signal.entry_price,
+                        "side": 1.0 if signal.side == "buy" else -1.0,
+                        "strategy": hash(signal.strategy) % 100 / 100.0,
+                    }
+                    feat_series = _pd.Series(basic_features)
+                    confidence = _ml_inference_engine.predict_single(signal.symbol, feat_series)
+            elif _signal_features:
+                # Legacy path: direct model.predict()
                 feat_df = _pd.DataFrame([_signal_features])
                 prediction = model.predict(feat_df)
-                # prediction is array; use first element as confidence (0-1 for classification)
                 confidence = float(prediction[0]) if len(prediction) > 0 else 0.5
-                # Scale: confidence 0.5 = neutral (1.0x), 1.0 = high (1.3x), 0.0 = low (0.7x)
-                ml_conf_mult = 0.7 + 0.6 * confidence
-                ml_conf_mult = max(0.5, min(ml_conf_mult, 1.5))
-        except Exception as e:
-            logger.debug("WIRE-002: ML prediction failed for %s (fail-open): %s", signal.symbol, e)
-            ml_conf_mult = 1.0
+
+            # V11.3 T9: ML confidence gating
+            # < 0.35 → skip signal (strong ML disagreement)
+            # 0.35-0.65 → neutral (no adjustment)
+            # > 0.65 → boost conviction 10-20%
+            if confidence < 0.35:
+                logger.info(
+                    f"V11.3 T9: ML rejects {signal.symbol} — confidence={confidence:.2f} < 0.35"
+                )
+                return None
+            elif confidence > 0.65:
+                ml_conf_mult = 1.0 + (confidence - 0.65) * 0.57  # Maps 0.65→1.0, 1.0→1.2
+                ml_conf_mult = min(ml_conf_mult, 1.2)
+            else:
+                ml_conf_mult = 1.0  # Neutral zone
+    except Exception as e:
+        logger.debug("WIRE-002: ML prediction failed for %s (fail-open): %s", signal.symbol, e)
+        ml_conf_mult = 1.0
 
     # WIRE-003 + T5-007: VPIN toxicity-adjusted position sizing (fail-open)
     # T5-007: toxicity_multiplier = max(0.3, 1.0 - 2.0 * (vpin - 0.25)) for vpin in [0.25, 0.60]
@@ -888,11 +1011,44 @@ def _process_single_signal(
         except Exception as e:
             logger.debug("T7-003: EDGAR check failed for %s (fail-open): %s", signal.symbol, e)
 
-    # Apply all multipliers
-    # CRIT-008: Cap combined multipliers to prevent position size overflow (3x+ leverage)
-    combined_mult = news_mult * llm_mult * regime_mult * seasonality_mult * cross_asset_mult * var_mult * ml_conf_mult * vpin_mult * finbert_mult * lead_lag_mult * alpha_agent_mult * edgar_mult
-    combined_mult = min(combined_mult, 2.0)  # Hard cap at 2x base size
+    # V11.3 T1: Conviction scoring — weighted average instead of multiplicative cascade.
+    # The old multiplicative approach (12 factors multiplied) caused catastrophic size
+    # reduction: three factors at 0.8 → 0.51 combined. Now we use weighted averaging
+    # with hard vetoes only for critical signals (news=0, VPIN extreme, FinBERT=0).
+    #
+    # Hard vetoes (already handled above with early returns):
+    #   - news_mult == 0.0 → already returned
+    #   - finbert_mult == 0.0 → already returned
+    #   - LLM score below threshold → already returned
+    #
+    # Soft multipliers → conviction score via weighted average:
+    _conviction_inputs = [
+        (regime_mult,       0.20, "regime"),        # Market regime alignment
+        (vpin_mult,         0.20, "vpin"),           # Market microstructure toxicity
+        (ml_conf_mult,      0.15, "ml"),             # ML model confidence
+        (cross_asset_mult,  0.10, "cross_asset"),    # Cross-asset signal
+        (llm_mult,          0.10, "llm"),            # LLM scoring
+        (seasonality_mult,  0.08, "seasonality"),    # Time-of-day effects
+        (lead_lag_mult,     0.07, "lead_lag"),        # Lead-lag relationships
+        (edgar_mult,        0.05, "edgar"),           # SEC filing bias
+        (alpha_agent_mult,  0.05, "alpha_agent"),     # Alpha orchestrator
+    ]
+    # var_mult and news_mult applied directly (risk budget and hard veto respectively)
+    weighted_sum = sum(mult * weight for mult, weight, _ in _conviction_inputs)
+    total_weight = sum(weight for _, weight, _ in _conviction_inputs)
+    conviction_score = weighted_sum / total_weight if total_weight > 0 else 1.0
+
+    # Apply VaR budget as a direct multiplier (risk management, not conviction)
+    # and news_mult (already filtered for 0.0, so always 1.0 here)
+    # T8: data quality multiplier reduces size on stale data
+    combined_mult = conviction_score * var_mult * news_mult * _data_quality_mult
+    # Bound to [0.4, 1.5] — prevents both over-sizing and excessive reduction
+    combined_mult = max(0.4, min(combined_mult, 1.5))
     qty = int(qty * combined_mult)
+    logger.debug(
+        "V11.3 conviction: %s conviction=%.2f var=%.2f → combined=%.2f qty=%d",
+        signal.symbol, conviction_score, var_mult, combined_mult, qty,
+    )
 
     if qty <= 0:
         skip_reason = "position_size_zero"

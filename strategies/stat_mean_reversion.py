@@ -333,23 +333,32 @@ class StatMeanReversion:
 
                 if trade.side == "buy":
                     # Long: entered at negative z-score, want z to revert toward 0 and beyond
-                    if -config.MR_ZSCORE_EXIT_FULL <= zscore <= config.MR_ZSCORE_EXIT_FULL:
-                        exits.append({
-                            "symbol": symbol,
-                            "action": "full",
-                            "reason": f"MR reverted z={zscore:.2f}",
-                        })
-                    elif zscore >= config.MR_ZSCORE_EXIT_PARTIAL:
-                        # V10: partial when z crosses ABOVE +partial threshold (mean overshoot)
+                    # V11.3 T11: Scaled exits to capture mean-reversion overshoot
+                    if zscore >= config.MR_ZSCORE_EXIT_PARTIAL:
+                        # z overshot past mean — take partial, set trailing stop
                         exits.append({
                             "symbol": symbol,
                             "action": "partial",
-                            "reason": f"MR partial revert z={zscore:.2f}",
+                            "reason": f"MR overshoot partial z={zscore:.2f}",
                         })
+                        # Set trailing stop at 0.3% below current price to capture rest
+                        if hasattr(trade, 'stop_loss'):
+                            trail_stop = price * 0.997
+                            if trade.stop_loss < trail_stop:
+                                trade.stop_loss = trail_stop
+                    elif -config.MR_ZSCORE_EXIT_FULL <= zscore <= config.MR_ZSCORE_EXIT_FULL:
+                        # V11.3: Changed from "full" to "partial" — take 50%, let rest ride
+                        # The mean-reversion often overshoots past the mean
+                        exits.append({
+                            "symbol": symbol,
+                            "action": "partial",
+                            "reason": f"MR reverted z={zscore:.2f}",
+                        })
+                        # Move stop to breakeven for remaining position
+                        if hasattr(trade, 'stop_loss') and hasattr(trade, 'entry_price'):
+                            if trade.stop_loss < trade.entry_price:
+                                trade.stop_loss = trade.entry_price
                     elif hasattr(trade, 'stop_loss') and trade.stop_loss and price <= trade.stop_loss:
-                        # Use the stop price stored at entry (calculated with intraday OU params)
-                        # rather than recomputing z-score with daily OU params which uses a
-                        # different sigma — this mismatch was causing stops to fire at z=-6+ instead of -2.5
                         exits.append({
                             "symbol": symbol,
                             "action": "full",
@@ -358,19 +367,25 @@ class StatMeanReversion:
 
                 elif trade.side == "sell":
                     # Short: entered at positive z-score, want z to revert toward 0 and beyond
-                    if -config.MR_ZSCORE_EXIT_FULL <= zscore <= config.MR_ZSCORE_EXIT_FULL:
-                        exits.append({
-                            "symbol": symbol,
-                            "action": "full",
-                            "reason": f"MR reverted z={zscore:.2f}",
-                        })
-                    elif zscore <= -config.MR_ZSCORE_EXIT_PARTIAL:
-                        # V10: partial when z crosses BELOW -partial threshold (mean overshoot)
+                    if zscore <= -config.MR_ZSCORE_EXIT_PARTIAL:
                         exits.append({
                             "symbol": symbol,
                             "action": "partial",
-                            "reason": f"MR partial revert z={zscore:.2f}",
+                            "reason": f"MR overshoot partial z={zscore:.2f}",
                         })
+                        if hasattr(trade, 'stop_loss'):
+                            trail_stop = price * 1.003
+                            if trade.stop_loss > trail_stop:
+                                trade.stop_loss = trail_stop
+                    elif -config.MR_ZSCORE_EXIT_FULL <= zscore <= config.MR_ZSCORE_EXIT_FULL:
+                        exits.append({
+                            "symbol": symbol,
+                            "action": "partial",
+                            "reason": f"MR reverted z={zscore:.2f}",
+                        })
+                        if hasattr(trade, 'stop_loss') and hasattr(trade, 'entry_price'):
+                            if trade.stop_loss > trade.entry_price:
+                                trade.stop_loss = trade.entry_price
                     elif hasattr(trade, 'stop_loss') and trade.stop_loss and price >= trade.stop_loss:
                         exits.append({
                             "symbol": symbol,

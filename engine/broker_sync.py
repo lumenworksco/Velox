@@ -13,8 +13,20 @@ logger = logging.getLogger(__name__)
 # Track consecutive misses before closing (prevents false closes from transient API issues)
 _broker_miss_counts: dict[str, int] = {}
 
-# Lazy-loaded optional module
+# Lazy-loaded optional modules
 _notifications = None
+_intraday_controls = None
+_intraday_controls_checked = False
+
+
+def set_intraday_controls(controls) -> None:
+    """Set the shared IntradayRiskControls instance (called from main.py)."""
+    global _intraday_controls
+    _intraday_controls = controls
+
+
+def _get_intraday_controls():
+    return _intraday_controls
 
 
 def _get_notifications():
@@ -56,29 +68,63 @@ def sync_positions_with_broker(risk: RiskManager, now: datetime, ws_monitor=None
             exit_price, broker_reason = get_filled_exit_info(symbol, side=trade.side)
             if exit_price is None:
                 broker_reason = "broker_sync"
+                # V11.3 T7: Improved fallback chain for exit price
+                # 1. Try snapshot (real-time)
+                exit_price_found = False
                 try:
                     snap = get_snapshot(symbol)
                     if snap and snap.latest_trade:
                         exit_price = float(snap.latest_trade.price)
-                    else:
-                        logger.warning(f"No snapshot available for {symbol} — using entry_price as last resort")
-                        exit_price = trade.entry_price
+                        exit_price_found = True
                 except Exception:
-                    logger.warning(f"Snapshot fetch failed for {symbol} — using entry_price as last resort")
+                    pass
+
+                # 2. Try bar cache (last known close)
+                if not exit_price_found:
+                    try:
+                        from data import get_intraday_bars
+                        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+                        bars = get_intraday_bars(symbol, TimeFrame(1, TimeFrameUnit.Minute),
+                                                  start=now - timedelta(minutes=10), end=now)
+                        if bars is not None and not bars.empty:
+                            exit_price = float(bars["close"].iloc[-1])
+                            exit_price_found = True
+                            logger.info(f"V11.3: Using bar cache close for {symbol} exit: ${exit_price:.2f}")
+                    except Exception:
+                        pass
+
+                # 3. Last resort: entry_price (log as CRITICAL for reconciliation)
+                if not exit_price_found:
                     exit_price = trade.entry_price
+                    logger.critical(
+                        f"V11.3 T7: CRITICAL — using entry_price as exit for {symbol}. "
+                        f"Real exit price unknown. Manual reconciliation needed."
+                    )
 
             risk.close_trade(symbol, exit_price, now, exit_reason=broker_reason)
             logger.info(f"Position {symbol} confirmed gone from broker — {broker_reason} at ${exit_price:.2f} (entry ${trade.entry_price:.2f})")
             _broker_miss_counts.pop(symbol, None)
 
             # BUG-022: Register cooldown when bracket stop fires at broker
-            # Without this, the bot immediately re-enters the same symbol
             if broker_reason and "stop" in broker_reason.lower():
                 try:
                     from engine.signal_processor import register_stopout
                     register_stopout(symbol)
                 except Exception:
                     pass
+
+            # V11.3 T2: Feed intraday risk controls with P&L data
+            try:
+                from risk.intraday_controls import IntradayRiskControls
+                _irc = _get_intraday_controls()
+                if _irc is not None:
+                    pnl = (exit_price - trade.entry_price) * trade.qty * (1 if trade.side == "buy" else -1)
+                    pnl_pct = pnl / max(risk.current_equity, 1)
+                    is_stop = broker_reason and "stop" in broker_reason.lower()
+                    _irc.record_pnl(pnl_pct, is_stop_loss=is_stop,
+                                    is_loss=(pnl < 0), is_win=(pnl > 0), now=now)
+            except Exception:
+                pass
 
             if ws_monitor:
                 ws_monitor.unsubscribe(symbol)

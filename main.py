@@ -755,6 +755,20 @@ def main():
     ws_monitor = initialize_websocket(risk)
     initialize_dashboard(order_manager, kill_switch, tiered_cb)
 
+    # V11.3 T2: Initialize intraday risk controls (velocity + rolling P&L limits)
+    intraday_controls = None
+    if IntradayRiskControls:
+        try:
+            intraday_controls = IntradayRiskControls()
+            # Share instance with broker_sync and exit_processor
+            from engine.broker_sync import set_intraday_controls as _set_irc_broker
+            _set_irc_broker(intraday_controls)
+            from engine.exit_processor import set_intraday_controls as _set_irc_exit
+            _set_irc_exit(intraday_controls)
+            logger.info("V11.3: Intraday risk controls initialized (5m/30m/1h windows + velocity)")
+        except Exception as e:
+            logger.warning(f"V11.3: Intraday risk controls init failed (non-fatal): {e}")
+
     # Load filters
     try:
         load_earnings_cache(config.SYMBOLS)
@@ -973,6 +987,9 @@ def main():
                         overnight_manager=overnight_manager, news_sentiment=news_sentiment,
                         llm_scorer=llm_scorer, tiered_cb=tiered_cb,
                     )
+                    # V11.3 T2: Reset intraday controls for new day
+                    if intraday_controls:
+                        intraday_controls.reset_daily()
                     universe_prepared_today = False
                     last_day = current.date()
                     eod_summary_printed = False
@@ -1108,7 +1125,12 @@ def main():
                             day_pnl_pct=day_pnl_pct,
                         )
 
-                        # 4. Process signals
+                        # 4. Process signals (with intraday risk control gate)
+                        if signals and intraday_controls:
+                            allowed, irc_reason = intraday_controls.should_allow_trade(current)
+                            if not allowed:
+                                logger.warning(f"V11.3 intraday controls blocking signals: {irc_reason}")
+                                signals = []  # Block all new entries
                         if signals:
                             process_signals(
                                 signals, risk, regime, current,

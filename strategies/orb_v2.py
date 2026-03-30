@@ -258,10 +258,15 @@ class ORBStrategyV2:
     # ------------------------------------------------------------------
 
     def check_exits(self, open_trades: list, now: datetime) -> list[dict]:
-        """Check open ORB trades for time-based exits.
+        """Check open ORB trades for trailing stop and time stop.
+
+        V11.3 T3: Trailing stop for ORB breakout trades:
+        - At 0.5x range profit: move stop to breakeven
+        - At 1.0x range profit: trail at 0.5x range below current price
+        - Time stop: ORB_TIME_STOP_HOURS (2h)
 
         Returns a list of exit actions:
-            [{symbol, action: 'full', reason: 'orb_time_stop'}, ...]
+            [{symbol, action: 'full', reason: '...'}, ...]
         """
         exits: list[dict] = []
 
@@ -269,6 +274,61 @@ class ORBStrategyV2:
             if getattr(trade, "strategy", "") != "ORB":
                 continue
 
+            symbol = trade.symbol
+
+            # V11.3 T3: Trailing stop based on ORB range
+            orb = self.opening_ranges.get(symbol)
+            if orb and hasattr(trade, 'entry_price') and hasattr(trade, 'stop_loss'):
+                orb_range = orb["high"] - orb["low"]
+                if orb_range > 0:
+                    try:
+                        snap = get_snapshot(symbol)
+                        if snap and snap.latest_trade:
+                            price = float(snap.latest_trade.price)
+
+                            if trade.side == "buy":
+                                profit = price - trade.entry_price
+                                # At 0.5x range profit, move stop to breakeven
+                                if profit >= 0.5 * orb_range:
+                                    new_stop = max(trade.stop_loss, trade.entry_price)
+                                    if new_stop > trade.stop_loss:
+                                        trade.stop_loss = new_stop
+                                # At 1.0x range profit, trail at 0.5x range below price
+                                if profit >= 1.0 * orb_range:
+                                    trail_stop = price - 0.5 * orb_range
+                                    if trail_stop > trade.stop_loss:
+                                        trade.stop_loss = trail_stop
+
+                                # Check if trailing stop hit
+                                if price <= trade.stop_loss:
+                                    exits.append({
+                                        "symbol": symbol, "action": "full",
+                                        "reason": f"ORB trailing stop (price={price:.2f})",
+                                    })
+                                    continue
+
+                            elif trade.side == "sell":
+                                profit = trade.entry_price - price
+                                if profit >= 0.5 * orb_range:
+                                    new_stop = min(trade.stop_loss, trade.entry_price)
+                                    if new_stop < trade.stop_loss:
+                                        trade.stop_loss = new_stop
+                                if profit >= 1.0 * orb_range:
+                                    trail_stop = price + 0.5 * orb_range
+                                    if trail_stop < trade.stop_loss:
+                                        trade.stop_loss = trail_stop
+
+                                if price >= trade.stop_loss:
+                                    exits.append({
+                                        "symbol": symbol, "action": "full",
+                                        "reason": f"ORB trailing stop (price={price:.2f})",
+                                    })
+                                    continue
+
+                    except Exception as e:
+                        logger.debug(f"ORB trailing stop check failed for {symbol}: {e}")
+
+            # Time stop
             entry_time = getattr(trade, "entry_time", None)
             if entry_time is None:
                 continue
@@ -276,7 +336,7 @@ class ORBStrategyV2:
             elapsed = now - entry_time
             if elapsed >= timedelta(hours=config.ORB_TIME_STOP_HOURS):
                 exits.append({
-                    "symbol": trade.symbol,
+                    "symbol": symbol,
                     "action": "full",
                     "reason": "orb_time_stop",
                 })

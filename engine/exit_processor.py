@@ -29,8 +29,15 @@ def _emit_event(event_type: str, data: dict, source: str = "exit_processor"):
         except Exception:
             pass
 
-# Lazy-loaded optional module
+# Lazy-loaded optional modules
 _notifications = None
+_intraday_controls = None
+
+
+def set_intraday_controls(controls) -> None:
+    """Set the shared IntradayRiskControls instance (called from main.py)."""
+    global _intraday_controls
+    _intraday_controls = controls
 
 
 def _get_notifications():
@@ -90,6 +97,16 @@ def handle_strategy_exits(exit_actions: list[dict], risk: RiskManager, now: date
 
             pnl = (exit_price - trade.entry_price) * trade.qty * (1 if trade.side == "buy" else -1)
             risk.close_trade(symbol, exit_price, now, exit_reason=reason)
+
+            # V11.3 T2: Feed intraday risk controls with P&L data
+            if _intraday_controls is not None:
+                try:
+                    pnl_pct = pnl / max(risk.current_equity, 1)
+                    is_stop = "stop" in reason.lower()
+                    _intraday_controls.record_pnl(pnl_pct, is_stop_loss=is_stop,
+                                                   is_loss=(pnl < 0), is_win=(pnl > 0), now=now)
+                except Exception:
+                    pass
 
             # Register cooldown if this was a stop-loss exit
             if "stop" in reason.lower():

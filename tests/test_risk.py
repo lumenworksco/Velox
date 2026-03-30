@@ -246,24 +246,33 @@ class TestTradeLifecycle:
 # ===================================================================
 
 class TestVixRiskScalar:
-    """Test each VIX level bracket for get_vix_risk_scalar."""
+    """Test each VIX level bracket for get_vix_risk_scalar.
+
+    V11.3 T6: Updated thresholds to match new rate-of-change-aware scaling.
+    Level-based scalars are now less aggressive (0.90, 0.80, 0.65, 0.40),
+    and direction_adj is 1.0 when VIX history has <3 readings (fresh start).
+    """
 
     @pytest.mark.parametrize("vix_level, expected_scalar", [
         (12.0, 1.0),    # VIX < 15
         (14.9, 1.0),    # VIX < 15
-        (15.0, 0.85),   # 15 <= VIX < 20
-        (19.9, 0.85),   # 15 <= VIX < 20
-        (20.0, 0.70),   # 20 <= VIX < 25
-        (24.9, 0.70),   # 20 <= VIX < 25
-        (25.0, 0.50),   # 25 <= VIX < 30
-        (29.9, 0.50),   # 25 <= VIX < 30
-        (30.0, 0.30),   # 30 <= VIX < VIX_HALT_THRESHOLD (40)
-        (39.9, 0.30),   # 30 <= VIX < 40
+        (15.0, 0.90),   # 15 <= VIX < 20 (V11.3: was 0.85)
+        (19.9, 0.90),   # 15 <= VIX < 20
+        (20.0, 0.80),   # 20 <= VIX < 25 (V11.3: was 0.70)
+        (24.9, 0.80),   # 20 <= VIX < 25
+        (25.0, 0.65),   # 25 <= VIX < 30 (V11.3: was 0.50)
+        (29.9, 0.65),   # 25 <= VIX < 30
+        (30.0, 0.40),   # 30 <= VIX < VIX_HALT_THRESHOLD (V11.3: was 0.30)
+        (39.9, 0.40),   # 30 <= VIX < 40
         (40.0, 0.0),    # VIX >= 40 (halt)
         (50.0, 0.0),    # VIX >= 40 (halt)
     ])
     def test_get_vix_risk_scalar_thresholds(self, vix_level, expected_scalar,
                                              override_config):
+        # V11.3: Clear VIX history to get clean level-based scalar (no direction_adj)
+        import risk.risk_manager as _rm
+        _rm._vix_history.clear()
+
         with override_config(VIX_RISK_SCALING_ENABLED=True,
                              VIX_HALT_THRESHOLD=40):
             with patch("risk.risk_manager.get_vix_level", return_value=vix_level):

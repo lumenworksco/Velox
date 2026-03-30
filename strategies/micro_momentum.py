@@ -164,17 +164,44 @@ class IntradayMicroMomentum:
 
                 price = bars["close"].iloc[-1]
 
+                # V11.3 T12: ATR-based stops — adapt to current volatility
+                # instead of fixed 1% stop / 2% target
+                atr_stop_mult = 1.5  # Stop at 1.5x ATR
+                atr_target_mult = 3.0  # Target at 3x ATR (2:1 R:R)
+                try:
+                    if len(bars) >= 5:
+                        high = bars["high"].iloc[-5:]
+                        low = bars["low"].iloc[-5:]
+                        close_prev = bars["close"].iloc[-6:-1] if len(bars) > 5 else bars["close"].iloc[-5:]
+                        tr = pd.concat([
+                            high - low,
+                            (high - close_prev).abs(),
+                            (low - close_prev).abs(),
+                        ], axis=1).max(axis=1)
+                        atr_val = float(tr.mean())
+                    else:
+                        atr_val = price * config.MICRO_STOP_PCT  # Fallback
+                except Exception:
+                    atr_val = price * config.MICRO_STOP_PCT
+
+                # Floor and ceiling for stop distance
+                stop_dist = atr_val * atr_stop_mult
+                min_stop = price * 0.003  # Floor: 0.3%
+                max_stop = price * 0.020  # Ceiling: 2.0%
+                stop_dist = max(min_stop, min(stop_dist, max_stop))
+                target_dist = stop_dist * (atr_target_mult / atr_stop_mult)  # Maintain R:R
+
                 if self._event_direction == "up":
                     # Buy high-beta stocks
-                    stop_loss = price * (1 - config.MICRO_STOP_PCT)
-                    take_profit = price * (1 + config.MICRO_TARGET_PCT)
+                    stop_loss = price - stop_dist
+                    take_profit = price + target_dist
                     side = "buy"
                 else:
                     # Short high-beta stocks
                     if not config.ALLOW_SHORT or symbol in config.NO_SHORT_SYMBOLS:
                         continue
-                    stop_loss = price * (1 + config.MICRO_STOP_PCT)
-                    take_profit = price * (1 - config.MICRO_TARGET_PCT)
+                    stop_loss = price + stop_dist
+                    take_profit = price - target_dist
                     side = "sell"
 
                 # WIRE-004: Order book imbalance confirmation (fail-open)
@@ -216,9 +243,12 @@ class IntradayMicroMomentum:
         return signals
 
     def check_exits(self, open_trades: dict, now: datetime) -> list[dict]:
-        """Check micro-momentum positions for time stop.
+        """Check micro-momentum positions for trailing stop and time stop.
 
-        8-minute hard time stop — these are ultra-short-hold trades.
+        V11.3 T3+T12: ATR-based trailing stop + extended time stop (30 min).
+        - Once trade reaches +0.5% profit, trail stop at entry + 0.25%
+        - Once trade reaches +1.0% profit, trail stop at highest profit - 0.3%
+        - Hard time stop at MICRO_MAX_HOLD_MINUTES (30 min)
 
         Returns list of exit actions.
         """
@@ -228,7 +258,65 @@ class IntradayMicroMomentum:
             if trade.strategy != "MICRO_MOM":
                 continue
 
-            # 8-minute time stop
+            try:
+                # Get current price
+                lookback = now - timedelta(minutes=2)
+                bars = get_intraday_bars(symbol, TimeFrame(1, TimeFrameUnit.Minute), start=lookback, end=now)
+                if bars is not None and not bars.empty:
+                    price = float(bars["close"].iloc[-1])
+                else:
+                    continue
+
+                # Calculate unrealized P&L %
+                if trade.side == "buy":
+                    pnl_pct = (price - trade.entry_price) / trade.entry_price
+                else:
+                    pnl_pct = (trade.entry_price - price) / trade.entry_price
+
+                # V11.3 T3: Trailing stop logic
+                # Once profitable by 0.5%, move stop to breakeven + 0.25%
+                if pnl_pct >= 0.005:
+                    if trade.side == "buy":
+                        breakeven_trail = trade.entry_price * 1.0025
+                        if hasattr(trade, 'stop_loss') and trade.stop_loss < breakeven_trail:
+                            trade.stop_loss = breakeven_trail
+                            logger.debug(f"MICRO trailing: {symbol} stop moved to breakeven+0.25% = {breakeven_trail:.2f}")
+                    else:
+                        breakeven_trail = trade.entry_price * 0.9975
+                        if hasattr(trade, 'stop_loss') and trade.stop_loss > breakeven_trail:
+                            trade.stop_loss = breakeven_trail
+
+                # Once profitable by 1.0%, use tighter trailing stop (0.3% from current)
+                if pnl_pct >= 0.01:
+                    if trade.side == "buy":
+                        tight_trail = price * 0.997
+                        if hasattr(trade, 'stop_loss') and trade.stop_loss < tight_trail:
+                            trade.stop_loss = tight_trail
+                            logger.debug(f"MICRO tight trail: {symbol} stop at {tight_trail:.2f} (price={price:.2f})")
+                    else:
+                        tight_trail = price * 1.003
+                        if hasattr(trade, 'stop_loss') and trade.stop_loss > tight_trail:
+                            trade.stop_loss = tight_trail
+
+                # Check if current price hit trailing stop
+                if hasattr(trade, 'stop_loss') and trade.stop_loss:
+                    if trade.side == "buy" and price <= trade.stop_loss:
+                        exits.append({
+                            "symbol": symbol, "action": "full",
+                            "reason": f"Micro trailing stop (price={price:.2f} <= stop={trade.stop_loss:.2f})",
+                        })
+                        continue
+                    elif trade.side == "sell" and price >= trade.stop_loss:
+                        exits.append({
+                            "symbol": symbol, "action": "full",
+                            "reason": f"Micro trailing stop (price={price:.2f} >= stop={trade.stop_loss:.2f})",
+                        })
+                        continue
+
+            except Exception as e:
+                logger.debug(f"Micro exit check error for {symbol}: {e}")
+
+            # Time stop (V11.3: extended from 8 to 30 min via config)
             if hasattr(trade, 'entry_time') and trade.entry_time:
                 elapsed_min = (now - trade.entry_time).total_seconds() / 60
                 if elapsed_min >= config.MICRO_MAX_HOLD_MINUTES:

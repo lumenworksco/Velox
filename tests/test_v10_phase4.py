@@ -93,9 +93,9 @@ class TestCorrelationLimiter:
         assert not result.too_concentrated
 
     def test_high_correlation_blocks(self):
-        # HIGH-030: Ledoit-Wolf shrinkage reduces raw correlations,
-        # so use a lower threshold (0.60) and a very high raw correlation (0.99)
-        limiter = CorrelationLimiter(max_pairwise_corr=0.60)
+        # HIGH-030 + V11.3 T14: Improved Ledoit-Wolf shrinkage reduces raw
+        # correlations more for small portfolios. Lower threshold to 0.45.
+        limiter = CorrelationLimiter(max_pairwise_corr=0.45)
         limiter.update_correlation("AAPL", "MSFT", 0.99)
         # Set different sectors to avoid sector concentration trigger
         limiter.set_sector_map({"AAPL": "tech", "MSFT": "software"})

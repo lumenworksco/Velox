@@ -23,6 +23,23 @@ from strategies.base import Signal
 
 logger = logging.getLogger(__name__)
 
+# V11.3 T4: Lazy-loaded slippage model singleton
+_slippage_model = None
+
+
+def _get_slippage_model():
+    """Lazy-load the SlippageModel singleton (fail-open)."""
+    global _slippage_model
+    if _slippage_model is None:
+        try:
+            from execution.slippage_model import SlippageModel
+            _slippage_model = SlippageModel()
+            logger.info("V11.3 T4: SlippageModel initialized")
+        except Exception as e:
+            logger.warning(f"V11.3 T4: SlippageModel init failed (fail-open): {e}")
+            _slippage_model = False  # Sentinel: don't retry
+    return _slippage_model if _slippage_model else None
+
 
 # ============================================================
 # EXEC-005: Exponential backoff configuration
@@ -586,6 +603,47 @@ def submit_bracket_order(signal: Signal, qty: int, order_manager=None) -> str | 
             f"{validation.reason} — {validation.details}"
         )
         return None
+
+    # V11.3 T4: Pre-trade slippage prediction — skip if cost > 50% of expected gain
+    slippage_model = _get_slippage_model()
+    if slippage_model is not None:
+        try:
+            prediction = slippage_model.predict_from_order(
+                order_size=qty,
+                price=signal.entry_price,
+                order_type="limit" if signal.strategy in ("STAT_MR", "KALMAN_PAIRS", "ORB", "PEAD") else "market",
+                side=signal.side,
+                current_time=datetime.now(timezone.utc),
+            )
+            slippage_bps = prediction.expected_bps
+            slippage_dollars = signal.entry_price * slippage_bps / 10000.0
+
+            # Calculate expected gain (distance to take profit)
+            expected_gain = abs(signal.take_profit - signal.entry_price)
+
+            if expected_gain > 0 and slippage_dollars > expected_gain * 0.5:
+                logger.warning(
+                    f"V11.3 T4: Skipping {signal.symbol} — predicted slippage "
+                    f"${slippage_dollars:.2f} ({slippage_bps:.1f}bps) > 50%% of "
+                    f"expected gain ${expected_gain:.2f}"
+                )
+                return None
+
+            # Widen TP/SL by predicted slippage to account for execution cost
+            if slippage_dollars > 0.01:
+                if signal.side == "buy":
+                    signal.take_profit = round(signal.take_profit + slippage_dollars, 2)
+                    signal.stop_loss = round(signal.stop_loss - slippage_dollars, 2)
+                else:
+                    signal.take_profit = round(signal.take_profit - slippage_dollars, 2)
+                    signal.stop_loss = round(signal.stop_loss + slippage_dollars, 2)
+
+            logger.debug(
+                f"V11.3 T4: {signal.symbol} slippage={slippage_bps:.1f}bps "
+                f"(${slippage_dollars:.3f}/share)"
+            )
+        except Exception as e:
+            logger.debug(f"V11.3 T4: Slippage prediction failed for {signal.symbol} (fail-open): {e}")
 
     # EXEC-005: Generate idempotency key for retry safety
     idempotency_key = f"bracket_{signal.symbol}_{signal.strategy}_{uuid.uuid4().hex[:8]}"

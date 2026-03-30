@@ -136,17 +136,14 @@ SECTOR_GROUPS = {
 # ============================================================
 
 STRATEGY_ALLOCATIONS = {
-    'STAT_MR': 0.30,
-    'VWAP': 0.15,
-    'KALMAN_PAIRS': 0.15,
-    'PEAD': 0.08,
-    'ORB': 0.05,
-    'MICRO_MOM': 0.05,
-    # WIRE-015: New strategy allocations
-    'COPULA_PAIRS': 0.07,
-    'CROSS_SECT_MOM': 0.05,
-    'SECTOR_MOM': 0.05,
-    'MULTI_TF': 0.05,
+    # V11.3 T10: Reallocated from dead strategies (COPULA_PAIRS, SECTOR_MOM, etc.)
+    # to active ones. Total = 100%.
+    'STAT_MR': 0.35,         # was 0.30 — highest Sharpe, most active
+    'VWAP': 0.20,            # was 0.15 — second most active
+    'KALMAN_PAIRS': 0.20,    # was 0.15 — diversifying, uncorrelated
+    'ORB': 0.10,             # was 0.05 — now with trailing stops
+    'MICRO_MOM': 0.10,       # was 0.05 — now with ATR-based stops
+    'PEAD': 0.05,            # was 0.08 — event-driven, low frequency
 }
 
 # --- Statistical Mean Reversion ---
@@ -207,7 +204,7 @@ ORB_TIME_STOP_HOURS  = 2          # Close after 2 hours
 # --- Micro Momentum ---
 MICRO_SPY_VOL_SPIKE_MULT = 1.5     # Was 2.0 — detect more micro-events
 MICRO_SPY_MIN_MOVE_PCT = 0.0008    # Was 0.001 — 0.08% SPY move triggers event
-MICRO_MAX_HOLD_MINUTES = 15          # Was 8 — give trades room to work
+MICRO_MAX_HOLD_MINUTES = 30          # V11.3: Extended from 15 to 30 — trailing stop manages risk
 MICRO_STOP_PCT = 0.01                # Was 0.003 — 1% stop survives noise on beta=2 stocks
 MICRO_TARGET_PCT = 0.02              # Was 0.006 — 2% target keeps 2:1 R/R
 MICRO_MAX_TRADES_PER_EVENT = 2       # Was 3 — fewer, higher-conviction trades

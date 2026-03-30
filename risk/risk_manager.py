@@ -68,25 +68,68 @@ def get_vix_level() -> float:
     return snapshot.value if snapshot else 20.0  # Default to 20 if unavailable
 
 
+_vix_history: list[float] = []  # Rolling VIX readings for rate-of-change
+
+
 def get_vix_risk_scalar() -> float:
-    """Return 0.0-1.0 multiplier for position sizing based on VIX level."""
+    """Return 0.0-1.5 multiplier for position sizing based on VIX level AND direction.
+
+    V11.3 T6: Uses VIX rate-of-change, not just level.
+    - VIX falling (vol compression) → scale UP (good for mean-reversion)
+    - VIX spiking (vol expansion) → scale DOWN more aggressively
+    - Level-based floor remains as safety net
+    """
     if not config.VIX_RISK_SCALING_ENABLED:
         return 1.0
 
     vix = get_vix_level()
 
-    if vix < 15:
-        return 1.0
-    elif vix < 20:
-        return 0.85
-    elif vix < 25:
-        return 0.70
-    elif vix < 30:
-        return 0.50
-    elif vix < config.VIX_HALT_THRESHOLD:
-        return 0.30
-    else:
+    # Track VIX history for rate-of-change (keep last 10 readings ≈ 20 min at 120s scan)
+    _vix_history.append(vix)
+    if len(_vix_history) > 10:
+        _vix_history.pop(0)
+
+    # Level-based floor (safety net)
+    if vix >= config.VIX_HALT_THRESHOLD:
         return 0.0  # Halt all new positions
+
+    # Base scalar from level (less aggressive than before)
+    if vix < 15:
+        level_scalar = 1.0
+    elif vix < 20:
+        level_scalar = 0.90
+    elif vix < 25:
+        level_scalar = 0.80
+    elif vix < 30:
+        level_scalar = 0.65
+    else:
+        level_scalar = 0.40
+
+    # Rate-of-change adjustment: compare current VIX to average of last readings
+    if len(_vix_history) >= 3:
+        vix_avg = sum(_vix_history[:-1]) / len(_vix_history[:-1])
+        vix_change_pct = (vix - vix_avg) / max(vix_avg, 1.0)
+
+        if vix_change_pct > 0.10:
+            # VIX spiking (>10% increase) → reduce further
+            direction_adj = 0.7
+        elif vix_change_pct > 0.05:
+            # VIX rising moderately → slight reduction
+            direction_adj = 0.85
+        elif vix_change_pct < -0.10:
+            # VIX falling fast (vol compression) → boost sizing
+            direction_adj = 1.2
+        elif vix_change_pct < -0.05:
+            # VIX falling moderately → slight boost
+            direction_adj = 1.1
+        else:
+            direction_adj = 1.0
+    else:
+        direction_adj = 1.0
+
+    scalar = level_scalar * direction_adj
+    # Bound to [0.3, 1.3] — never zero from direction alone (level handles halt)
+    return max(0.3, min(scalar, 1.3))
 
 
 @dataclass
