@@ -49,10 +49,24 @@ class PEADStrategy:
 
         self._scanned_today = True
 
+        # V12 FINAL: Boost max positions during heavy earnings weeks
+        # More earnings = more opportunities for drift capture
+        max_positions = config.PEAD_MAX_POSITIONS
+        try:
+            from earnings import get_earnings_count_this_week
+            weekly_count = get_earnings_count_this_week()
+            if weekly_count > 10:
+                max_positions = min(8, config.PEAD_MAX_POSITIONS + 3)
+                logger.info("V12 FINAL: Heavy earnings week (%d) — PEAD max positions %d", weekly_count, max_positions)
+            elif weekly_count > 5:
+                max_positions = min(7, config.PEAD_MAX_POSITIONS + 2)
+        except Exception:
+            pass  # Fail-open, use default
+
         # Check how many PEAD positions we already have (via triggered)
         active_count = len(self.triggered)
-        if active_count >= config.PEAD_MAX_POSITIONS:
-            logger.debug(f"PEAD: max positions ({config.PEAD_MAX_POSITIONS}) reached")
+        if active_count >= max_positions:
+            logger.debug(f"PEAD: max positions ({max_positions}) reached")
             return []
 
         # Reduce in HIGH_VOL_BEAR regime

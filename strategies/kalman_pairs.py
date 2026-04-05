@@ -634,6 +634,33 @@ class KalmanPairsTrader:
 
                 zscore = self._update_kalman(pair_key, price1, price2)
 
+                # V12 FINAL: Correlation regime guard — tighten stops if pair
+                # correlation is breaking down (flight-to-quality scenario)
+                try:
+                    import numpy as _np
+                    if len(bars1) >= 5 and len(bars2) >= 5:
+                        _ret1 = bars1["close"].pct_change().dropna().values[-5:]
+                        _ret2 = bars2["close"].pct_change().dropna().values[-5:]
+                        if len(_ret1) >= 3 and len(_ret2) >= 3:
+                            _live_corr = _np.corrcoef(_ret1, _ret2)[0, 1]
+                            if _live_corr < 0.3:  # Correlation breakdown
+                                logger.warning(
+                                    "V12 FINAL: Pair %s correlation breakdown "
+                                    "(live=%.2f < 0.3) — closing pair",
+                                    pair_key, _live_corr,
+                                )
+                                for s, t in open_trades.items():
+                                    if t.pair_id == trade.pair_id:
+                                        exits.append({
+                                            "symbol": s,
+                                            "action": "full",
+                                            "reason": f"Pairs correlation breakdown (corr={_live_corr:.2f})",
+                                            "pair_id": trade.pair_id,
+                                        })
+                                continue
+                except Exception:
+                    pass  # Fail-open
+
                 # Max hold check
                 if hasattr(trade, 'entry_time') and trade.entry_time:
                     days_held = (now - trade.entry_time).total_seconds() / 86400

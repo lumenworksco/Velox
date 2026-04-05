@@ -226,3 +226,27 @@ def get_earnings_calendar() -> dict[str, str]:
 def get_excluded_count() -> int:
     """Get count of symbols excluded due to earnings."""
     return sum(1 for v in _earnings_cache.values() if v)
+
+
+def get_earnings_count_this_week() -> int:
+    """V12 FINAL: Count symbols with earnings this week (Mon-Fri).
+
+    Used by PEAD strategy to boost allocation during heavy earnings weeks.
+    """
+    try:
+        today = datetime.now(config.ET).date()
+        # Find Monday of this week
+        monday = today - timedelta(days=today.weekday())
+        friday = monday + timedelta(days=4)
+        count = 0
+        for sym, edate_str in _earnings_dates.items():
+            if edate_str:
+                try:
+                    edate = date.fromisoformat(edate_str)
+                    if monday <= edate <= friday:
+                        count += 1
+                except (ValueError, TypeError):
+                    pass
+        return count
+    except Exception:
+        return 0

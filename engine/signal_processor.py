@@ -1241,6 +1241,15 @@ def _process_single_signal(
                     vpin_inst = None
             if vpin_inst is not None:
                 vpin_value = vpin_inst.compute_vpin()
+                # V12 FINAL: Hard reject at extreme toxicity — informed traders active
+                if vpin_value > 0.70:
+                    logger.info(
+                        "V12 FINAL: VPIN=%.2f for %s — REJECTING (toxic order flow)",
+                        vpin_value, signal.symbol,
+                    )
+                    database.log_signal(now, signal.symbol, signal.strategy,
+                                       signal.side, False, f"vpin_toxic_{vpin_value:.2f}")
+                    return
                 if vpin_value > 0.25:
                     # T5-007: Continuous toxicity adjustment
                     toxicity_multiplier = max(0.3, 1.0 - 2.0 * (vpin_value - 0.25))
