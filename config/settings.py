@@ -1,8 +1,28 @@
-"""Configuration — all settings and environment variable handling."""
+"""Configuration — all settings and environment variable handling.
+
+Velox V12 — loads .env automatically so the bot can run with just `python3 main.py`.
+"""
 
 import os
 from datetime import time
+from pathlib import Path
 from zoneinfo import ZoneInfo
+
+# Load .env file BEFORE reading any environment variables.
+# This ensures `python3 main.py` works without manually exporting vars.
+_env_file = Path(__file__).resolve().parent.parent / ".env"
+if _env_file.exists():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_env_file)
+    except ImportError:
+        # Fallback: manual .env parsing if python-dotenv not installed
+        with open(_env_file) as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _k, _v = _line.split("=", 1)
+                    os.environ.setdefault(_k.strip(), _v.strip())
 
 # ============================================================
 # BROKER & CONNECTIVITY
@@ -14,7 +34,6 @@ PAPER_MODE = os.getenv("ALPACA_LIVE", "false") != "true"
 API_KEY = os.getenv("ALPACA_API_KEY", "")
 API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 
-# Validate API credentials at import time (skip in test environments)
 # Validate API credentials at import time (skip in test environments)
 if not os.getenv("TESTING") and not os.getenv("PYTEST_CURRENT_TEST"):
     if not API_KEY:

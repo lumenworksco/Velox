@@ -25,7 +25,7 @@ from analytics.metrics import compute_sharpe as _shared_compute_sharpe
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Velox V10 Dashboard", docs_url=None, redoc_url=None)
+app = FastAPI(title="Velox V12 Dashboard", docs_url=None, redoc_url=None)
 
 
 # V10 SEC-003: IP-based rate limiting (10 req/sec per IP)
@@ -705,7 +705,7 @@ tr:hover{background:rgba(255,255,255,0.03)}
   <div id="shadow-trades"></div>
  </div>
 
- <div class="footer">Auto-refreshes every 30s &middot; Velox V10</div>
+ <div class="footer">Auto-refreshes every 30s &middot; Velox V12</div>
 </div>
 
 <script>

@@ -1,4 +1,4 @@
-# V10 Production Stack: Velox + PostgreSQL + Prometheus + Grafana
+# V12 Production Stack: Velox + PostgreSQL + Prometheus + Grafana + Alertmanager + Backup
 #
 # Usage:
 #   docker compose up -d              # Start all services
@@ -15,7 +15,7 @@
 services:
   velox:
     build: .
-    container_name: velox-v11
+    container_name: velox-v12
     restart: unless-stopped
     stop_grace_period: 45s
     env_file: .env

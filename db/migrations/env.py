@@ -1,4 +1,4 @@
-"""Alembic env.py — configured for Velox V10 dual-backend (SQLite/PostgreSQL).
+"""Alembic env.py — configured for Velox V12 dual-backend (SQLite/PostgreSQL).
 
 Uses db.models.metadata for autogenerate support, and db.DATABASE_URL for connection.
 """

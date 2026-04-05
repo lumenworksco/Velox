@@ -1,7 +1,9 @@
 # =============================================================
-# Risk Management Parameters — ARCH-006
+# Risk Management Parameters — V12 (Updated 2026-04-05)
 #
 # Loaded by ConfigManager.  Hot-reload supported.
+# IMPORTANT: These values MUST match config/settings.py.
+# settings.py is the canonical source; this file is for hot-reload only.
 # =============================================================
 
 # --- Position Sizing ---
@@ -14,7 +16,7 @@ position_sizing:
 
 # --- Daily P&L Controls ---
 daily_pnl:
-  loss_halt:             -0.04
+  loss_halt:             -0.025    # V12: matches DAILY_LOSS_HALT in settings.py
   gain_lock_pct:         0.015
   loss_halt_pct:         -0.010
   gain_lock_size_mult:   0.30

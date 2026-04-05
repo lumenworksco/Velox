@@ -13,12 +13,13 @@
 global:
   resolve_timeout: 5m
 
-  # SMTP defaults (used by email receiver)
-  smtp_smarthost: "${SMTP_SMARTHOST:-smtp.gmail.com:587}"
-  smtp_from: "${SMTP_FROM:-velox-alerts@example.com}"
-  smtp_auth_username: "${SMTP_AUTH_USERNAME:-}"
-  smtp_auth_password: "${SMTP_AUTH_PASSWORD:-}"
-  smtp_require_tls: true
+  # SMTP defaults — email alerting is OPTIONAL.
+  # To enable: set SMTP vars in .env, then uncomment below.
+  # smtp_smarthost: "smtp.gmail.com:587"
+  # smtp_from: "velox-alerts@example.com"
+  # smtp_auth_username: ""
+  # smtp_auth_password: ""
+  # smtp_require_tls: true
 
 route:
   # Default receiver
@@ -66,36 +67,29 @@ inhibit_rules:
     equal: ["team"]
 
 receivers:
+  # Default receiver — logs to stdout (always works)
   - name: telegram-critical
-    telegram_configs:
-      - bot_token: "${TELEGRAM_BOT_TOKEN}"
-        chat_id: ${TELEGRAM_CHAT_ID:-0}
-        parse_mode: HTML
-        message: |
-          🚨 <b>VELOX CRITICAL</b>
-          <b>Alert:</b> {{ .GroupLabels.alertname }}
-          <b>Severity:</b> {{ .CommonLabels.severity }}
-          {{ range .Alerts }}
-          <b>Summary:</b> {{ .Annotations.summary }}
-          {{ .Annotations.description }}
-          {{ if .Annotations.runbook_url }}<b>Runbook:</b> {{ .Annotations.runbook_url }}{{ end }}
-          {{ end }}
+    webhook_configs:
+      - url: "http://velox-v12:8080/api/alerts"
+        send_resolved: true
 
   - name: telegram-warning
-    telegram_configs:
-      - bot_token: "${TELEGRAM_BOT_TOKEN}"
-        chat_id: ${TELEGRAM_CHAT_ID:-0}
-        parse_mode: HTML
-        message: |
-          ⚠️ <b>VELOX WARNING</b>
-          <b>Alert:</b> {{ .GroupLabels.alertname }}
-          {{ range .Alerts }}
-          <b>Summary:</b> {{ .Annotations.summary }}
-          {{ end }}
-
-  - name: email-fallback
-    email_configs:
-      - to: "${ALERT_EMAIL_TO:-admin@example.com}"
+    webhook_configs:
+      - url: "http://velox-v12:8080/api/alerts"
         send_resolved: true
-        headers:
-          Subject: "[VELOX {{ .CommonLabels.severity | toUpper }}] {{ .GroupLabels.alertname }}"
+
+  # To enable Telegram alerts directly from Alertmanager:
+  # Uncomment below and set bot_token + chat_id from your .env
+  #
+  # - name: telegram-critical
+  #   telegram_configs:
+  #     - bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+  #       chat_id: 123456789
+  #       parse_mode: HTML
+  #       message: |
+  #         <b>VELOX CRITICAL:</b> {{ .GroupLabels.alertname }}
+  #         {{ range .Alerts }}{{ .Annotations.summary }}{{ end }}
+  #
+  # - name: email-fallback
+  #   email_configs:
+  #     - to: "your-email@example.com"

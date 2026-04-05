@@ -1,4 +1,4 @@
-# Velox V11.2 Prometheus Configuration
+# Velox V12 Prometheus Configuration
 global:
   scrape_interval: 15s
   evaluation_interval: 15s

@@ -1,4 +1,4 @@
-"""Velox V11.3 — Institutional-Grade Quantitative Trading System.
+"""Velox V12 — Institutional-Grade Quantitative Trading System.
 
 Six-strategy portfolio with HMM regime detection, ML-enhanced alpha,
 volatility-targeted sizing, Kelly criterion, conviction-scored signal pipeline,
@@ -540,7 +540,7 @@ def startup_checks() -> dict:
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Velox V11 — Institutional-Grade Quant System")
+    parser = argparse.ArgumentParser(description="Velox V12 — Institutional-Grade Quant System")
     parser.add_argument("--backtest", action="store_true", help="Run backtesting engine")
     parser.add_argument("--walkforward", action="store_true", help="Run walk-forward test")
     parser.add_argument("--live", action="store_true", help="Alias for ALPACA_LIVE=true")
@@ -768,7 +768,7 @@ def main():
     signal.signal(signal.SIGTERM, _sigterm_handler)
     signal.signal(signal.SIGINT, _sigint_handler)
 
-    console.print("[bold cyan]Starting Velox V10 Trading Bot...[/bold cyan]\n")
+    console.print("[bold cyan]Starting Velox V12 Trading Bot...[/bold cyan]\n")
 
     # Validate configuration
     config.validate()
@@ -1109,7 +1109,7 @@ def main():
             logger.warning(f"T7-003: EDGAR monitor init failed (fail-open): {e}")
 
     features_str = ", ".join(features)
-    console.print(f"\n[bold green]Velox V11 is running. Press Ctrl+C to stop.[/bold green]")
+    console.print(f"\n[bold green]Velox V12 is running. Press Ctrl+C to stop.[/bold green]")
     console.print(f"[dim]Strategies: STAT_MR + VWAP + KALMAN_PAIRS + ORB + MICRO_MOM + PEAD[/dim]")
     console.print(f"[dim]V11 Modules: {v11_active} active[/dim]")
     console.print(f"[dim]Features: {features_str}[/dim]\n")
@@ -2158,7 +2158,7 @@ def run_diagnostic():
 if __name__ == "__main__":
     import argparse as _argparse
 
-    _parser = _argparse.ArgumentParser(description="Velox V10 Trading Bot")
+    _parser = _argparse.ArgumentParser(description="Velox V12 Trading Bot")
     _parser.add_argument("--diagnose", action="store_true", help="Run one diagnostic scan cycle (read-only)")
     _args = _parser.parse_args()
 

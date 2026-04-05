@@ -1,17 +1,20 @@
 # =============================================================
-# Strategy Parameters — ARCH-006
+# Strategy Parameters — V12 (Updated 2026-04-05)
 #
 # Loaded by ConfigManager.  Values here override compiled defaults
-# in config.py.  Hot-reload supported: edit and save while running.
+# in config/settings.py.  Hot-reload supported: edit and save while running.
+#
+# IMPORTANT: These values MUST match config/settings.py.
+# settings.py is the canonical source; this file is for hot-reload only.
 # =============================================================
 
 allocations:
-  STAT_MR:      0.40
-  VWAP:         0.20
-  KALMAN_PAIRS: 0.20
-  PEAD:         0.10
-  ORB:          0.05
-  MICRO_MOM:    0.05
+  STAT_MR:      0.25       # V12 AUDIT: Reduced from 0.35 — crowded edge
+  VWAP:         0.13       # V12 AUDIT: Reduced from 0.20 — overlaps with STAT_MR
+  KALMAN_PAIRS: 0.27       # V12 AUDIT: Increased from 0.20 — diversifying
+  ORB:          0.12       # V12 AUDIT: Increased from 0.10 — good risk mgmt
+  MICRO_MOM:    0.05       # V12 AUDIT: Reduced from 0.10 — weak signals
+  PEAD:         0.18       # V12 AUDIT: Increased from 0.05 — orthogonal edge
 
 # --- Statistical Mean Reversion ---
 stat_mr:
@@ -27,16 +30,16 @@ stat_mr:
   halflife_max_hours:  48
   universe_size:       40
   min_gain_pct:        0.002
-  min_rr_ratio:        1.5
+  min_rr_ratio:        2.0        # V12: Tightened from 1.5
 
 # --- VWAP Mean Reversion ---
 vwap:
   ou_zscore_min:       1.0
-  max_spread_pct:      0.001
-  volume_ratio:        0.8
+  max_spread_pct:      0.0015     # V12: Loosened from 0.001
+  volume_ratio:        1.0        # V12: Tightened from 0.8
   max_intraday_move_pct: 0.03
-  band_std:            2.0
-  rsi_oversold:        40
+  band_std:            1.5        # V12: Tightened from 2.0
+  rsi_oversold:        45         # V12: Raised from 40
   rsi_overbought:      70
   confirmation_bars:   1
   stop_extension:      0.5
@@ -44,7 +47,7 @@ vwap:
 
 # --- Kalman Pairs Trading ---
 kalman_pairs:
-  zscore_entry:        2.0
+  zscore_entry:        1.5        # V12: Loosened from 2.0
   zscore_exit:         0.2
   zscore_stop:         3.0
   max_hold_days:       10
@@ -59,14 +62,14 @@ kalman_pairs:
 # --- Opening Range Breakout ---
 orb:
   enabled:             true
-  volume_ratio:        1.3
+  volume_ratio:        2.0        # V12: Tightened from 1.3
   max_gap_pct:         0.04
   max_range_pct:       0.035
   min_stop_pct:        0.008
   scan_symbols:        15
-  breakout_buffer:     0.001
-  tp_mult:             1.5
-  sl_mult:             0.5
+  breakout_buffer:     0.0025     # V12: Increased from 0.001
+  tp_mult:             2.0        # V12: Widened from 1.5
+  sl_mult:             0.7        # V12: Widened from 0.5
   time_stop_hours:     2
   adx_filter_enabled:  true
   adx_min:             25
@@ -75,11 +78,11 @@ orb:
 # --- Micro Momentum ---
 micro_momentum:
   spy_vol_spike_mult:  2.0
-  spy_min_move_pct:    0.001
-  max_hold_minutes:    15
+  spy_min_move_pct:    0.0015     # V12: Tightened from 0.001
+  max_hold_minutes:    20         # V12: Extended from 15
   stop_pct:            0.01
   target_pct:          0.02
-  max_trades_per_event: 2
+  max_trades_per_event: 4         # V12: Doubled from 2
   max_daily_gain_disable: 0.015
   top_beta_stocks:     5
   event_cooldown_sec:  900
@@ -88,11 +91,11 @@ micro_momentum:
 # --- Post-Earnings Announcement Drift ---
 pead:
   enabled:             true
-  min_surprise_pct:    5.0
+  min_surprise_pct:    3.0        # V12: Lowered from 5.0
   min_volume_ratio:    2.0
-  hold_days_min:       10
-  hold_days_max:       20
+  hold_days_min:       3          # V12: Fixed MIN/MAX inversion
+  hold_days_max:       10         # V12: Shortened from 20
   take_profit:         0.05
-  stop_loss:           0.03
+  stop_loss:           0.02       # V12: Tightened from 0.03
   max_positions:       5
   position_size_pct:   0.02

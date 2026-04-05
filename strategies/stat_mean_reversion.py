@@ -160,7 +160,7 @@ class StatMeanReversion:
                 # V12 AUDIT: Skip symbols with upcoming earnings (gap risk)
                 if _has_earnings_soon is not None:
                     try:
-                        if _has_earnings_soon(symbol, days=2):
+                        if _has_earnings_soon(symbol):
                             logger.debug("V12 AUDIT: %s has earnings within 2 days — skipping", symbol)
                             continue
                     except Exception:

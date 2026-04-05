@@ -151,6 +151,9 @@ trading_bot/
 
   scripts/
     train_ml_model.py        # ML training: Alpaca data, feature selection, Optuna HPO
+    generate_tearsheet.py    # Performance tear sheet (terminal + HTML report)
+
+  reports/                     # Generated performance reports (tearsheet_YYYYMMDD.html)
 
   web_dashboard.py           # FastAPI dashboard with Apple-style UI
 
@@ -306,6 +309,30 @@ Environment variables are configured in `.env` (see `.env.example`).
 | `TAX_HARVESTING_ENABLED` | `true` | Enable Friday EOD tax-loss harvesting |
 | `TELEGRAM_ENABLED` | `false` | Enable Telegram trade alerts |
 | `ALLOW_SHORT` | `false` | Enable short selling |
+
+---
+
+## Performance Reports
+
+Generate a comprehensive tear sheet with summary statistics, monthly returns, per-strategy breakdown, equity curve with SPY benchmark, and risk metrics.
+
+```bash
+# Generate tear sheet (full history)
+python3 scripts/generate_tearsheet.py
+
+# Last 90 days only
+python3 scripts/generate_tearsheet.py --days 90
+
+# Custom output path
+python3 scripts/generate_tearsheet.py --output my_report.html
+
+# Skip SPY benchmark fetch (offline)
+python3 scripts/generate_tearsheet.py --no-spy
+```
+
+Output:
+- **Terminal**: Rich-formatted tables with color-coded P&L
+- **HTML**: Self-contained dark-theme report saved to `reports/tearsheet_YYYYMMDD.html` (inline CSS + SVG charts, suitable for sharing)
 
 ---
 

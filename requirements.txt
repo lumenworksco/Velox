@@ -1,4 +1,4 @@
-# V10 — All dependencies pinned (2026-03-19)
+# V12 — All dependencies pinned (2026-04-05)
 # Core
 alpaca-py==0.43.2
 pandas==3.0.1

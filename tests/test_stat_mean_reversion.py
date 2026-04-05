@@ -72,11 +72,12 @@ def strategy():
 
 class TestPrepareUniverse:
 
+    @patch("strategies.stat_mean_reversion.get_intraday_bars", return_value=None)
     @patch("strategies.stat_mean_reversion.get_daily_bars")
     @patch("strategies.stat_mean_reversion.fit_ou_params")
     @patch("strategies.stat_mean_reversion.hurst_exponent")
     def test_prepare_universe_filters_correctly(
-        self, mock_hurst, mock_ou, mock_bars, strategy
+        self, mock_hurst, mock_ou, mock_bars, mock_intraday, strategy
     ):
         """Symbols with low Hurst + valid OU pass; trending symbols are rejected."""
         bars_mr = _make_daily_bars(25, base_price=100.0)
@@ -116,11 +117,12 @@ class TestPrepareUniverse:
         assert strategy._universe_ready is True
         assert len(strategy.ou_params) == 2
 
+    @patch("strategies.stat_mean_reversion.get_intraday_bars", return_value=None)
     @patch("strategies.stat_mean_reversion.get_daily_bars")
     @patch("strategies.stat_mean_reversion.fit_ou_params")
     @patch("strategies.stat_mean_reversion.hurst_exponent")
     def test_prepare_universe_rejects_bad_halflife(
-        self, mock_hurst, mock_ou, mock_bars, strategy
+        self, mock_hurst, mock_ou, mock_bars, mock_intraday, strategy
     ):
         """Symbols with half-life outside 1-48 hours are rejected."""
         mock_bars.return_value = _make_daily_bars(25)
@@ -143,13 +145,21 @@ class TestPrepareUniverse:
 
 class TestScan:
 
+    @patch("strategies.stat_mean_reversion.get_snapshot")
     @patch("strategies.stat_mean_reversion.get_intraday_bars")
     @patch("strategies.stat_mean_reversion.fit_ou_params")
     @patch("strategies.stat_mean_reversion.compute_zscore")
     def test_scan_generates_long_signal(
-        self, mock_zscore, mock_ou, mock_bars, strategy
+        self, mock_zscore, mock_ou, mock_bars, mock_snapshot, strategy
     ):
         """Negative z-score with low RSI and price < VWAP triggers a buy signal."""
+        # Disable earnings filter and set up tight spread for snapshot
+        import strategies.stat_mean_reversion as _mr_mod
+        _mr_mod._has_earnings_soon = None  # Disable earnings filter
+        mock_snap = MagicMock()
+        mock_snap.latest_quote.bid_price = 95.0
+        mock_snap.latest_quote.ask_price = 95.10  # 0.1% spread (under 0.2% limit)
+        mock_snapshot.return_value = mock_snap
         # Set up universe manually
         strategy.universe = ["AAPL"]
         strategy.ou_params = {
