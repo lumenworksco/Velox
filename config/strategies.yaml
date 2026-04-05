@@ -39,7 +39,7 @@ vwap:
   volume_ratio:        1.0        # V12: Tightened from 0.8
   max_intraday_move_pct: 0.03
   band_std:            1.5        # V12: Tightened from 2.0
-  rsi_oversold:        45         # V12: Raised from 40
+  rsi_oversold:        40         # V12 FINAL: Reverted to 40 — 45 allowed false signals
   rsi_overbought:      70
   confirmation_bars:   1
   stop_extension:      0.5
@@ -47,7 +47,7 @@ vwap:
 
 # --- Kalman Pairs Trading ---
 kalman_pairs:
-  zscore_entry:        1.5        # V12: Loosened from 2.0
+  zscore_entry:        1.2        # V12 FINAL: Lowered from 1.5 — captures more pair setups
   zscore_exit:         0.2
   zscore_stop:         3.0
   max_hold_days:       10
@@ -91,7 +91,7 @@ micro_momentum:
 # --- Post-Earnings Announcement Drift ---
 pead:
   enabled:             true
-  min_surprise_pct:    3.0        # V12: Lowered from 5.0
+  min_surprise_pct:    2.0        # V12 FINAL: Lowered from 3.0 — drift starts at 2% per research
   min_volume_ratio:    2.0
   hold_days_min:       3          # V12: Fixed MIN/MAX inversion
   hold_days_max:       10         # V12: Shortened from 20

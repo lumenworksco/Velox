@@ -388,10 +388,12 @@ class RiskManager:
                     current_drawdown * 100, drawdown_mult, (1.0 - drawdown_mult) * 100,
                 )
 
-        # V12 AUDIT: Prevent over-hedging — minimum 30% of original size survives
-        if position_value < original_position_value * 0.30:
-            position_value = original_position_value * 0.30
-            logger.debug("V12 AUDIT: Multiplier cascade floor hit — capping reduction at 70%%")
+        # V12 FINAL: Prevent over-hedging but allow deep cuts in drawdowns
+        # Floor at 15% (was 30%) — lets drawdown multiplier work properly
+        _floor = getattr(config, 'POSITION_SIZE_MULTIPLIER_FLOOR', 0.15)
+        if position_value < original_position_value * _floor:
+            position_value = original_position_value * _floor
+            logger.debug("V12 FINAL: Multiplier cascade floor hit at %.0f%%", _floor * 100)
 
         # Check we don't exceed max deployment
         deployed = sum(t.entry_price * t.qty for t in self.open_trades.values())

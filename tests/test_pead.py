@@ -83,10 +83,10 @@ class TestPEADScan:
         assert sig.stop_loss == 204.0     # 200 * (1 + PEAD_STOP_LOSS) = 200 * 1.02
 
     def test_scan_filters_small_surprise(self):
-        """scan() filters out surprises below PEAD_MIN_SURPRISE_PCT (3%)."""
+        """scan() filters out surprises below PEAD_MIN_SURPRISE_PCT (2%)."""
         strat = PEADStrategy()
-        # 2% surprise is below the 3% threshold → should be filtered
-        surprise = _mock_surprise("AAPL", surprise_pct=2.0, volume_ratio=3.0,
+        # 1.5% surprise is below the 2% threshold → should be filtered
+        surprise = _mock_surprise("AAPL", surprise_pct=1.5, volume_ratio=3.0,
                                   gap_pct=1.0, current_price=150.0)
         with patch.object(strat, "_get_earnings_surprises", return_value=[surprise]):
             signals = strat.scan(SCAN_TIME, "NORMAL")
@@ -282,7 +282,11 @@ class TestPEADExits:
             entry_price=100.0, entry_time=entry_time,
             hold_type="swing", highest_price_seen=102.0,
         )
-        exits = strat.check_exits({"AAPL": trade}, SCAN_TIME)
+        # Mock snapshot with price within TP/SL bounds (+2%, inside 5% TP and 2% SL)
+        mock_snap = MagicMock()
+        mock_snap.latest_trade.price = 102.0
+        with patch("data.get_snapshot", return_value=mock_snap):
+            exits = strat.check_exits({"AAPL": trade}, SCAN_TIME)
         assert exits == []
 
 

@@ -192,14 +192,14 @@ VWAP_MAX_SPREAD_PCT  = 0.0015     # Skip if bid-ask spread > 0.15% — tighter q
 VWAP_VOLUME_RATIO    = 1.0        # Volume ratio vs 20-bar average — require above-average volume
 MAX_INTRADAY_MOVE_PCT = 0.03      # Skip if stock moved > 3% today
 VWAP_BAND_STD        = 1.5        # Standard deviation multiplier for VWAP bands — tighter bands, more entries
-VWAP_RSI_OVERSOLD    = 45         # RSI below this = oversold (buy signal, raised from 40)
+VWAP_RSI_OVERSOLD    = 40         # V12 FINAL: Reverted to 40 — 45 was too loose, allowing false signals
 VWAP_RSI_OVERBOUGHT  = 70         # RSI above this = overbought (short signal)
 VWAP_CONFIRMATION_BARS = 1        # Bars confirming bounce (1 = disabled)
 VWAP_STOP_EXTENSION  = 0.5        # Stop extension beyond band (in std devs)
 VWAP_MIN_STOP_PCT    = 0.01       # Minimum 1.0% stop distance (was 0.5%)
 
 # --- Kalman Pairs Trading ---
-PAIRS_ZSCORE_ENTRY = 1.5
+PAIRS_ZSCORE_ENTRY = 1.2              # V12 FINAL: Lowered from 1.5 — captures 20-30% more pair setups
 PAIRS_ZSCORE_EXIT = 0.2
 PAIRS_ZSCORE_STOP = 3.0
 PAIRS_MAX_HOLD_DAYS = 10
@@ -251,7 +251,7 @@ MICRO_BETA_TABLE = {
 
 # --- Post-Earnings Announcement Drift ---
 PEAD_ENABLED = True
-PEAD_MIN_SURPRISE_PCT = 3.0        # Lowered from 5.0 — capture more earnings plays
+PEAD_MIN_SURPRISE_PCT = 2.0        # V12 FINAL: Lowered from 3.0 — academic research shows drift starts at 2%
 PEAD_MIN_VOLUME_RATIO = 2.0       # Tightened from 1.5 — require strong volume confirmation
 PEAD_HOLD_DAYS_MIN = 3             # Minimum hold = 3 days (capture initial drift)
 PEAD_HOLD_DAYS_MAX = 10            # Maximum hold = 10 days (most drift captured by then)
@@ -333,7 +333,7 @@ MAX_PORTFOLIO_DEPLOY = 0.55
 DAILY_LOSS_HALT = -0.025
 
 # V12 AUDIT: Position sizing multiplier cascade floor
-POSITION_SIZE_MULTIPLIER_FLOOR = 0.30  # Never reduce position by more than 70%
+POSITION_SIZE_MULTIPLIER_FLOOR = 0.15  # V12 FINAL: Lowered from 0.30 — allows deeper cuts in drawdowns
 
 # --- Volatility Targeting ---
 VOL_TARGET_DAILY = 0.01

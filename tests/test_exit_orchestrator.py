@@ -255,12 +255,14 @@ class TestProfitTiers:
         assert tier2[0].action == "partial"
 
     def test_no_tier_below_threshold(self, orchestrator, emod):
+        """V12 FINAL: With strategy-specific tiers, STAT_MR tier 1 is 0.4%.
+        A +0.2% unrealized gain should NOT trigger any profit tier."""
         trade = FakeTrade(entry_price=100.0, qty=100, side="buy")
         rm = FakeRiskManager()
         rm.open_trades["AAPL"] = trade
         now = datetime(2026, 4, 3, 10, 5, tzinfo=ET)
 
-        with _patch_prices(emod, {"AAPL": 101.00}):
+        with _patch_prices(emod, {"AAPL": 100.20}):
             actions = orchestrator.check_exits(rm, now)
 
         tier_actions = [a for a in actions if "profit_tier" in a.reason]

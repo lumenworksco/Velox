@@ -513,32 +513,55 @@ class ExitOrchestrator:
         self, trade, current_price: float, unrealized_pct: float,
         state: PositionExitState,
     ) -> Optional[ExitAction]:
-        """Tiered profit-taking: partial exits at +1.5% and +2.5%."""
+        """V12 FINAL: Strategy-specific tiered profit-taking.
+
+        MR/VWAP strategies target smaller moves (0.3-0.8%), so profit tiers
+        must be tighter to avoid holding past the reversion. Pairs and swing
+        strategies can afford wider tiers.
+        """
         if state.profit_tiers_taken >= 2:
             return None
 
-        if state.profit_tiers_taken == 0 and unrealized_pct >= 0.015:
+        # V12 FINAL: Strategy-specific profit tier thresholds
+        strategy = getattr(trade, "strategy", "")
+        _TIER_THRESHOLDS = {
+            "STAT_MR":       (0.004, 0.007),   # 0.4% partial, 0.7% full (MR captures overshoot)
+            "VWAP":          (0.006, 0.010),   # 0.6% partial, 1.0% full
+            "KALMAN_PAIRS":  (0.010, 0.015),   # 1.0% partial, 1.5% full
+            "ORB":           (0.012, 0.020),   # 1.2% partial, 2.0% full (breakout needs room)
+            "MICRO_MOM":     (0.008, 0.015),   # 0.8% partial, 1.5% full
+            "PEAD":          (0.020, 0.035),   # 2.0% partial, 3.5% full (swing, wide targets)
+        }
+        tier1_pct, tier2_pct = _TIER_THRESHOLDS.get(strategy, (0.015, 0.025))
+
+        if state.profit_tiers_taken == 0 and unrealized_pct >= tier1_pct:
             partial_qty = max(1, int(trade.qty * 0.33))
             state.profit_tiers_taken = 1
             logger.info(
-                "ExitOrchestrator: Profit tier 1 for %s — %.2f%% unrealized, %d of %d shares",
-                trade.symbol, unrealized_pct * 100, partial_qty, trade.qty,
+                "ExitOrchestrator: Profit tier 1 for %s (%s) — %.2f%% >= %.2f%%, %d of %d shares",
+                trade.symbol, strategy, unrealized_pct * 100, tier1_pct * 100,
+                partial_qty, trade.qty,
             )
             return ExitAction(
                 symbol=trade.symbol, action="partial",
-                qty=partial_qty, reason="profit_tier_1_1.5pct", priority=30,
+                qty=partial_qty,
+                reason=f"profit_tier_1_{tier1_pct:.1%}",
+                priority=30,
             )
 
-        if state.profit_tiers_taken == 1 and unrealized_pct >= 0.025:
+        if state.profit_tiers_taken == 1 and unrealized_pct >= tier2_pct:
             partial_qty = max(1, int(trade.qty * 0.33))
             state.profit_tiers_taken = 2
             logger.info(
-                "ExitOrchestrator: Profit tier 2 for %s — %.2f%% unrealized, %d of %d shares",
-                trade.symbol, unrealized_pct * 100, partial_qty, trade.qty,
+                "ExitOrchestrator: Profit tier 2 for %s (%s) — %.2f%% >= %.2f%%, %d of %d shares",
+                trade.symbol, strategy, unrealized_pct * 100, tier2_pct * 100,
+                partial_qty, trade.qty,
             )
             return ExitAction(
                 symbol=trade.symbol, action="partial",
-                qty=partial_qty, reason="profit_tier_2_2.5pct", priority=30,
+                qty=partial_qty,
+                reason=f"profit_tier_2_{tier2_pct:.1%}",
+                priority=30,
             )
 
         return None
