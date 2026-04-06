@@ -1,4 +1,4 @@
-"""V10 Strategy — Dynamic universe expansion based on regime and opportunity.
+"""Strategy — Dynamic universe expansion based on regime and opportunity.
 
 Instead of a static symbol list, dynamically selects symbols based on:
 1. Volatility regime (more symbols in high-vol for mean reversion)

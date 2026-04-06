@@ -1,4 +1,4 @@
-"""V10 OMS — Order dataclass with state machine."""
+"""OMS — Order dataclass with state machine."""
 
 import uuid
 import logging

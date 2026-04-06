@@ -103,7 +103,7 @@ system_info = Info(
     'Velox trading system information',
 )
 system_info.info({
-    'version': 'V10',
+    'version': 'V12',
     'mode': 'paper',  # Updated at runtime
 })
 

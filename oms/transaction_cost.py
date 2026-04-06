@@ -1,4 +1,4 @@
-"""V10 OMS — Pre-trade transaction cost estimation.
+"""OMS — Pre-trade transaction cost estimation.
 
 Models spread, slippage, and commission to reject negative-EV trades.
 This is PROFIT-GAP-001 from the audit — highest-ROI single change.

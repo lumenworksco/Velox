@@ -1,6 +1,6 @@
 """FastAPI web dashboard — portfolio history, trade log, signal analysis, risk state, strategy health.
 
-V10 additions:
+Dashboard features:
 - JWT authentication (SEC-001)
 - CORS middleware
 - OMS status, kill switch, circuit breaker endpoints
@@ -164,7 +164,7 @@ async def health():
         "uptime_seconds": round(uptime_sec),
         "open_positions": open_count,
         "paper_mode": config.PAPER_MODE,
-        "version": "V10",
+        "version": "V12",
         "auth_enabled": AUTH_ENABLED,
     }
 
@@ -1190,17 +1190,17 @@ async def get_degraded_status():
 
 
 # ===================================================================
-# V10 Endpoints: OMS, Kill Switch, Circuit Breaker
+# API Endpoints: OMS, Kill Switch, Circuit Breaker
 # ===================================================================
 
-# Shared V10 component references (set by main.py)
+# Shared component references (set by main.py)
 _v10_order_manager = None
 _v10_kill_switch = None
 _v10_circuit_breaker = None
 
 
 def set_v10_components(order_manager=None, kill_switch=None, circuit_breaker=None):
-    """Called by main.py to register V10 components for API access."""
+    """Called by main.py to register components for API access."""
     global _v10_order_manager, _v10_kill_switch, _v10_circuit_breaker
     _v10_order_manager = order_manager
     _v10_kill_switch = kill_switch

@@ -29,7 +29,7 @@ websockets==16.0
 sqlalchemy==2.0.48
 alembic==1.18.4
 
-# Observability (V10)
+# Observability
 structlog==25.5.0
 prometheus-client==0.24.1
 

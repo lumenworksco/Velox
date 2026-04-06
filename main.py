@@ -2041,7 +2041,7 @@ def main():
 
 def run_diagnostic():
     """Run one diagnostic scan cycle and print what's blocking trades."""
-    print("\n=== VELOX V10 SIGNAL DIAGNOSTIC MODE ===\n")
+    print("\n=== VELOX V12 SIGNAL DIAGNOSTIC MODE ===\n")
     print("Initializing strategies and filters...\n")
 
     from earnings import has_earnings_soon, load_earnings_cache

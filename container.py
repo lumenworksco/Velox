@@ -234,7 +234,7 @@ class Container:
     # ------------------------------------------------------------------
 
     def _register_v11_defaults(self) -> None:
-        """Register V11 module factories with lazy imports."""
+        """Register module factories with lazy imports."""
 
         # --- Risk modules ---
         self.register_factory("intraday_controls", lambda: (

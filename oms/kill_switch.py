@@ -1,4 +1,4 @@
-"""V10 OMS — Emergency kill switch: cancel all orders + close all positions."""
+"""OMS — Emergency kill switch: cancel all orders + close all positions."""
 
 import json
 import logging

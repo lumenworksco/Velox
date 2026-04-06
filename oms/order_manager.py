@@ -1,4 +1,4 @@
-"""V10 OMS — Central order registry and lifecycle manager."""
+"""OMS — Central order registry and lifecycle manager."""
 
 import hashlib
 import json

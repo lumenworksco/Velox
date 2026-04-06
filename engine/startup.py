@@ -183,9 +183,9 @@ def initialize_v10_components():
         components["kill_switch"] = KillSwitch()
         components["var_monitor"] = VaRMonitor()
         components["corr_limiter"] = CorrelationLimiter()
-        logger.info("V10 OMS, circuit breaker, VaR monitor, and correlation limiter initialized")
+        logger.info("OMS, circuit breaker, VaR monitor, and correlation limiter initialized")
     except Exception as e:
-        logger.warning(f"V10 component init failed (non-fatal): {e}")
+        logger.warning(f"Component init failed (non-fatal): {e}")
 
     return components
 
@@ -225,7 +225,7 @@ def initialize_websocket(risk, ws_monitor_cls=None):
 
 
 def initialize_dashboard(order_manager=None, kill_switch=None, tiered_cb=None):
-    """Start the web dashboard and register V10 components."""
+    """Start the web dashboard and register components."""
     if not config.WEB_DASHBOARD_ENABLED:
         return False
 

@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 
 DASHBOARD_URL="${DASHBOARD_URL:-http://localhost:8080}"
 
-echo "=== VELOX V10 STATUS ==="
+echo "=== VELOX V12 STATUS ==="
 echo
 
 # Check if running
@@ -15,7 +15,7 @@ if [ -n "$PID" ]; then
     echo "Uptime:  $(ps -p "$PID" -o etime= 2>/dev/null || echo 'unknown')"
 else
     echo "Status:  STOPPED (checking Docker...)"
-    docker ps --filter name=velox-v10 --format "Status: {{.Status}}" 2>/dev/null || true
+    docker ps --filter name=velox-v12 --format "Status: {{.Status}}" 2>/dev/null || true
 fi
 echo
 

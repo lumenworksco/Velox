@@ -1,4 +1,4 @@
-"""V10 Auth — JWT token creation and validation for web dashboard.
+"""Auth — JWT token creation and validation for web dashboard.
 
 Configuration via environment variables:
     DASHBOARD_SECRET_KEY: JWT signing key (required for auth)
