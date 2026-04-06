@@ -22,6 +22,7 @@ Usage:
 
 import os
 import logging
+from logging.handlers import RotatingFileHandler
 import sys
 import uuid
 import threading
@@ -156,7 +157,11 @@ def configure_logging():
                 structlog.processors.JSONRenderer(),
             ],
         )
-        file_handler = logging.FileHandler(config.LOG_FILE)
+        file_handler = RotatingFileHandler(
+            config.LOG_FILE,
+            maxBytes=10_000_000,  # 10 MB per file
+            backupCount=5,        # Keep 5 rotated files
+        )
         file_handler.setFormatter(file_formatter)
         file_handler.setLevel(logging.DEBUG)
         # PROD-010: correlation ID filter on file handler too

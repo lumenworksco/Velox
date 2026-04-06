@@ -571,8 +571,8 @@ def main():
                 issues.append("No trained ML model found in models/ — ML will return neutral (0.5)")
             else:
                 logger.info(f"V12 preflight: ML model found: {ml_models[-1]}")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Preflight: ML model check failed: %s", e)
 
         # 3. Strategy allocations sum to 1.0
         alloc_sum = sum(config.STRATEGY_ALLOCATIONS.values())
@@ -686,7 +686,7 @@ def main():
         # Step 2: Cancel all open orders
         try:
             if order_manager and hasattr(order_manager, 'cancel_all'):
-                cancelled = order_manager.cancel_all(reason="graceful_shutdown")
+                cancelled = order_manager.cancel_all()
                 console.print(f"[yellow]  2/6 Cancelled open orders: {cancelled}[/yellow]")
             else:
                 from execution import cancel_all_orders
@@ -895,8 +895,8 @@ def main():
                 )
                 try:
                     risk.close_trade(sym, 0.0, now_et(), exit_reason="orphan_recovery")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("V12 6.5: Failed to close orphan trade %s: %s", sym, e)
 
         if _adopted or _orphaned:
             logger.warning(
@@ -909,8 +909,8 @@ def main():
                         f"Position Recovery: {_adopted} adopted, {_orphaned} orphaned",
                         severity="WARNING",
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("V12 6.5: Position recovery notification failed: %s", e)
         else:
             logger.info("V12 6.5: Position recovery — all positions in sync")
     except Exception as _e:
@@ -1519,7 +1519,8 @@ def main():
                             if _intraday_vol_regime:
                                 try:
                                     _vol_regime_mult = _intraday_vol_regime.get_sizing_multiplier()
-                                except Exception:
+                                except Exception as e:
+                                    logger.debug("IntradayVolRegime sizing multiplier failed: %s", e)
                                     _vol_regime_mult = 1.0
                             process_signals(
                                 signals, risk, regime, current,
@@ -1604,8 +1605,8 @@ def main():
                             try:
                                 for _ct in risk.closed_trades[_closed_before:]:
                                     _win_streak_tracker.record_trade(_ct.pnl > 0)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug("WinStreakTracker update failed: %s", e)
 
                         # 6. Beta neutralization
                         run_beta_neutralization(
@@ -1875,8 +1876,8 @@ def main():
                             if dd > 0.05:
                                 try:
                                     notifications.notify_drawdown_warning(dd)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug("Drawdown notification failed: %s", e)
                     except Exception as e:
                         logger.error(f"Failed to compute analytics: {e}")
 
@@ -1938,15 +1939,15 @@ def main():
                             v9_update['cross_asset_bias'] = cross_asset_monitor.get_equity_bias()
                             try:
                                 v9_update['cross_asset_signals'] = cross_asset_monitor.compute_signals()
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug("Cross-asset signals update failed: %s", e)
                         if overnight_manager:
                             v9_update['overnight_count'] = len(overnight_manager.get_overnight_positions())
                         if adaptive_allocator and hasattr(vol_engine, '_adaptive_weights'):
                             v9_update['adaptive_weights'] = getattr(vol_engine, '_adaptive_weights', {})
                         update_v9_state(**v9_update)
-                    except Exception:
-                        pass  # Web dashboard update is non-critical
+                    except Exception as e:
+                        logger.debug("Web dashboard state update failed: %s", e)
 
                 # Build V9 dashboard kwargs
                 _v9_dash = {}
@@ -1964,10 +1965,10 @@ def main():
                             warnings = [f"{s}: {d.get('status','')}" for s, d in report.items()
                                        if d.get('status') in ('warning', 'critical')]
                             _v9_dash['alpha_warnings'] = warnings
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                        except Exception as e:
+                            logger.debug("Alpha decay health report failed: %s", e)
+                except Exception as e:
+                    logger.debug("Dashboard kwargs build failed: %s", e)
 
                 live.update(
                     build_dashboard(
@@ -1994,16 +1995,16 @@ def main():
                             hour=current.hour,
                         )
                         scan_interval = min(scan_interval, bonus_interval)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Adaptive scan interval failed: %s", e)
                 # V12 BONUS: Update intraday vol regime
                 if _intraday_vol_regime:
                     try:
                         spy_snap = get_snapshot("SPY")
                         if spy_snap and hasattr(spy_snap, "latest_trade"):
                             _intraday_vol_regime.update(float(spy_snap.latest_trade.price))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("IntradayVolRegime update failed: %s", e)
                 for _ in range(scan_interval):
                     time_mod.sleep(1)
 
@@ -2126,8 +2127,8 @@ def run_diagnostic():
                 count("filter_earnings")
                 blocked_signals.append(f"{sig.symbol} {sig.strategy}: BLOCKED by earnings")
                 continue
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Earnings check failed for %s: %s", sig.symbol, e)
 
         if sig.strategy != "KALMAN_PAIRS":
             try:
@@ -2135,8 +2136,8 @@ def run_diagnostic():
                     count("filter_correlation")
                     blocked_signals.append(f"{sig.symbol} {sig.strategy}: BLOCKED by correlation")
                     continue
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Correlation check failed for %s: %s", sig.symbol, e)
 
         passed_signals.append(f"{sig.symbol} {sig.strategy} {sig.side} @ ${sig.entry_price:.2f}")
 

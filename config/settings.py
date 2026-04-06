@@ -616,7 +616,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # --- Web Dashboard ---
 WEB_DASHBOARD_ENABLED = os.getenv("WEB_DASHBOARD_ENABLED", "true") == "true"
 WEB_DASHBOARD_PORT = int(os.getenv("WEB_DASHBOARD_PORT", "8080"))
-CORS_ORIGINS = ["http://localhost:3000"]
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 TRUSTED_PROXY_IPS: list[str] = []  # MED-034: IPs allowed to set X-Forwarded-For
 
 # --- WebSocket Position Monitoring ---
