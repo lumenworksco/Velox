@@ -542,14 +542,15 @@ class PEADStrategy:
             today = date_cls.today()
             yesterday = today - timedelta(days=1)
 
-            # FMP earnings calendar endpoint
-            url = (
-                f"https://financialmodelingprep.com/api/v3/earning_calendar"
-                f"?from={yesterday.isoformat()}&to={today.isoformat()}"
-                f"&apikey={api_key}"
-            )
+            # FMP earnings calendar endpoint (API key passed as param, not in URL string)
+            url = "https://financialmodelingprep.com/api/v3/earning_calendar"
+            params = {
+                "from": yesterday.isoformat(),
+                "to": today.isoformat(),
+                "apikey": api_key,
+            }
 
-            resp = requests.get(url, timeout=10)
+            resp = requests.get(url, params=params, timeout=10)
             if resp.status_code != 200:
                 logger.debug(f"PEAD FMP: HTTP {resp.status_code}")
                 return []
@@ -577,11 +578,9 @@ class PEADStrategy:
 
                 # Get price data for volume ratio and gap
                 try:
-                    price_url = (
-                        f"https://financialmodelingprep.com/api/v3/historical-price-full/"
-                        f"{symbol}?timeseries=5&apikey={api_key}"
-                    )
-                    price_resp = requests.get(price_url, timeout=10)
+                    price_url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}"
+                    price_params = {"timeseries": "5", "apikey": api_key}
+                    price_resp = requests.get(price_url, params=price_params, timeout=10)
                     if price_resp.status_code != 200:
                         continue
                     price_data = price_resp.json().get("historical", [])
