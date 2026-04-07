@@ -2,7 +2,7 @@
 
 ![CI](https://github.com/lumenworksco/Velox/actions/workflows/ci.yml/badge.svg)
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
-![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
+![License: Proprietary](https://img.shields.io/badge/License-Proprietary-red.svg)
 
 A production-grade autonomous equity trading system built on the Alpaca API. Features 6 diversified strategies, a unified ExitOrchestrator with 10-priority-level exit cascade, an 18-stage signal pipeline with ML confidence gating, real-time VaR monitoring, FinBERT sentiment analysis, structured logging, and a Docker production stack with PostgreSQL, Prometheus, Grafana, Alertmanager, and automated backups.
 

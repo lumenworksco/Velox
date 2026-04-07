@@ -1,16 +1,25 @@
-MIT License
+Velox — Proprietary Commercial Software License
 
-Copyright (c) 2024-2026 Lumen Studio (Florian Braun)
+Copyright (c) 2024-2026 Lumen Studio (Florian Braun). All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software and associated documentation files (the "Software") are the
+proprietary property of Lumen Studio. Unauthorized copying, modification,
+distribution, or use of this Software, in whole or in part, is strictly
+prohibited without a valid commercial license agreement.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+The Software is licensed, not sold. Use of the Software is governed by the
+Commercial Software License Agreement provided at the time of purchase
+(see docs/LICENSE_COMMERCIAL.md for the full license template).
+
+Without a valid license, you may NOT:
+
+  - Use the Software for any purpose (personal, commercial, or educational)
+  - Copy, modify, merge, or create derivative works of the Software
+  - Distribute, sublicense, sell, or transfer the Software to any third party
+  - Reverse engineer, decompile, or disassemble the Software
+  - Use the Software to provide trading signals or services to third parties
+
+For licensing inquiries, contact: Lumen Studio
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
