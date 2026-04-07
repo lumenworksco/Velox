@@ -300,7 +300,7 @@ async def portfolio_history(days: int = Query(30, ge=1, le=365), user=Depends(_r
         return database.get_daily_snapshots(days=days)
     except Exception as e:
         logger.error(f"portfolio_history failed: {e}")
-        return {"error": str(e)}
+        return {"error": "Internal server error"}
 
 
 @app.get("/api/trades")
@@ -313,7 +313,7 @@ async def trades(limit: int = Query(100, ge=1, le=1000),
         return database.get_trades_paginated(limit=limit, offset=offset, strategy=strategy)
     except Exception as e:
         logger.error(f"trades endpoint failed: {e}")
-        return {"error": str(e)}
+        return {"error": "Internal server error"}
 
 
 @app.get("/api/stats")
@@ -361,7 +361,7 @@ async def signals(date: str = Query(None)):
         return database.get_signals_by_date(date)
     except Exception as e:
         logger.error(f"signals endpoint failed: {e}")
-        return {"error": str(e)}
+        return {"error": "Internal server error"}
 
 
 @app.get("/api/positions")
@@ -390,7 +390,7 @@ async def positions():
             return database.load_open_positions()
         except Exception as e2:
             logger.error(f"positions endpoint failed: {e2}")
-            return {"error": str(e2)}
+            return {"error": "Internal server error"}
 
 
 @app.get("/api/signal_stats")
@@ -400,7 +400,7 @@ async def signal_stats(days: int = Query(7, ge=1, le=90)):
         return database.get_signal_skip_reasons(days=days)
     except Exception as e:
         logger.error(f"signal_stats endpoint failed: {e}")
-        return {"error": str(e)}
+        return {"error": "Internal server error"}
 
 
 @app.get("/api/shadow_trades")
@@ -411,7 +411,8 @@ async def shadow_trades(days: int = Query(14, ge=1, le=90)):
         performance = database.get_shadow_performance(days=days)
         return {"open": open_shadows, "performance": performance}
     except Exception as e:
-        return {"open": [], "performance": [], "error": str(e)}
+        logger.error(f"shadow_trades endpoint failed: {e}")
+        return {"open": [], "performance": [], "error": "Internal server error"}
 
 
 @app.get("/api/consistency")
@@ -420,7 +421,8 @@ async def consistency(days: int = Query(30, ge=1, le=90)):
     try:
         return database.get_consistency_log(days=days)
     except Exception as e:
-        return {"error": str(e)}
+        logger.error(f"consistency endpoint failed: {e}")
+        return {"error": "Internal server error"}
 
 
 @app.get("/api/risk-state")
@@ -519,7 +521,8 @@ async def filter_diagnostic():
         rows = [{'strategy': r[0], 'skip_reason': r[1], 'count': r[2]} for r in c.fetchall()]
         return {'filter_breakdown': rows}
     except Exception as e:
-        return {'filter_breakdown': [], 'error': str(e)}
+        logger.error(f"filter_diagnostic endpoint failed: {e}")
+        return {'filter_breakdown': [], 'error': 'Internal server error'}
 
 
 @app.get("/api/trade_analysis")
@@ -530,7 +533,8 @@ async def trade_analysis(days: int = Query(7, ge=1, le=90)):
         filter_blocks = database.get_filter_block_summary()
         return {"exit_breakdown": exit_breakdown, "filter_blocks": filter_blocks}
     except Exception as e:
-        return {"exit_breakdown": [], "filter_blocks": {}, "error": str(e)}
+        logger.error(f"trade_analysis endpoint failed: {e}")
+        return {"exit_breakdown": [], "filter_blocks": {}, "error": "Internal server error"}
 
 
 # --- HTML Dashboard ---
@@ -903,7 +907,7 @@ async def v2_overview():
         }
     except Exception as e:
         logger.warning(f"v2_overview regime failed: {e}")
-        result["regime"] = {"state": "UNKNOWN", "probabilities": {}, "error": str(e)}
+        result["regime"] = {"state": "UNKNOWN", "probabilities": {}, "error": "Internal server error"}
 
     try:
         result["cross_asset"] = {
@@ -912,7 +916,7 @@ async def v2_overview():
         }
     except Exception as e:
         logger.warning(f"v2_overview cross_asset failed: {e}")
-        result["cross_asset"] = {"bias": 0.0, "signals": {}, "error": str(e)}
+        result["cross_asset"] = {"bias": 0.0, "signals": {}, "error": "Internal server error"}
 
     try:
         result["portfolio_heat"] = {
@@ -921,7 +925,7 @@ async def v2_overview():
         }
     except Exception as e:
         logger.warning(f"v2_overview heat failed: {e}")
-        result["portfolio_heat"] = {"current_pct": 0.0, "cap_pct": 0.60, "error": str(e)}
+        result["portfolio_heat"] = {"current_pct": 0.0, "cap_pct": 0.60, "error": "Internal server error"}
 
     try:
         result["daily_pnl"] = {
@@ -931,7 +935,7 @@ async def v2_overview():
         }
     except Exception as e:
         logger.warning(f"v2_overview pnl failed: {e}")
-        result["daily_pnl"] = {"day_pnl_pct": 0.0, "attribution": {}, "error": str(e)}
+        result["daily_pnl"] = {"day_pnl_pct": 0.0, "attribution": {}, "error": "Internal server error"}
 
     try:
         result["adaptive_weights"] = _v9_state.get("adaptive_weights", {})
@@ -953,7 +957,7 @@ async def v2_strategy(name: str):
         result["alpha_decay"] = decay_stats.get(name, {})
     except Exception as e:
         logger.warning(f"v2_strategy alpha_decay failed for {name}: {e}")
-        result["alpha_decay"] = {"error": str(e)}
+        result["alpha_decay"] = {"error": "Internal server error"}
 
     # Recent trades from DB
     try:
@@ -1018,7 +1022,7 @@ async def v2_signals_pipeline():
     except Exception as e:
         logger.warning(f"v2_signals_pipeline signals failed: {e}")
         result["signals_today"] = []
-        result["error"] = str(e)
+        result["error"] = "Internal server error"
 
     # Also pull from DB for today's signals
     try:
@@ -1060,7 +1064,7 @@ async def v2_risk_exposure():
         }
     except Exception as e:
         logger.warning(f"v2_risk_exposure heat failed: {e}")
-        result["portfolio_heat"] = {"error": str(e)}
+        result["portfolio_heat"] = {"error": "Internal server error"}
 
     try:
         result["beta_exposure"] = _v6_risk_state.get("portfolio_beta", 0.0)
@@ -1112,7 +1116,7 @@ async def v2_execution_quality():
         result.update(exec_stats)
     except Exception as e:
         logger.warning(f"v2_execution_quality state failed: {e}")
-        result["error"] = str(e)
+        result["error"] = "Internal server error"
 
     # Try to get from execution analytics module
     try:
@@ -1186,7 +1190,7 @@ async def get_degraded_status():
         return degraded_tracker.status()
     except Exception as e:
         logger.error("Failed to get degraded status: %s", e)
-        return {"degraded_count": -1, "healthy": False, "error": str(e)}
+        return {"degraded_count": -1, "healthy": False, "error": "Internal server error"}
 
 
 # ===================================================================
@@ -1434,7 +1438,7 @@ async def walk_forward_oos(user=Depends(_require_auth)):
 
     except Exception as e:
         logger.error("walk_forward endpoint failed: %s", e)
-        return {"strategies": [], "error": str(e)}
+        return {"strategies": [], "error": "Internal server error"}
 
 
 # ===================================================================
@@ -1516,7 +1520,7 @@ async def audit_trail_query(
 
     except Exception as e:
         logger.error("audit endpoint failed: %s", e)
-        return {"events": [], "count": 0, "error": str(e)}
+        return {"events": [], "count": 0, "error": "Internal server error"}
 
 
 def start_web_dashboard():

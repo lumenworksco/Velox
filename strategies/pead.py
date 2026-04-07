@@ -613,11 +613,11 @@ class PEADStrategy:
                             "source": "fmp",
                         })
                 except Exception as e:
-                    logger.debug(f"PEAD FMP price fetch failed for {symbol}: {e}")
+                    logger.debug("PEAD FMP price fetch failed for %s", symbol)
                     continue
 
         except Exception as e:
-            logger.debug(f"PEAD FMP earnings fetch failed: {e}")
+            logger.debug("PEAD FMP earnings fetch failed")
 
         return results
 
