@@ -1615,6 +1615,15 @@ def main():
                                 except Exception as e:
                                     logger.error("Advanced exits failed: %s", e)
 
+                        # BUG-FIX: Refresh equity immediately after exits so subsequent
+                        # position sizing uses up-to-date buying power (prevents stale
+                        # equity from inflating sizes after a loss).
+                        try:
+                            _acct = get_account()
+                            risk.update_equity(float(_acct.equity), float(_acct.cash))
+                        except Exception:
+                            pass  # Fail-open: stale equity is better than crashing
+
                         # V12 FINAL: Wire WinStreakTracker — record each newly closed trade
                         if _win_streak_tracker:
                             try:

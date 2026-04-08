@@ -417,6 +417,8 @@ class StatMeanReversion:
                             "action": "full",
                             "reason": f"MR time stop ({elapsed:.0f}min > {max_hold:.0f}min)",
                         })
+                        # BUG-FIX: Cooldown on ALL exits, not just stops
+                        self._stop_cooldowns[symbol] = now
                         continue
 
                 if trade.side == "buy":
@@ -440,6 +442,8 @@ class StatMeanReversion:
                             "action": "partial",
                             "reason": f"MR overshoot partial z={zscore:.2f}",
                         })
+                        # BUG-FIX: Cooldown on ALL exits, not just stops
+                        self._stop_cooldowns[symbol] = now
                         # V11.4: Tighter trailing stop in overshoot zone (0.2% vs 0.3%)
                         if hasattr(trade, 'stop_loss'):
                             trail_stop = price * 0.998
@@ -460,6 +464,8 @@ class StatMeanReversion:
                             "action": "partial",
                             "reason": f"MR reverted z={zscore:.2f}",
                         })
+                        # BUG-FIX: Cooldown on ALL exits, not just stops
+                        self._stop_cooldowns[symbol] = now
                         # Move stop to breakeven for remaining position
                         if hasattr(trade, 'stop_loss') and hasattr(trade, 'entry_price'):
                             if trade.stop_loss < trade.entry_price:
@@ -492,6 +498,8 @@ class StatMeanReversion:
                             "action": "partial",
                             "reason": f"MR overshoot partial z={zscore:.2f}",
                         })
+                        # BUG-FIX: Cooldown on ALL exits, not just stops
+                        self._stop_cooldowns[symbol] = now
                         if hasattr(trade, 'stop_loss'):
                             trail_stop = price * 1.002
                             if trade.stop_loss > trail_stop:
@@ -508,6 +516,8 @@ class StatMeanReversion:
                             "action": "partial",
                             "reason": f"MR reverted z={zscore:.2f}",
                         })
+                        # BUG-FIX: Cooldown on ALL exits, not just stops
+                        self._stop_cooldowns[symbol] = now
                         if hasattr(trade, 'stop_loss') and hasattr(trade, 'entry_price'):
                             if trade.stop_loss > trade.entry_price:
                                 trade.stop_loss = trade.entry_price

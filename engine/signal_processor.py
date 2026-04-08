@@ -940,6 +940,17 @@ def _process_single_signal(
         database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
         return
 
+    # 1a2b. BUG-FIX: General recently-traded cooldown to prevent churn.
+    # Any symbol traded in the last 5 minutes is skipped regardless of strategy.
+    _RECENT_TRADE_COOLDOWN_SEC = 300  # 5 minutes
+    if hasattr(_state, 'recent_trades') and signal.symbol in _state.recent_trades:
+        _last_trade_time = _state.recent_trades[signal.symbol]
+        _elapsed_sec = (now - _last_trade_time).total_seconds()
+        if _elapsed_sec < _RECENT_TRADE_COOLDOWN_SEC:
+            logger.debug("Skip %s: recently traded %ds ago", signal.symbol, int(_elapsed_sec))
+            database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, "recent_trade_cooldown")
+            return
+
     # 1a3. Per-symbol daily loss cap
     max_symbol_loss = getattr(config, "MAX_SYMBOL_DAILY_LOSS", 200.0)
     symbol_pnl = risk._symbol_daily_pnl.get(signal.symbol, 0.0)
@@ -1511,6 +1522,11 @@ def _process_single_signal(
         _emit_event(EventTypes.ORDER_FAILED if _EVENTS_AVAILABLE else "order.failed",
                     {"symbol": signal.symbol, "strategy": signal.strategy})
         return
+
+    # BUG-FIX: Record recent trade time to prevent churn (5-min cooldown)
+    if not hasattr(_state, 'recent_trades'):
+        _state.recent_trades = {}
+    _state.recent_trades[signal.symbol] = now
 
     # Track accepted symbol for intra-batch correlation checks
     if batch_accepted is not None:
