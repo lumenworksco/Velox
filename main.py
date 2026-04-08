@@ -1337,6 +1337,21 @@ def main():
 
                     # Trading hours scan
                     if is_trading_hours(current_time):
+                        # BUG-FIX: Refresh account equity BEFORE circuit breaker
+                        # check.  Previously update_equity() ran at the END of
+                        # the loop, so the circuit breaker always evaluated
+                        # stale P&L from the prior cycle.  During rapid losses
+                        # ($69K over 2 days) the breaker never fired because
+                        # day_pnl lagged behind actual account equity.
+                        try:
+                            _cb_account = get_account()
+                            risk.update_equity(
+                                float(_cb_account.equity),
+                                float(_cb_account.cash),
+                            )
+                        except Exception as _eq_err:
+                            logger.warning("Pre-CB equity refresh failed: %s", _eq_err)
+
                         # 1. Update PnL lock state
                         pnl_lock.update(risk.day_pnl)
 

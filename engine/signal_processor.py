@@ -1107,6 +1107,7 @@ def _process_single_signal(
         side=signal.side,
         pnl_lock_mult=lock_mult,
         now=now,  # V12 4.1 + 4.3: intraday session & Friday EOW multipliers
+        symbol=signal.symbol,  # BUG-FIX: Pass symbol for ATR-based vol cap
     )
 
     # V12 6.3: Drawdown-based sizing — smooth multiplier reduces size as drawdown
