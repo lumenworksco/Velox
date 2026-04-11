@@ -17,7 +17,13 @@ logger = logging.getLogger(__name__)
 
 
 def _send_telegram(message: str, parse_mode: str = "Markdown"):
-    """Send a message via Telegram Bot API. Synchronous (fire-and-forget)."""
+    """Send a message via Telegram Bot API. Synchronous (fire-and-forget).
+
+    V12 HOTFIX: Telegram's legacy Markdown parser chokes on characters like
+    '=', '<', '>', '(', ')' embedded in exit reasons (e.g. "MR z-stop z=-4.04
+    (< -2.5)") and returns HTTP 400 "can't parse entities". If the first
+    send fails with a parse error, retry once as plain text.
+    """
     if not config.TELEGRAM_ENABLED:
         return
     if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
@@ -26,18 +32,27 @@ def _send_telegram(message: str, parse_mode: str = "Markdown"):
     try:
         import httpx
         url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
-        with httpx.Client(timeout=10) as client:
-            resp = client.post(
-                url,
-                json={
-                    "chat_id": config.TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": parse_mode,
-                    "disable_web_page_preview": True,
-                },
-            )
-            if resp.status_code != 200:
-                logger.warning(f"Telegram send failed: {resp.status_code} {resp.text}")
+
+        def _post(text: str, mode):
+            with httpx.Client(timeout=10) as client:
+                return client.post(
+                    url,
+                    json={
+                        "chat_id": config.TELEGRAM_CHAT_ID,
+                        "text": text,
+                        "parse_mode": mode,
+                        "disable_web_page_preview": True,
+                    },
+                )
+
+        resp = _post(message, parse_mode)
+        if resp.status_code == 400 and parse_mode and "parse" in resp.text.lower():
+            # Retry without markdown, stripping the markdown markers
+            plain = (message.replace("*", "").replace("`", "")
+                     .replace("_", ""))
+            resp = _post(plain, None)
+        if resp.status_code != 200:
+            logger.warning(f"Telegram send failed: {resp.status_code} {resp.text}")
     except Exception as e:
         logger.warning(f"Telegram notification failed: {e}")
 

@@ -152,6 +152,12 @@ class KillSwitch:
         failed_closes = []
         if risk_manager:
             from execution import close_position
+            # V12 HOTFIX: fail-open import for broker_sync guard
+            try:
+                from engine.broker_sync import mark_symbol_close_attempted
+            except Exception:
+                def mark_symbol_close_attempted(_s: str) -> None:  # type: ignore[misc]
+                    return None
             symbols = list(risk_manager.open_trades.keys())
 
             # V12 11.1: Write full queue to disk before starting batch close
@@ -166,6 +172,7 @@ class KillSwitch:
                             logger.critical("V12 AUDIT: Kill switch FAILED to close %s — manual intervention required", symbol)
                             failed_closes.append(symbol)
                             continue
+                        mark_symbol_close_attempted(symbol)
                         trade = risk_manager.open_trades.get(symbol)
                         if trade:
                             risk_manager.close_trade(

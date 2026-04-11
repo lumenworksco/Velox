@@ -43,6 +43,9 @@ class StatMeanReversion:
         self.ou_params: dict[str, dict] = {}   # symbol -> {kappa, mu, sigma, half_life}
         self._universe_ready = False
         self._last_scan = None
+        # BUG-FIX: Per-symbol cooldown after stop-loss to prevent repeated
+        # re-entry into the same losing stock (e.g. LYFT bought 5x in 10 min)
+        self._stop_cooldowns: dict[str, datetime] = {}  # symbol -> last stop time
 
     def reset_daily(self):
         """Clear all state for a new trading day."""
@@ -50,6 +53,7 @@ class StatMeanReversion:
         self.ou_params = {}
         self._universe_ready = False
         self._last_scan = None
+        self._stop_cooldowns = {}
 
     def prepare_universe(self, symbols: list[str], now: datetime) -> list[str]:
         """Filter symbols for mean-reverting characteristics.
@@ -157,6 +161,20 @@ class StatMeanReversion:
 
         for symbol in self.universe:
             try:
+                # BUG-FIX: Enforce re-entry cooldown after stop-loss exit.
+                # Prevents repeated entries into the same losing stock.
+                if symbol in self._stop_cooldowns:
+                    cooldown_until = self._stop_cooldowns[symbol] + timedelta(minutes=config.REENTRY_COOLDOWN_MIN)
+                    if now < cooldown_until:
+                        logger.debug(
+                            "MR skip %s: stop cooldown active until %s",
+                            symbol, cooldown_until.strftime("%H:%M"),
+                        )
+                        continue
+                    else:
+                        # Cooldown expired — remove entry
+                        del self._stop_cooldowns[symbol]
+
                 # V12 AUDIT: Skip symbols with upcoming earnings (gap risk)
                 if _has_earnings_soon is not None:
                     try:
@@ -192,6 +210,17 @@ class StatMeanReversion:
                     sigma = ou['sigma']
 
                 zscore = compute_zscore(price, mu, sigma)
+
+                # BUG-FIX: Reject extreme z-scores (|z| > 5).  A z-score of -67
+                # or -89 means the OU model parameters are completely stale —
+                # sigma is tiny compared to the actual price move.  This is NOT
+                # a real signal; entering here leads to immediate stop-outs.
+                if abs(zscore) > 5.0:
+                    logger.warning(
+                        "Extreme z-score %.1f for %s — skipping (OU model stale)",
+                        zscore, symbol,
+                    )
+                    continue
 
                 # BUG-021: OU sigma is std of price CHANGES (residuals), which is
                 # tiny on 2-min bars (~$0.05 for a $100 stock). Using it for
@@ -388,6 +417,8 @@ class StatMeanReversion:
                             "action": "full",
                             "reason": f"MR time stop ({elapsed:.0f}min > {max_hold:.0f}min)",
                         })
+                        # BUG-FIX: Cooldown on ALL exits, not just stops
+                        self._stop_cooldowns[symbol] = now
                         continue
 
                 if trade.side == "buy":
@@ -398,6 +429,8 @@ class StatMeanReversion:
                             "action": "full",
                             "reason": f"MR z-stop z={zscore:.2f} (< -{config.MR_ZSCORE_STOP})",
                         })
+                        # BUG-FIX: Record stop time to enforce re-entry cooldown
+                        self._stop_cooldowns[symbol] = now
                         continue
 
                     # Long: entered at negative z-score, want z to revert toward 0 and beyond
@@ -409,6 +442,8 @@ class StatMeanReversion:
                             "action": "partial",
                             "reason": f"MR overshoot partial z={zscore:.2f}",
                         })
+                        # BUG-FIX: Cooldown on ALL exits, not just stops
+                        self._stop_cooldowns[symbol] = now
                         # V11.4: Tighter trailing stop in overshoot zone (0.2% vs 0.3%)
                         if hasattr(trade, 'stop_loss'):
                             trail_stop = price * 0.998
@@ -429,6 +464,8 @@ class StatMeanReversion:
                             "action": "partial",
                             "reason": f"MR reverted z={zscore:.2f}",
                         })
+                        # BUG-FIX: Cooldown on ALL exits, not just stops
+                        self._stop_cooldowns[symbol] = now
                         # Move stop to breakeven for remaining position
                         if hasattr(trade, 'stop_loss') and hasattr(trade, 'entry_price'):
                             if trade.stop_loss < trade.entry_price:
@@ -439,6 +476,8 @@ class StatMeanReversion:
                             "action": "full",
                             "reason": f"MR stop z={zscore:.2f}",
                         })
+                        # BUG-FIX: Record stop time to enforce re-entry cooldown
+                        self._stop_cooldowns[symbol] = now
 
                 elif trade.side == "sell":
                     # V12 AUDIT: Z-score stop — diverging further from mean (short)
@@ -448,6 +487,8 @@ class StatMeanReversion:
                             "action": "full",
                             "reason": f"MR z-stop z={zscore:.2f} (> {config.MR_ZSCORE_STOP})",
                         })
+                        # BUG-FIX: Record stop time to enforce re-entry cooldown
+                        self._stop_cooldowns[symbol] = now
                         continue
 
                     # Short: entered at positive z-score, want z to revert toward 0 and beyond
@@ -457,6 +498,8 @@ class StatMeanReversion:
                             "action": "partial",
                             "reason": f"MR overshoot partial z={zscore:.2f}",
                         })
+                        # BUG-FIX: Cooldown on ALL exits, not just stops
+                        self._stop_cooldowns[symbol] = now
                         if hasattr(trade, 'stop_loss'):
                             trail_stop = price * 1.002
                             if trade.stop_loss > trail_stop:
@@ -473,6 +516,8 @@ class StatMeanReversion:
                             "action": "partial",
                             "reason": f"MR reverted z={zscore:.2f}",
                         })
+                        # BUG-FIX: Cooldown on ALL exits, not just stops
+                        self._stop_cooldowns[symbol] = now
                         if hasattr(trade, 'stop_loss') and hasattr(trade, 'entry_price'):
                             if trade.stop_loss > trade.entry_price:
                                 trade.stop_loss = trade.entry_price
@@ -482,6 +527,8 @@ class StatMeanReversion:
                             "action": "full",
                             "reason": f"MR stop z={zscore:.2f}",
                         })
+                        # BUG-FIX: Record stop time to enforce re-entry cooldown
+                        self._stop_cooldowns[symbol] = now
 
             except Exception as e:
                 logger.debug(f"MR exit check error for {symbol}: {e}")

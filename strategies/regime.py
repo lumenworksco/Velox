@@ -69,6 +69,36 @@ class MarketRegime:
         ):
             return self.regime
 
+        # BUG-FIX: VIX override — if VIX > 30, force BEARISH regardless
+        # of HMM or EMA.  During tariff-panic/crash scenarios, the HMM
+        # can remain stuck on a stale BULLISH classification (trained on
+        # older data) and the EMA20 is too slow to react to intraday
+        # crashes.  VIX > 30 is unambiguous high-fear territory.
+        try:
+            from risk import get_vix_level
+            vix = get_vix_level()
+            if vix > 30:
+                self.regime = "BEARISH"
+                self.last_check = now
+                # Also update HMM state if available.
+                # V12 HOTFIX (CodeQL): explicit fail-open — HMM is optional,
+                # so a missing module should not break the VIX override path.
+                try:
+                    from analytics.hmm_regime import MarketRegimeState
+                    self.hmm_regime = MarketRegimeState.HIGH_VOL_BEAR
+                except ImportError as e:
+                    logger.debug(
+                        "HMM MarketRegimeState unavailable during VIX override; "
+                        "skipping hmm_regime sync: %s", e,
+                    )
+                logger.warning(
+                    "VIX override: VIX=%.1f > 30 — forcing regime to BEARISH",
+                    vix,
+                )
+                return self.regime
+        except Exception as e:
+            logger.debug("VIX override check failed (non-fatal): %s", e)
+
         # Try HMM first
         hmm_enabled = getattr(config, "HMM_REGIME_ENABLED", False)
         if hmm_enabled:

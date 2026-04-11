@@ -370,10 +370,26 @@ class KalmanPairsTrader:
         e = y - y_hat  # Spread (innovation)
 
         # V12 FINAL: Check P condition BEFORE gain computation to prevent K divergence
+        # V12 HOTFIX: Rate-limit the log message — repeatedly ill-conditioned
+        # pairs spam the log with 60+ warnings per session. Log at WARNING only
+        # on the first and every 50th reset per pair; rest go to DEBUG.
         initial_variance = 1.0
         if np.linalg.cond(P) > 1e6:
             P = np.eye(2) * initial_variance
-            logger.warning("V12 FINAL: P matrix pre-update reset for %s (cond > 1e6)", pair_key)
+            if not hasattr(self, "_pre_reset_counts"):
+                self._pre_reset_counts: dict[str, int] = {}
+            _n = self._pre_reset_counts.get(pair_key, 0) + 1
+            self._pre_reset_counts[pair_key] = _n
+            if _n == 1 or _n % 50 == 0:
+                logger.warning(
+                    "V12 FINAL: P matrix pre-update reset for %s (cond > 1e6, count=%d)",
+                    pair_key, _n,
+                )
+            else:
+                logger.debug(
+                    "V12 FINAL: P matrix pre-update reset for %s (cond > 1e6, count=%d)",
+                    pair_key, _n,
+                )
 
         # Innovation covariance
         R = config.KALMAN_OBS_NOISE  # Observation noise
@@ -405,13 +421,25 @@ class KalmanPairsTrader:
         # V12 2.7: P matrix regularization — if condition number explodes
         # (spread near zero for extended periods), Kalman gain diverges.
         # Reset P to identity * initial_variance to restore numerical stability.
+        # V12 HOTFIX: Rate-limit the log to avoid spamming when a pair is
+        # chronically ill-conditioned (e.g. V_MA, JPM_MA).
         try:
             cond = np.linalg.cond(P)
             if cond > 1e6:
-                logger.warning(
-                    f"V12 2.7: P matrix ill-conditioned for {pair_key} "
-                    f"(cond={cond:.2e}), resetting to identity"
-                )
+                if not hasattr(self, "_post_reset_counts"):
+                    self._post_reset_counts: dict[str, int] = {}
+                _n = self._post_reset_counts.get(pair_key, 0) + 1
+                self._post_reset_counts[pair_key] = _n
+                if _n == 1 or _n % 50 == 0:
+                    logger.warning(
+                        f"V12 2.7: P matrix ill-conditioned for {pair_key} "
+                        f"(cond={cond:.2e}, count={_n}), resetting to identity"
+                    )
+                else:
+                    logger.debug(
+                        f"V12 2.7: P matrix ill-conditioned for {pair_key} "
+                        f"(cond={cond:.2e}, count={_n}), resetting to identity"
+                    )
                 P = np.eye(2) * 1.0
         except np.linalg.LinAlgError:
             logger.warning(

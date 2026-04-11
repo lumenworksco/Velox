@@ -273,6 +273,14 @@ def eod_close(
     day_strategies = ("MICRO_MOM", "BETA_HEDGE", "ORB", "VWAP", "STAT_MR", "KALMAN_PAIRS")
     closed_count = 0
 
+    # V12 HOTFIX: mark recently-closed symbols so broker_sync doesn't re-adopt
+    # them during the close window
+    try:
+        from engine.broker_sync import mark_symbol_close_attempted
+    except Exception:
+        def mark_symbol_close_attempted(_s: str) -> None:  # type: ignore[misc]
+            return None
+
     for symbol in list(risk.open_trades.keys()):
         trade = risk.open_trades[symbol]
 
@@ -281,7 +289,16 @@ def eod_close(
 
         if trade.hold_type == "day" and trade.strategy in day_strategies:
             try:
-                close_position(symbol, reason="eod_close")
+                # V12 HOTFIX: Check return value — if broker rejects the
+                # close, do NOT log a phantom close_trade() to the DB.
+                ok = close_position(symbol, reason="eod_close")
+                if not ok:
+                    logger.error(
+                        f"EOD close rejected by broker for {symbol} — leaving "
+                        f"position in tracking, will retry next cycle"
+                    )
+                    continue
+                mark_symbol_close_attempted(symbol)
                 try:
                     snap = get_snapshot(symbol)
                     ep = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price

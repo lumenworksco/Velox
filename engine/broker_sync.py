@@ -2,6 +2,7 @@
 
 import logging
 import threading
+import time as _time_mod
 from datetime import datetime, timedelta
 
 import config
@@ -16,6 +17,63 @@ logger = logging.getLogger(__name__)
 # V11.3 P8: Protected by lock for thread safety
 _broker_miss_counts: dict[str, int] = {}
 _broker_miss_lock = threading.Lock()
+
+# V12 HOTFIX: Track symbols where a close was recently attempted so that we do NOT
+# re-adopt them in sync_positions_with_broker() while the broker is still
+# processing the close order. Without this, the phantom-exit loop occurs:
+#   scan N:    strategy returns z-stop → close_position submitted
+#              risk.close_trade() removes from open_trades, logs to DB
+#              sync runs → broker still holds position (close pending) →
+#                          position re-adopted into open_trades
+#   scan N+1:  strategy sees re-adopted position → z-stop again → close_trade
+#              logs ANOTHER exit for the SAME underlying position → loop
+# The cooldown blocks re-adoption for a few minutes after a close attempt.
+_recent_close_attempts: dict[str, float] = {}
+_recent_close_lock = threading.Lock()
+
+# How long a symbol stays in the "recently closed" set. Needs to exceed the
+# max scan interval plus broker order-fill latency.
+RECENT_CLOSE_COOLDOWN_SEC = 300  # 5 minutes
+
+
+def mark_symbol_close_attempted(symbol: str) -> None:
+    """Record that we just submitted a close for this symbol.
+
+    Called by exit_orchestrator and exit_processor right after submitting a
+    close/partial-close order. Prevents sync_positions_with_broker() from
+    re-adopting the position while the close is still in flight at the broker.
+    """
+    with _recent_close_lock:
+        _recent_close_attempts[symbol] = _time_mod.time()
+
+
+def was_recently_closed(symbol: str) -> bool:
+    """Return True if a close was submitted for this symbol within the cooldown."""
+    with _recent_close_lock:
+        ts = _recent_close_attempts.get(symbol)
+        if ts is None:
+            return False
+        if _time_mod.time() - ts > RECENT_CLOSE_COOLDOWN_SEC:
+            # Expired — drop it so the dict doesn't grow unbounded
+            _recent_close_attempts.pop(symbol, None)
+            return False
+        return True
+
+
+def clear_recent_close(symbol: str) -> None:
+    """Forget a symbol's recent-close mark — used by tests and daily reset."""
+    with _recent_close_lock:
+        _recent_close_attempts.pop(symbol, None)
+
+
+def prune_recent_closes() -> None:
+    """Drop any expired recent-close entries."""
+    now_ts = _time_mod.time()
+    with _recent_close_lock:
+        expired = [s for s, ts in _recent_close_attempts.items()
+                   if now_ts - ts > RECENT_CLOSE_COOLDOWN_SEC]
+        for s in expired:
+            _recent_close_attempts.pop(s, None)
 
 # Lazy-loaded optional modules
 _notifications = None
@@ -151,6 +209,18 @@ def sync_positions_with_broker(risk: RiskManager, now: datetime, ws_monitor=None
     our_symbols = set(risk.open_trades.keys())
     for symbol in broker_positions:
         if symbol not in our_symbols and symbol not in getattr(config, "BROKER_SYNC_EXCLUDE_SYMBOLS", {"SPY"}):
+            # V12 HOTFIX: Skip symbols we just tried to close — their close
+            # order is still pending at the broker. Re-adopting them creates
+            # a phantom-exit loop where every subsequent scan cycle logs a
+            # duplicate close_trade() to the DB without the broker position
+            # ever actually changing.
+            if was_recently_closed(symbol):
+                logger.info(
+                    "V12 HOTFIX: Skipping re-adoption of %s — close was recently "
+                    "submitted, broker is still processing (cooldown %ds)",
+                    symbol, RECENT_CLOSE_COOLDOWN_SEC,
+                )
+                continue
             bp = broker_positions[symbol]
             qty = int(float(bp.qty))
             avg_price = float(bp.avg_entry_price)
@@ -360,6 +430,15 @@ def recover_positions(risk: RiskManager, now: datetime) -> dict:
     for symbol in adopted:
         if symbol in exclude:
             logger.info(f"V12-6.5: Skipping excluded symbol {symbol} (hedge/manual)")
+            continue
+        # V12 HOTFIX: Same guard as sync_positions_with_broker — don't adopt
+        # a symbol we just tried to close (close order still pending).
+        if was_recently_closed(symbol):
+            logger.info(
+                "V12-6.5 HOTFIX: Skipping adoption of %s — close was recently "
+                "submitted, broker still processing",
+                symbol,
+            )
             continue
 
         bp = broker_positions[symbol]

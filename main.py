@@ -894,7 +894,11 @@ def main():
                     sym,
                 )
                 try:
-                    risk.close_trade(sym, 0.0, now_et(), exit_reason="orphan_recovery")
+                    # Use entry_price as exit_price to record 0 P&L (not -100%)
+                    # The position doesn't exist at broker, so there's no real loss
+                    _orphan_trade = risk.open_trades.get(sym)
+                    _orphan_exit_price = _orphan_trade.entry_price if _orphan_trade else 0.0
+                    risk.close_trade(sym, _orphan_exit_price, now_et(), exit_reason="orphan_recovery")
                 except Exception as e:
                     logger.debug("V12 6.5: Failed to close orphan trade %s: %s", sym, e)
 
@@ -1337,6 +1341,21 @@ def main():
 
                     # Trading hours scan
                     if is_trading_hours(current_time):
+                        # BUG-FIX: Refresh account equity BEFORE circuit breaker
+                        # check.  Previously update_equity() ran at the END of
+                        # the loop, so the circuit breaker always evaluated
+                        # stale P&L from the prior cycle.  During rapid losses
+                        # ($69K over 2 days) the breaker never fired because
+                        # day_pnl lagged behind actual account equity.
+                        try:
+                            _cb_account = get_account()
+                            risk.update_equity(
+                                float(_cb_account.equity),
+                                float(_cb_account.cash),
+                            )
+                        except Exception as _eq_err:
+                            logger.warning("Pre-CB equity refresh failed: %s", _eq_err)
+
                         # 1. Update PnL lock state
                         pnl_lock.update(risk.day_pnl)
 
@@ -1399,9 +1418,23 @@ def main():
                                     )
                                     try:
                                         from execution import close_position as _emergency_close
+                                        # V12 HOTFIX: check return value; only
+                                        # close_trade() on actual broker success
+                                        try:
+                                            from engine.broker_sync import mark_symbol_close_attempted as _mkmark
+                                        except Exception:
+                                            def _mkmark(_s: str) -> None:  # type: ignore[misc]
+                                                return None
                                         for _sym in list(risk.open_trades.keys()):
                                             try:
-                                                _emergency_close(_sym, reason="kill_switch_fallback")
+                                                _ok = _emergency_close(_sym, reason="kill_switch_fallback")
+                                                if not _ok:
+                                                    logger.critical(
+                                                        "Kill switch fallback: close rejected for %s "
+                                                        "— MANUAL INTERVENTION REQUIRED", _sym,
+                                                    )
+                                                    continue
+                                                _mkmark(_sym)
                                                 _t = risk.open_trades.get(_sym)
                                                 if _t:
                                                     risk.close_trade(
@@ -1424,12 +1457,26 @@ def main():
                                 skip_scan = True
                             elif tiered_cb.should_close_day_trades:
                                 # Red tier: close day-hold positions
+                                # V12 HOTFIX: check return value; only call
+                                # risk.close_trade() on actual broker success
+                                try:
+                                    from engine.broker_sync import mark_symbol_close_attempted as _cbmark
+                                except Exception:
+                                    def _cbmark(_s: str) -> None:  # type: ignore[misc]
+                                        return None
                                 for sym in list(risk.open_trades.keys()):
                                     t = risk.open_trades[sym]
                                     if t.hold_type == "day":
                                         try:
                                             from execution import close_position as _close_pos
-                                            _close_pos(sym, reason="circuit_breaker_red")
+                                            _ok = _close_pos(sym, reason="circuit_breaker_red")
+                                            if not _ok:
+                                                logger.error(
+                                                    f"Circuit breaker close rejected for {sym} "
+                                                    f"— will retry next cycle"
+                                                )
+                                                continue
+                                            _cbmark(sym)
                                             risk.close_trade(sym, t.entry_price, current, exit_reason="circuit_breaker_red")
                                         except Exception as e:
                                             logger.error(f"Circuit breaker close failed for {sym}: {e}", exc_info=True)
@@ -1489,9 +1536,14 @@ def main():
                                 feed_monitor.consecutive_down_cycles,
                             )
                         else:
+                            # V12 HOTFIX: signal_ranker was being passed as the
+                            # 9th positional arg, which maps to copula_pairs.
+                            # That caused "'SignalRanker' object has no attribute
+                            # 'scan'" errors every cycle. Pass it by keyword.
                             signals = scan_all_strategies(
                                 current, regime, stat_mr, kalman_pairs, micro_mom,
-                                vwap_strategy, orb_strategy, pead_strategy, signal_ranker,
+                                vwap_strategy, orb_strategy, pead_strategy,
+                                signal_ranker=signal_ranker,
                                 day_pnl_pct=day_pnl_pct,
                             )
 
@@ -1599,6 +1651,15 @@ def main():
                                         handle_strategy_exits(adv_exits, risk, current, ws_monitor)
                                 except Exception as e:
                                     logger.error("Advanced exits failed: %s", e)
+
+                        # BUG-FIX: Refresh equity immediately after exits so subsequent
+                        # position sizing uses up-to-date buying power (prevents stale
+                        # equity from inflating sizes after a loss).
+                        try:
+                            _acct = get_account()
+                            risk.update_equity(float(_acct.equity), float(_acct.cash))
+                        except Exception:
+                            pass  # Fail-open: stale equity is better than crashing
 
                         # V12 FINAL: Wire WinStreakTracker — record each newly closed trade
                         if _win_streak_tracker:
@@ -1785,7 +1846,11 @@ def main():
                     # V9: Alpha decay check at EOD
                     if alpha_decay_monitor:
                         try:
-                            report = alpha_decay_monitor.get_strategy_health_report()
+                            # V12 HOTFIX: load trade history as DataFrame for the monitor
+                            import pandas as _pd
+                            _rows = database.get_recent_trades(days=120) or []
+                            _trade_df = _pd.DataFrame(_rows)
+                            report = alpha_decay_monitor.get_strategy_health_report(_trade_df)
                             for strat, health in report.items():
                                 status = health.get("status", "unknown")
                                 if status == "critical":
@@ -1961,7 +2026,11 @@ def main():
                         _v9_dash['overnight_count'] = len(overnight_manager.get_overnight_positions())
                     if alpha_decay_monitor:
                         try:
-                            report = alpha_decay_monitor.get_strategy_health_report()
+                            # V12 HOTFIX: pass trade history DataFrame
+                            import pandas as _pd
+                            _rows = database.get_recent_trades(days=60) or []
+                            _trade_df = _pd.DataFrame(_rows)
+                            report = alpha_decay_monitor.get_strategy_health_report(_trade_df)
                             warnings = [f"{s}: {d.get('status','')}" for s, d in report.items()
                                        if d.get('status') in ('warning', 'critical')]
                             _v9_dash['alpha_warnings'] = warnings

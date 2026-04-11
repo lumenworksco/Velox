@@ -1,4 +1,8 @@
-"""Advanced exit mechanics — scaled TP, trailing stops, ATR trailing, volatility exits."""
+"""Advanced exit mechanics — scaled TP, trailing stops, ATR trailing, volatility exits.
+
+NOTE: As of V12, this module is superseded by engine.exit_orchestrator.ExitOrchestrator.
+It is kept for backward compatibility and referenced only by tests.
+"""
 
 import copy
 import logging
@@ -12,6 +16,52 @@ from data import get_intraday_bars
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 logger = logging.getLogger(__name__)
+
+
+def _full_close(risk_manager, symbol: str, price: float, now: datetime, reason: str) -> bool:
+    """V12 HOTFIX: Submit a broker close AND record in risk_manager.
+
+    exit_manager previously called risk_manager.close_trade() directly without
+    submitting a close order to the broker. That removed the position from our
+    tracking but left it open at the broker — triggering the phantom-exit
+    re-adoption loop via broker_sync.
+    """
+    try:
+        from execution import close_position
+    except Exception as e:
+        logger.error("exit_manager: failed to import execution: %s", e)
+        return False
+
+    # V12 HOTFIX: broker_sync guard — fail-open if import fails (tests)
+    try:
+        from engine.broker_sync import mark_symbol_close_attempted, was_recently_closed
+    except Exception:
+        def mark_symbol_close_attempted(_s: str) -> None:  # type: ignore[misc]
+            return None
+
+        def was_recently_closed(_s: str) -> bool:  # type: ignore[misc]
+            return False
+
+    if was_recently_closed(symbol):
+        logger.info("exit_manager: skipping %s — close recently submitted", symbol)
+        return False
+
+    try:
+        close_ok = close_position(symbol, reason=reason)
+    except Exception as e:
+        logger.error("exit_manager: close_position raised for %s: %s", symbol, e)
+        return False
+
+    if not close_ok:
+        logger.warning(
+            "exit_manager: close rejected by broker for %s (reason=%s) — "
+            "leaving position open", symbol, reason,
+        )
+        return False
+
+    mark_symbol_close_attempted(symbol)
+    risk_manager.close_trade(symbol, price, now, reason)
+    return True
 
 
 class ExitManager:
@@ -209,8 +259,9 @@ class ExitManager:
                     trade.stop_loss = trailing_stop
 
                 if current_price <= trade.stop_loss:
-                    risk_manager.close_trade(trade.symbol, current_price, now, "trailing_stop")
-                    return {"symbol": trade.symbol, "action": "trailing_stop", "qty": trade.qty}
+                    if _full_close(risk_manager, trade.symbol, current_price, now, "trailing_stop"):
+                        return {"symbol": trade.symbol, "action": "trailing_stop", "qty": trade.qty}
+                    return None
 
         elif trade.side == "sell":
             if trade.lowest_price_seen > 0 and trade.lowest_price_seen < trade.entry_price:
@@ -219,8 +270,9 @@ class ExitManager:
                     trade.stop_loss = trailing_stop
 
                 if current_price >= trade.stop_loss:
-                    risk_manager.close_trade(trade.symbol, current_price, now, "trailing_stop")
-                    return {"symbol": trade.symbol, "action": "trailing_stop", "qty": trade.qty}
+                    if _full_close(risk_manager, trade.symbol, current_price, now, "trailing_stop"):
+                        return {"symbol": trade.symbol, "action": "trailing_stop", "qty": trade.qty}
+                    return None
 
         return None
 
@@ -252,8 +304,9 @@ class ExitManager:
                 trade.stop_loss = atr_trail_stop
 
             if current_price <= trade.stop_loss:
-                risk_manager.close_trade(trade.symbol, current_price, now, "atr_trailing_stop")
-                return {"symbol": trade.symbol, "action": "atr_trailing_stop", "qty": trade.qty}
+                if _full_close(risk_manager, trade.symbol, current_price, now, "atr_trailing_stop"):
+                    return {"symbol": trade.symbol, "action": "atr_trailing_stop", "qty": trade.qty}
+                return None
 
         elif trade.side == "sell":
             # Check activation: must be in profit by at least 0.5x ATR
@@ -270,8 +323,9 @@ class ExitManager:
                 trade.stop_loss = atr_trail_stop
 
             if current_price >= trade.stop_loss:
-                risk_manager.close_trade(trade.symbol, current_price, now, "atr_trailing_stop")
-                return {"symbol": trade.symbol, "action": "atr_trailing_stop", "qty": trade.qty}
+                if _full_close(risk_manager, trade.symbol, current_price, now, "atr_trailing_stop"):
+                    return {"symbol": trade.symbol, "action": "atr_trailing_stop", "qty": trade.qty}
+                return None
 
         return None
 
@@ -289,12 +343,14 @@ class ExitManager:
             rsi = rsi_series.iloc[-1]
 
             if trade.side == "buy" and rsi > config.RSI_EXIT_THRESHOLD:
-                risk_manager.close_trade(trade.symbol, current_price, now, "rsi_overbought")
-                return {"symbol": trade.symbol, "action": "rsi_overbought", "qty": trade.qty}
+                if _full_close(risk_manager, trade.symbol, current_price, now, "rsi_overbought"):
+                    return {"symbol": trade.symbol, "action": "rsi_overbought", "qty": trade.qty}
+                return None
 
             if trade.side == "sell" and rsi < (100 - config.RSI_EXIT_THRESHOLD):
-                risk_manager.close_trade(trade.symbol, current_price, now, "rsi_oversold")
-                return {"symbol": trade.symbol, "action": "rsi_oversold", "qty": trade.qty}
+                if _full_close(risk_manager, trade.symbol, current_price, now, "rsi_oversold"):
+                    return {"symbol": trade.symbol, "action": "rsi_oversold", "qty": trade.qty}
+                return None
 
         except Exception as e:
             logger.debug(f"RSI exit check failed for {trade.symbol}: {e}")
@@ -318,8 +374,9 @@ class ExitManager:
             current_atr = atr_series.iloc[-1]
 
             if current_atr > trade.entry_atr * config.ATR_EXPANSION_MULT:
-                risk_manager.close_trade(trade.symbol, current_price, now, "volatility_expansion")
-                return {"symbol": trade.symbol, "action": "volatility_expansion", "qty": trade.qty}
+                if _full_close(risk_manager, trade.symbol, current_price, now, "volatility_expansion"):
+                    return {"symbol": trade.symbol, "action": "volatility_expansion", "qty": trade.qty}
+                return None
 
         except Exception as e:
             logger.debug(f"Volatility exit check failed for {trade.symbol}: {e}")
@@ -327,14 +384,21 @@ class ExitManager:
         return None
 
     def _execute_partial(self, risk_manager, symbol: str, qty: int,
-                         price: float, now: datetime, reason: str):
-        """Execute a partial position close via the broker."""
+                         price: float, now: datetime, reason: str) -> bool:
+        """Execute a partial position close via the broker. Returns True on success."""
         try:
             from execution import close_partial_position
-            close_partial_position(symbol, qty)
+            close_ok = close_partial_position(symbol, qty)
         except Exception as e:
             logger.error(f"Partial close execution failed for {symbol}: {e}")
-            return
+            return False
+
+        if not close_ok:
+            logger.warning(
+                "exit_manager: partial close rejected by broker for %s qty=%d — "
+                "leaving position open", symbol, qty,
+            )
+            return False
 
         risk_manager.partial_close(symbol, qty, price, now, reason)
 
@@ -353,6 +417,8 @@ class ExitManager:
                 )
         except Exception as e:
             logger.debug(f"OMS registration for partial close failed (non-critical): {e}")
+
+        return True
 
     def update_highest_prices(self, risk_manager, quotes: dict):
         """Update price extremes from live quote data (called by WebSocket handler).

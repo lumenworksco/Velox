@@ -465,7 +465,7 @@ def _refresh_asset_status_blocklist() -> None:
             return  # Still fresh
 
     try:
-        from broker.alpaca_client import get_trading_client
+        from data import get_trading_client  # V12 HOTFIX: correct import path
 
         client = get_trading_client()
         # Fetch the full set of open-position symbols + recently seen symbols
@@ -537,7 +537,7 @@ def _is_asset_blocked(symbol: str) -> bool:
     # (i.e., the broker API is actually available in this environment)
     if _last_successful_asset_refresh > 0:
         try:
-            from broker.alpaca_client import get_trading_client
+            from data import get_trading_client  # V12 HOTFIX: correct import path
 
             client = get_trading_client()
             asset = client.get_asset(symbol)
@@ -629,10 +629,27 @@ def _pairs_atomic_rollback(leg1_order_id: str, symbol: str) -> bool:
 
     Submits a market close order for the given symbol with retry logic.
     Returns True if rollback succeeded, False if all attempts exhausted.
+
+    V12 HOTFIX: Check the return value of close_position() — previously this
+    only caught exceptions, but close_position() now returns False on
+    40310000 bracket qty holds. Also marks the symbol as recently-closed so
+    broker_sync doesn't re-adopt it while the close is in flight.
     """
+    # Lazy import to avoid circular
+    try:
+        from engine.broker_sync import mark_symbol_close_attempted
+    except Exception:
+        def mark_symbol_close_attempted(_s: str) -> None:  # type: ignore[misc]
+            return None
+
     for attempt in range(3):
         try:
-            close_position(symbol, reason="pair_atomic_rollback")
+            ok = close_position(symbol, reason="pair_atomic_rollback")
+        except Exception as e:
+            logger.error(f"T1-001: Pairs rollback attempt {attempt + 1}/3 raised for {symbol}: {e}")
+            ok = False
+        if ok:
+            mark_symbol_close_attempted(symbol)
             logger.warning(f"T1-001: Pairs rollback succeeded for {symbol} (order {leg1_order_id}) on attempt {attempt + 1}")
             _emit_event("PAIRS_ROLLBACK_TRIGGERED", {
                 "symbol": symbol,
@@ -641,10 +658,8 @@ def _pairs_atomic_rollback(leg1_order_id: str, symbol: str) -> bool:
                 "status": "success",
             })
             return True
-        except Exception as e:
-            logger.error(f"T1-001: Pairs rollback attempt {attempt + 1}/3 failed for {symbol}: {e}")
-            if attempt < 2:
-                _time.sleep(0.5 * (attempt + 1))  # 500ms backoff
+        if attempt < 2:
+            _time.sleep(0.5 * (attempt + 1))  # 500ms backoff
 
     logger.critical(f"T1-001: PAIRS ROLLBACK FAILED after 3 attempts for {symbol} (order {leg1_order_id}) — manual intervention required")
     _emit_event("PAIRS_ROLLBACK_TRIGGERED", {
@@ -886,12 +901,18 @@ def process_signals(
                     if second_sig.symbol not in risk.open_trades:
                         logger.warning(f"T1-001: Pair {pair_id}: second leg {second_sig.symbol} failed, rolling back first leg {first_sig.symbol}")
                         rollback_ok = _pairs_atomic_rollback(leg1_order_id, first_sig.symbol)
-                        # Also clean up risk manager state for leg 1
-                        trade = risk.open_trades.get(first_sig.symbol)
-                        if trade:
-                            risk.close_trade(first_sig.symbol, trade.entry_price, now, exit_reason="pair_atomic_rollback")
-                        if not rollback_ok:
-                            logger.critical(f"T1-001: PAIR ROLLBACK FAILED for {first_sig.symbol} — manual intervention required")
+                        # V12 HOTFIX: Only clean up risk manager state if the
+                        # rollback ACTUALLY succeeded at the broker. Previously
+                        # risk.close_trade() was called unconditionally, which
+                        # logged a phantom close to the DB and removed the
+                        # position from tracking while the broker still had it
+                        # open — exactly the bug pattern we just fixed.
+                        if rollback_ok:
+                            trade = risk.open_trades.get(first_sig.symbol)
+                            if trade:
+                                risk.close_trade(first_sig.symbol, trade.entry_price, now, exit_reason="pair_atomic_rollback")
+                        else:
+                            logger.critical(f"T1-001: PAIR ROLLBACK FAILED for {first_sig.symbol} — manual intervention required (position still open at broker)")
                 else:
                     database.log_signal(now, second_sig.symbol, second_sig.strategy, second_sig.side, False, "pair_first_leg_failed")
             else:
@@ -939,6 +960,17 @@ def _process_single_signal(
         logger.info(f"Signal skipped for {signal.symbol}: in post-stop cooldown")
         database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, skip_reason)
         return
+
+    # 1a2b. BUG-FIX: General recently-traded cooldown to prevent churn.
+    # Any symbol traded in the last 5 minutes is skipped regardless of strategy.
+    _RECENT_TRADE_COOLDOWN_SEC = 300  # 5 minutes
+    if hasattr(_state, 'recent_trades') and signal.symbol in _state.recent_trades:
+        _last_trade_time = _state.recent_trades[signal.symbol]
+        _elapsed_sec = (now - _last_trade_time).total_seconds()
+        if _elapsed_sec < _RECENT_TRADE_COOLDOWN_SEC:
+            logger.debug("Skip %s: recently traded %ds ago", signal.symbol, int(_elapsed_sec))
+            database.log_signal(now, signal.symbol, signal.strategy, signal.side, False, "recent_trade_cooldown")
+            return
 
     # 1a3. Per-symbol daily loss cap
     max_symbol_loss = getattr(config, "MAX_SYMBOL_DAILY_LOSS", 200.0)
@@ -1107,6 +1139,7 @@ def _process_single_signal(
         side=signal.side,
         pnl_lock_mult=lock_mult,
         now=now,  # V12 4.1 + 4.3: intraday session & Friday EOW multipliers
+        symbol=signal.symbol,  # BUG-FIX: Pass symbol for ATR-based vol cap
     )
 
     # V12 6.3: Drawdown-based sizing — smooth multiplier reduces size as drawdown
@@ -1510,6 +1543,11 @@ def _process_single_signal(
         _emit_event(EventTypes.ORDER_FAILED if _EVENTS_AVAILABLE else "order.failed",
                     {"symbol": signal.symbol, "strategy": signal.strategy})
         return
+
+    # BUG-FIX: Record recent trade time to prevent churn (5-min cooldown)
+    if not hasattr(_state, 'recent_trades'):
+        _state.recent_trades = {}
+    _state.recent_trades[signal.symbol] = now
 
     # Track accepted symbol for intra-batch correlation checks
     if batch_accepted is not None:

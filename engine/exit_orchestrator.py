@@ -284,18 +284,60 @@ class ExitOrchestrator:
         from execution import close_position, close_partial_position
         from data import get_snapshot, get_filled_exit_price
 
+        # V12 HOTFIX: broker_sync provides the recently-closed guard. Failing
+        # the import is non-fatal — used only to prevent the phantom exit loop.
+        try:
+            from engine.broker_sync import mark_symbol_close_attempted, was_recently_closed
+        except Exception:
+            def mark_symbol_close_attempted(_s: str) -> None:  # type: ignore[misc]
+                return None
+
+            def was_recently_closed(_s: str) -> bool:  # type: ignore[misc]
+                return False
+
         notif = self._get_notifications()
 
-        for action in exit_actions:
+        # V12 HOTFIX: de-dup exits within a single batch — each symbol gets at
+        # most one action per execute_exits() call, preferring the lowest
+        # priority number (highest priority).
+        _seen_in_batch: set[str] = set()
+
+        for action in sorted(exit_actions, key=lambda a: a.priority):
             symbol = action.symbol
+            if symbol in _seen_in_batch:
+                logger.debug(
+                    "ExitOrchestrator: skipping duplicate action for %s (reason=%s)",
+                    symbol, action.reason,
+                )
+                continue
             if symbol not in risk_manager.open_trades:
+                continue
+            # V12 HOTFIX: If a close was just submitted for this symbol (e.g.
+            # prior scan cycle), don't submit another one while the broker is
+            # still processing it.
+            if was_recently_closed(symbol):
+                logger.info(
+                    "ExitOrchestrator: skipping %s — close was recently submitted "
+                    "(still pending at broker, reason=%s)",
+                    symbol, action.reason,
+                )
                 continue
             trade = risk_manager.open_trades[symbol]
 
             if action.action == "partial":
                 partial_qty = action.qty or max(1, trade.qty // 2)
                 try:
-                    close_partial_position(symbol, partial_qty)
+                    close_ok = close_partial_position(symbol, partial_qty)
+                    if not close_ok:
+                        # V12 HOTFIX: Broker rejected partial — DO NOT log a
+                        # phantom trade to the DB. Keep the position open and
+                        # retry next scan.
+                        logger.warning(
+                            "ExitOrchestrator: partial close rejected by broker for "
+                            "%s qty=%d — leaving position open, will retry",
+                            symbol, partial_qty,
+                        )
+                        continue
                     logger.info(
                         "ExitOrchestrator: partial exit %s: %d shares, reason=%s",
                         symbol, partial_qty, action.reason,
@@ -307,6 +349,8 @@ class ExitOrchestrator:
                                                    now, action.reason)
                     except Exception:
                         pass
+
+                    _seen_in_batch.add(symbol)
 
                     # Register partial in OMS (fail-open)
                     self._register_oms_partial(symbol, trade, partial_qty,
@@ -322,11 +366,30 @@ class ExitOrchestrator:
 
             else:
                 # Full close
+                close_ok = False
                 try:
-                    close_position(symbol, reason=action.reason)
+                    close_ok = close_position(symbol, reason=action.reason)
                 except Exception as e:
                     logger.error(f"ExitOrchestrator: close failed for {symbol}: {e}")
                     continue
+
+                if not close_ok:
+                    # V12 HOTFIX: Broker rejected the close (e.g. pending
+                    # bracket leg, no position, API error). DO NOT log a
+                    # phantom close_trade to the DB — that's the exact bug
+                    # that caused 139 duplicate RBLX exits. Leave the position
+                    # in open_trades so the next cycle can retry.
+                    logger.warning(
+                        "ExitOrchestrator: close rejected by broker for %s — "
+                        "leaving position open, will retry next scan (reason=%s)",
+                        symbol, action.reason,
+                    )
+                    continue
+
+                # V12 HOTFIX: Mark as recently closed so broker_sync won't
+                # re-adopt the position while the close is in flight.
+                mark_symbol_close_attempted(symbol)
+                _seen_in_batch.add(symbol)
 
                 exit_price = get_filled_exit_price(symbol, side=trade.side)
                 if exit_price is None:
@@ -399,11 +462,40 @@ class ExitOrchestrator:
         from execution import close_position
         from data import get_snapshot, get_filled_exit_price
 
+        # V12 HOTFIX: broker_sync guard — fail-open if import fails (tests)
         try:
-            close_position(symbol, reason=reason)
+            from engine.broker_sync import mark_symbol_close_attempted, was_recently_closed
+        except Exception:
+            def mark_symbol_close_attempted(_s: str) -> None:  # type: ignore[misc]
+                return None
+
+            def was_recently_closed(_s: str) -> bool:  # type: ignore[misc]
+                return False
+
+        # V12 HOTFIX: Skip WS close if close was just submitted (still in flight)
+        if was_recently_closed(symbol):
+            logger.info(
+                "ExitOrchestrator WS: skipping close for %s — close recently submitted",
+                symbol,
+            )
+            return
+
+        close_ok = False
+        try:
+            close_ok = close_position(symbol, reason=reason)
         except Exception as e:
             logger.error(f"ExitOrchestrator WS close failed for {symbol}: {e}")
             return
+
+        if not close_ok:
+            logger.warning(
+                "ExitOrchestrator WS: close rejected by broker for %s — "
+                "leaving position open", symbol,
+            )
+            return
+
+        # V12 HOTFIX: Mark recently closed
+        mark_symbol_close_attempted(symbol)
 
         exit_price = get_filled_exit_price(symbol, side=trade.side)
         if exit_price is None:

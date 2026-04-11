@@ -90,6 +90,7 @@ class VolatilityTargetingRiskEngine:
         side: str = "buy",
         pnl_lock_mult: float = 1.0,
         now: datetime | None = None,
+        symbol: str = "",
     ) -> int:
         """
         Position sizing with volatility targeting.
@@ -168,6 +169,64 @@ class VolatilityTargetingRiskEngine:
             tod_mult = get_time_of_day_multiplier(now)
             friday_mult = get_friday_eow_multiplier(now)
             position_value *= tod_mult * friday_mult
+
+        # 6d. BUG-FIX: ATR-based per-stock volatility cap.  High-ATR stocks
+        # (e.g. LYFT with ATR > 5% of price) can produce outsized losses
+        # even when within the portfolio max-position limit.  Halve size
+        # for very volatile stocks so a single adverse move doesn't wipe
+        # out more than the intended risk budget.
+        # V12 HOTFIX (CodeQL): entry_price > 0 is already guaranteed by the
+        # early return at line 115, so the extra comparison is redundant.
+        if symbol:
+            try:
+                # BUG-FIX: Use intraday 5-min bars (last 3 hours) for ATR cap —
+                # daily bars miss intraday volatility spikes (e.g. LYFT at 4.2%)
+                _atr_bars = None
+                try:
+                    from data import get_intraday_bars as _get_intraday_bars
+                    from alpaca.data.timeframe import TimeFrame as _TF, TimeFrameUnit as _TFU
+                    from datetime import timedelta as _td, timezone as _tz
+                    _lookback = now - _td(hours=3) if now else datetime.now(_tz.utc) - _td(hours=3)
+                    _atr_bars = _get_intraday_bars(symbol, _TF(5, _TFU.Minute), start=_lookback)
+                    if _atr_bars is None or len(_atr_bars) < 10:
+                        _atr_bars = None  # Fall through to daily fallback
+                except Exception:
+                    _atr_bars = None  # Fall through to daily fallback
+
+                if _atr_bars is None:
+                    from data import get_daily_bars as _get_daily_bars
+                    _atr_bars = _get_daily_bars(symbol, days=20)
+
+                if _atr_bars is not None and len(_atr_bars) >= 10:
+                    _high = _atr_bars["high"]
+                    _low = _atr_bars["low"]
+                    _prev_close = _atr_bars["close"].shift(1)
+                    _tr = np.maximum(
+                        _high - _low,
+                        np.maximum(
+                            np.abs(_high - _prev_close),
+                            np.abs(_low - _prev_close),
+                        ),
+                    )
+                    _atr_14 = _tr.iloc[-14:].mean()
+                    _atr_pct = _atr_14 / entry_price
+                    # BUG-FIX: Tiered ATR cap — 5% was too loose (LYFT at 4.2% slipped through)
+                    if _atr_pct > 0.07:  # ATR > 7% = extremely volatile — cut to 25%
+                        vol_cap = 0.25
+                        position_value *= vol_cap
+                        logger.info(
+                            "Extreme ATR %.1f%% for %s — size cut to 25%%",
+                            _atr_pct * 100, symbol,
+                        )
+                    elif _atr_pct > 0.03:  # ATR > 3% = high vol — cut to 50%
+                        vol_cap = 0.5
+                        position_value *= vol_cap
+                        logger.info(
+                            "High ATR %.1f%% for %s — size halved",
+                            _atr_pct * 100, symbol,
+                        )
+            except Exception:
+                pass  # Fail-open: if ATR fetch fails, use original size
 
         # 7. Hard caps
         max_position = equity * config.MAX_POSITION_PCT
