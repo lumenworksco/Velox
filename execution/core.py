@@ -1446,16 +1446,94 @@ def get_order_commission(order_id: str, client=None) -> float:
     return 0.0
 
 
-def close_position(symbol: str, reason: str = "") -> bool:
-    """Close an open position by symbol. Returns True on success."""
-    client = get_trading_client()
+def _cancel_pending_orders_for_symbol(client, symbol: str) -> int:
+    """V12 HOTFIX: Cancel all pending orders for a symbol. Returns count cancelled.
+
+    Alpaca's DELETE /v2/positions is supposed to cancel brackets automatically,
+    but in practice bracket TP/SL legs often remain pending and hold the
+    position's qty (40310000 "insufficient qty available for order"). This
+    helper cancels them explicitly BEFORE attempting the close.
+    """
+    cancelled = 0
     try:
-        client.close_position(symbol)
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        open_req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+        open_orders = client.get_orders(filter=open_req)
+        for o in open_orders or []:
+            try:
+                client.cancel_order_by_id(str(o.id))
+                cancelled += 1
+                logger.info(
+                    f"V12 HOTFIX: Cancelled pending order {o.id} on {symbol}"
+                )
+            except Exception as ce:
+                logger.debug(f"V12 HOTFIX: cancel_order_by_id failed for {o.id}: {ce}")
+    except Exception as e:
+        logger.debug(f"V12 HOTFIX: get_orders for {symbol} failed (fail-open): {e}")
+    return cancelled
+
+
+def close_position(symbol: str, reason: str = "") -> bool:
+    """Close an open position by symbol. Returns True on success.
+
+    V12 HOTFIX: Cancels pending bracket legs BEFORE the close. If Alpaca
+    returns 40310000 ("insufficient qty available for order", i.e. bracket
+    legs are still holding the qty), it retries once after a short wait.
+    Returns False on persistent failure — the caller must NOT log a phantom
+    close_trade to the DB when this returns False.
+    """
+    import time as _tm
+    client = get_trading_client()
+
+    # Best-effort: cancel pending orders first
+    _cancel_pending_orders_for_symbol(client, symbol)
+
+    def _attempt() -> tuple[bool, str]:
+        try:
+            client.close_position(symbol)
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    ok, err = _attempt()
+    if ok:
         logger.info(f"Position closed: {symbol} ({reason})")
         return True
-    except Exception as e:
-        logger.error(f"Failed to close {symbol}: {e}")
+
+    err_lower = err.lower()
+
+    # "Position not found" / already flat → treat as success so we reconcile
+    if ("position not found" in err_lower or "no positions" in err_lower
+            or "40410000" in err_lower):
+        logger.info(
+            f"V12 HOTFIX: {symbol} close called but position already flat "
+            f"(reason={reason}) — treating as success"
+        )
+        return True
+
+    # "Insufficient qty" (40310000) → bracket legs didn't cancel in time.
+    # Cancel again aggressively, wait briefly for Alpaca to process, retry once.
+    if ("40310000" in err_lower or "insufficient qty" in err_lower
+            or "held_for_orders" in err_lower):
+        logger.warning(
+            f"V12 HOTFIX: {symbol} close rejected (40310000 bracket qty hold) — "
+            f"retrying after cancelling brackets"
+        )
+        _cancel_pending_orders_for_symbol(client, symbol)
+        _tm.sleep(0.5)  # Give Alpaca a moment to process cancels
+        ok2, err2 = _attempt()
+        if ok2:
+            logger.info(f"V12 HOTFIX: {symbol} close succeeded on retry")
+            return True
+        # Still failing → let the caller retry next cycle. DO NOT log phantom.
+        logger.error(
+            f"V12 HOTFIX: {symbol} close still failing after bracket cancel: {err2}"
+        )
         return False
+
+    logger.error(f"Failed to close {symbol}: {err}")
+    return False
 
 
 def close_all_positions(reason: str = "EOD") -> CloseResult:
@@ -1551,13 +1629,66 @@ def check_vwap_time_stops(open_trades: dict, now: datetime) -> list[str]:
 
 
 def close_partial_position(symbol: str, qty: int) -> bool:
-    """Close a partial position (for scaled exits)."""
+    """Close a partial position (for scaled exits). Returns True on success.
+
+    V12 HOTFIX: Fix Alpaca SDK API usage. alpaca-py's
+    TradingClient.close_position() does NOT accept a qty= kwarg — it requires
+    a ClosePositionRequest object passed as close_options. Previously every
+    partial close raised "TradingClient.close_position() got an unexpected
+    keyword argument 'qty'" and the orchestrator logged the failure but moved
+    on, leaving the full position open.
+    """
+    import time as _tm
+    from alpaca.trading.requests import ClosePositionRequest
+
     client = get_trading_client()
-    try:
-        # V10 BUG-016: Validate qty is int before string conversion (Alpaca API requires str)
-        client.close_position(symbol, qty=str(int(qty)))
+
+    # V12 HOTFIX: Cancel pending bracket legs first — they also block partial
+    # closes with 40310000 ("insufficient qty available for order").
+    _cancel_pending_orders_for_symbol(client, symbol)
+
+    qty_str = str(int(qty))
+    close_req = ClosePositionRequest(qty=qty_str)
+
+    def _attempt() -> tuple[bool, str]:
+        try:
+            client.close_position(symbol, close_options=close_req)
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    ok, err = _attempt()
+    if ok:
         logger.info(f"Partial close: {symbol} qty={qty}")
         return True
-    except Exception as e:
-        logger.error(f"Failed partial close {symbol} qty={qty}: {e}")
+
+    err_lower = err.lower()
+
+    if ("position not found" in err_lower or "no positions" in err_lower
+            or "40410000" in err_lower):
+        logger.info(
+            f"V12 HOTFIX: {symbol} partial close called but position already "
+            f"flat — treating as success"
+        )
+        return True
+
+    # 40310000 insufficient qty → bracket legs holding the shares. Retry once.
+    if ("40310000" in err_lower or "insufficient qty" in err_lower
+            or "held_for_orders" in err_lower):
+        logger.warning(
+            f"V12 HOTFIX: {symbol} partial close rejected (40310000) — "
+            f"retrying after bracket cancel"
+        )
+        _cancel_pending_orders_for_symbol(client, symbol)
+        _tm.sleep(0.5)
+        ok2, err2 = _attempt()
+        if ok2:
+            logger.info(f"V12 HOTFIX: {symbol} partial close succeeded on retry")
+            return True
+        logger.error(
+            f"V12 HOTFIX: {symbol} partial close still failing after retry: {err2}"
+        )
         return False
+
+    logger.error(f"Failed partial close {symbol} qty={qty}: {err}")
+    return False

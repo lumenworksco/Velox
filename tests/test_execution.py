@@ -90,15 +90,30 @@ class TestClosePosition:
 
 class TestClosePartialPosition:
     def test_close_partial_position(self):
-        """close_partial_position calls client with qty string."""
+        """close_partial_position calls client with ClosePositionRequest(qty=...).
+
+        V12 HOTFIX: alpaca-py's TradingClient.close_position() does NOT accept
+        a qty= kwarg — it requires a ClosePositionRequest object passed as
+        close_options. This test enforces that API usage.
+        """
+        from alpaca.trading.requests import ClosePositionRequest
+
         mock_client = MagicMock()
         mock_client.close_position.return_value = True
+        # get_orders returns empty list so the pre-cancel step is a no-op
+        mock_client.get_orders.return_value = []
 
         with patch("execution.core.get_trading_client", return_value=mock_client):
             from execution import close_partial_position
             result = close_partial_position("AAPL", qty=5)
             assert result is True
-            mock_client.close_position.assert_called_with("AAPL", qty="5")
+            # Verify it was called with the symbol and a ClosePositionRequest
+            call_args = mock_client.close_position.call_args
+            assert call_args.args == ("AAPL",) or call_args.args[0] == "AAPL"
+            close_options = call_args.kwargs.get("close_options")
+            assert close_options is not None
+            assert isinstance(close_options, ClosePositionRequest)
+            assert close_options.qty == "5"
 
 
 class TestMaxHoldChecks:

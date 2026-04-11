@@ -81,7 +81,10 @@ class TestATRTrailingStop:
 
         with override_config(ATR_TRAILING_ENABLED=True,
                            ATR_TRAIL_MULT={"STAT_MR": 1.5},
-                           ATR_TRAIL_ACTIVATION=0.5):
+                           ATR_TRAIL_ACTIVATION=0.5), \
+                patch("execution.close_position", return_value=True), \
+                patch("engine.broker_sync.was_recently_closed", return_value=False), \
+                patch("engine.broker_sync.mark_symbol_close_attempted"):
             result = em._check_atr_trailing_stop(trade, 101.5, risk_mgr, now)
             assert result is not None
             assert result["action"] == "atr_trailing_stop"
@@ -115,7 +118,10 @@ class TestATRTrailingStop:
 
         with override_config(ATR_TRAILING_ENABLED=True,
                            ATR_TRAIL_MULT={"STAT_MR": 1.5},
-                           ATR_TRAIL_ACTIVATION=0.5):
+                           ATR_TRAIL_ACTIVATION=0.5), \
+                patch("execution.close_position", return_value=True), \
+                patch("engine.broker_sync.was_recently_closed", return_value=False), \
+                patch("engine.broker_sync.mark_symbol_close_attempted"):
             result = em._check_atr_trailing_stop(trade, 98.5, risk_mgr, now)
             assert result is not None
             assert result["action"] == "atr_trailing_stop"

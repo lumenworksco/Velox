@@ -267,9 +267,32 @@ def handle_strategy_exits(exit_actions: list[dict], risk: RiskManager, now: date
     """
     notif = _get_notifications()
 
+    # V12 HOTFIX: Lazy-import to avoid circular import; fail-open in tests
+    try:
+        from engine.broker_sync import mark_symbol_close_attempted, was_recently_closed
+    except Exception:
+        def mark_symbol_close_attempted(_s: str) -> None:  # type: ignore[misc]
+            return None
+
+        def was_recently_closed(_s: str) -> bool:  # type: ignore[misc]
+            return False
+
+    # V12 HOTFIX: de-dup actions per symbol within a single batch
+    _seen: set[str] = set()
+
     for action in exit_actions:
         symbol = action["symbol"]
+        if symbol in _seen:
+            continue
         if symbol not in risk.open_trades:
+            continue
+        # V12 HOTFIX: Don't issue another close for a symbol whose previous
+        # close is still in flight.
+        if was_recently_closed(symbol):
+            logger.info(
+                "handle_strategy_exits: skipping %s — close recently submitted",
+                symbol,
+            )
             continue
         trade = risk.open_trades[symbol]
         reason = action.get("reason", "strategy_exit")
@@ -277,19 +300,41 @@ def handle_strategy_exits(exit_actions: list[dict], risk: RiskManager, now: date
         if action.get("action") == "partial":
             partial_qty = action.get("qty", max(1, trade.qty // 2))
             try:
-                close_partial_position(symbol, partial_qty)
+                close_ok = close_partial_position(symbol, partial_qty)
+                if not close_ok:
+                    logger.warning(
+                        "Partial close rejected by broker for %s qty=%d — leaving "
+                        "position open, will retry",
+                        symbol, partial_qty,
+                    )
+                    continue
                 logger.info(f"Partial exit {symbol}: {partial_qty} shares, reason={reason}")
+                _seen.add(symbol)
                 _emit_event(EventTypes.POSITION_PARTIAL_CLOSE if _EVENTS_AVAILABLE else "position.partial_close", {
                     "symbol": symbol, "strategy": trade.strategy, "qty": partial_qty, "reason": reason,
                 })
             except Exception as e:
                 logger.error(f"Partial close failed for {symbol}: {e}")
         else:
+            close_ok = False
             try:
-                close_position(symbol, reason=reason)
+                close_ok = close_position(symbol, reason=reason)
             except Exception as e:
                 logger.error(f"Close failed for {symbol}: {e}")
                 continue
+
+            if not close_ok:
+                # V12 HOTFIX: Broker rejected the close — don't log a phantom
+                # exit. Leave position in open_trades and retry next scan.
+                logger.warning(
+                    "Close rejected by broker for %s — leaving position open, "
+                    "will retry next scan (reason=%s)", symbol, reason,
+                )
+                continue
+
+            # V12 HOTFIX: Mark recently closed so broker_sync doesn't re-adopt
+            mark_symbol_close_attempted(symbol)
+            _seen.add(symbol)
 
             exit_price = get_filled_exit_price(symbol, side=trade.side)
             if exit_price is None:
@@ -355,11 +400,32 @@ def handle_ws_close(symbol: str, reason: str, risk: RiskManager, ws_monitor):
         logger.info(f"WS: {symbol} {reason} detected — deferring to broker bracket order")
         return
 
+    # V12 HOTFIX: Lazy import to avoid circular; fail-open in tests
     try:
-        close_position(symbol, reason=reason)
+        from engine.broker_sync import mark_symbol_close_attempted, was_recently_closed
+    except Exception:
+        def mark_symbol_close_attempted(_s: str) -> None:  # type: ignore[misc]
+            return None
+
+        def was_recently_closed(_s: str) -> bool:  # type: ignore[misc]
+            return False
+
+    if was_recently_closed(symbol):
+        logger.info("handle_ws_close: skipping %s — close recently submitted", symbol)
+        return
+
+    close_ok = False
+    try:
+        close_ok = close_position(symbol, reason=reason)
     except Exception as e:
         logger.error(f"WS close failed for {symbol}: {e}")
         return
+
+    if not close_ok:
+        logger.warning("WS close rejected by broker for %s — leaving position open", symbol)
+        return
+
+    mark_symbol_close_attempted(symbol)
 
     exit_price = get_filled_exit_price(symbol, side=trade.side)
     if exit_price is None:

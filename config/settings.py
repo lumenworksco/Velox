@@ -206,7 +206,12 @@ PAIRS_MAX_HOLD_DAYS = 10
 PAIRS_MAX_ACTIVE = 15
 PAIRS_MIN_CORRELATION = 0.80       # Tightened from 0.70 — higher quality pairs only
 PAIRS_COINT_PVALUE = 0.05          # Tightened from 0.10 — require stronger cointegration
-KALMAN_DELTA = 1e-4
+# V12 HOTFIX: Raised KALMAN_DELTA from 1e-4 to 5e-4 so the process-noise
+# regularization keeps P numerically well-conditioned between updates.
+# The old value caused chronic "P matrix ill-conditioned" warnings on
+# tightly-cointegrated pairs (V_MA, JPM_MA, JPM_BAC) where spread variance
+# collapsed and cond(P) exploded on almost every update.
+KALMAN_DELTA = 5e-4
 KALMAN_OBS_NOISE = 0.001
 PAIRS_TP_PCT = 0.015   # V10: 1.5% take-profit (was 0.5% — negative EV after costs)
 PAIRS_SL_PCT = 0.010   # V10: 1.0% stop-loss (was 1.5% — gives 1.5:1 R/R)

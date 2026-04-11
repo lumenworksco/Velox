@@ -104,6 +104,11 @@ class PDTCompliance:
         self._pdt_restricted = False
         self._restriction_start: Optional[date] = None
 
+        # V12 HOTFIX: Last equity observed via can_day_trade(). Used by
+        # _record_inner() to avoid spamming PDT VIOLATION alerts on accounts
+        # that are exempt from the rule (equity >= $25k).
+        self._last_known_equity: Optional[float] = None
+
         # Load persisted records
         self._load_history()
 
@@ -124,6 +129,11 @@ class PDTCompliance:
             - reason: Human-readable explanation.
         """
         with self._lock:
+            # V12 HOTFIX: Remember the equity so _record_inner() can decide
+            # whether to emit a "PDT VIOLATION" alert. Without this, a $992k
+            # account spams CRITICAL alerts even though the rule doesn't
+            # apply.
+            self._last_known_equity = float(equity)
             return self._check_inner(equity)
 
     def record_day_trade(self, symbol: str, trade_date: date | None = None,
@@ -266,6 +276,18 @@ class PDTCompliance:
             f"PDT: Recorded day trade {symbol} on {trade_date} "
             f"({trades_in_window}/{PDT_MAX_DAY_TRADES} in window)"
         )
+
+        # V12 HOTFIX: Only raise a VIOLATION alert if we have a recorded equity
+        # below the PDT threshold. On $25k+ accounts the PDT rule does not
+        # apply at all — logging "VIOLATION" for every same-day close on a
+        # $992k account spammed the log with misleading CRITICAL alerts
+        # (16+ in one session). Track last-seen equity via check_equity().
+        last_equity = getattr(self, "_last_known_equity", None)
+        pdt_applies = last_equity is None or last_equity < PDT_EQUITY_THRESHOLD
+
+        if not pdt_applies:
+            # Account is above $25k — PDT rule doesn't apply. Skip the alert.
+            return
 
         if trades_in_window > PDT_MAX_DAY_TRADES:
             self._pdt_restricted = True

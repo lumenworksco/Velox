@@ -107,11 +107,21 @@ class PositionMonitor:
                         pass
 
             if self._running:
-                logger.info(
-                    f"WebSocket disconnected, reconnecting in {config.WEBSOCKET_RECONNECT_SEC}s..."
-                )
-                import time
-                time.sleep(config.WEBSOCKET_RECONNECT_SEC)
+                # V12 HOTFIX: Rate-limit reconnect log — this fires every 5s
+                # when we have no open positions (~7000 log lines per session
+                # in paper trading when no positions are held). Log only on
+                # first disconnect + every 60s.
+                if not hasattr(self, "_last_disconnect_log"):
+                    self._last_disconnect_log = 0.0
+                import time as _time_mod
+                _now_ts = _time_mod.time()
+                if _now_ts - self._last_disconnect_log > 60:
+                    logger.info(
+                        f"WebSocket disconnected, reconnecting in "
+                        f"{config.WEBSOCKET_RECONNECT_SEC}s..."
+                    )
+                    self._last_disconnect_log = _now_ts
+                _time_mod.sleep(config.WEBSOCKET_RECONNECT_SEC)
 
     async def _connect_and_stream(self):
         """Connect to Alpaca WebSocket and stream quotes."""
@@ -132,8 +142,16 @@ class PositionMonitor:
             symbols = list(self._subscribed_symbols)
             if not symbols:
                 # Nothing to monitor yet — wait and retry
+                # V12 HOTFIX: Rate-limit log to once per 60s (was flooding
+                # with thousands of lines per session).
                 self._connected = False
-                logger.info("WebSocket: no symbols to monitor, waiting...")
+                if not hasattr(self, "_last_no_symbols_log"):
+                    self._last_no_symbols_log = 0.0
+                import time as _time_mod
+                _now_ts = _time_mod.time()
+                if _now_ts - self._last_no_symbols_log > 60:
+                    logger.info("WebSocket: no symbols to monitor, waiting...")
+                    self._last_no_symbols_log = _now_ts
                 import asyncio
                 await asyncio.sleep(10)
                 return

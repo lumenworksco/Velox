@@ -25,6 +25,10 @@ class PDTTracker:
         # Each entry: (date, symbol) — completed round-trip same-day trades
         self._day_trades: deque[tuple[date, str]] = deque()
         self._enabled = getattr(config, 'PDT_ENFORCEMENT_ENABLED', True)
+        # V12 HOTFIX: remember last observed equity so record_day_trade can
+        # suppress misleading "PDT at limit" warnings when the account is
+        # exempt (>= $25k).
+        self._last_known_equity: float | None = None
 
     def record_day_trade(self, symbol: str, trade_date: date | None = None):
         """Record a completed same-day round trip."""
@@ -33,8 +37,14 @@ class PDTTracker:
         self._prune()
         count = self.day_trade_count
         logger.info(f"PDT: Day trade recorded for {symbol}. Count: {count}/{self.MAX_DAY_TRADES}")
+        # V12 HOTFIX: Only warn when equity is below the PDT threshold. On
+        # larger accounts this limit doesn't apply and the warning is noise.
         if count >= self.MAX_DAY_TRADES:
-            logger.warning(f"PDT: At limit ({count}/{self.MAX_DAY_TRADES}). New day trades BLOCKED.")
+            if self._last_known_equity is None or self._last_known_equity < self.PDT_EQUITY_THRESHOLD:
+                logger.warning(
+                    f"PDT: At limit ({count}/{self.MAX_DAY_TRADES}). "
+                    f"New day trades BLOCKED."
+                )
 
     def can_day_trade(self, equity: float) -> bool:
         """Check if a new day trade is allowed.
@@ -44,6 +54,8 @@ class PDTTracker:
         - Account equity >= $25,000, OR
         - Day trade count in last 5 business days < 3
         """
+        # V12 HOTFIX: remember equity for the recording path's warning gate
+        self._last_known_equity = float(equity)
         if not self._enabled:
             return True
         if equity >= self.PDT_EQUITY_THRESHOLD:
