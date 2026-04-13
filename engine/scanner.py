@@ -144,7 +144,7 @@ class StrategyRegistry:
         # Rank if available
         if signal_ranker and all_signals:
             try:
-                all_signals = signal_ranker.rank(all_signals, regime=regime)
+                all_signals = signal_ranker.rank(all_signals)
             except Exception as exc:
                 handle_failure(FailureMode.DEGRADE_GRACEFULLY,
                                "scanner.registry_signal_ranking", exc)
@@ -378,7 +378,7 @@ def scan_all_strategies(
     # Rank signals by expected value
     if signal_ranker and signals:
         try:
-            signals = signal_ranker.rank(signals, regime=regime)
+            signals = signal_ranker.rank(signals)
         except Exception as exc:
             handle_failure(FailureMode.DEGRADE_GRACEFULLY,
                            "scanner.signal_ranking", exc)
@@ -467,7 +467,7 @@ async def _async_scan_all_strategies_impl(
 
     if signal_ranker and all_signals:
         try:
-            all_signals = signal_ranker.rank(all_signals, regime=regime)
+            all_signals = signal_ranker.rank(all_signals)
         except Exception:
             pass
 

@@ -254,8 +254,8 @@ class Container:
             .GapRiskManager()
         ))
         self.register_factory("dynamic_hedger", lambda: (
-            __import__("risk.dynamic_hedging", fromlist=["DynamicHedger"])
-            .DynamicHedger()
+            __import__("risk.dynamic_hedging", fromlist=["DynamicHedgingEngine"])
+            .DynamicHedgingEngine()
         ))
         self.register_factory("margin_monitor", lambda: (
             __import__("risk.margin_monitor", fromlist=["MarginMonitor"])
@@ -332,8 +332,8 @@ class Container:
             .PositionReconciler()
         ))
         self.register_factory("watchdog", lambda: (
-            __import__("monitoring.watchdog", fromlist=["Watchdog"])
-            .Watchdog()
+            __import__("monitoring.watchdog", fromlist=["HeartbeatWatchdog"])
+            .HeartbeatWatchdog()
         ))
 
         # --- Compliance modules ---

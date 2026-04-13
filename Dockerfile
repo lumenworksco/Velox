@@ -12,9 +12,9 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt psycopg2-bi
 # Stage 2: Runtime (no gcc, smaller image)
 FROM python:3.13-slim
 
-# Only runtime libs needed (libpq for psycopg2)
+# Runtime libs: libpq for psycopg2, libgomp1 for LightGBM OpenMP
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq5 curl && \
+    libpq5 curl libgomp1 && \
     rm -rf /var/lib/apt/lists/*
 
 # Create non-root user

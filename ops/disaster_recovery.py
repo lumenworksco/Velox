@@ -321,17 +321,23 @@ class DisasterRecovery:
         """
         positions = {}
         try:
-            raw_positions = broker_client.get_positions()
+            # BUG-FIX: Alpaca SDK uses get_all_positions(), not get_positions()
+            raw_positions = broker_client.get_all_positions()
             for pos in raw_positions:
-                symbol = pos.get("symbol", pos.get("ticker", ""))
-                qty = float(pos.get("qty", pos.get("quantity", 0)))
-                side = pos.get("side", "long" if qty > 0 else "short")
+                # Alpaca Position objects use attribute access, not dict get
+                symbol = getattr(pos, "symbol", "") or ""
+                qty = float(getattr(pos, "qty", 0) or 0)
+                side = getattr(pos, "side", None)
+                if side is None:
+                    side = "long" if qty > 0 else "short"
+                else:
+                    side = str(side).lower().replace("positionside.", "")
                 positions[symbol] = {
                     "qty": abs(qty),
                     "side": side,
-                    "market_value": float(pos.get("market_value", 0)),
-                    "avg_entry": float(pos.get("avg_entry_price", pos.get("cost_basis", 0))),
-                    "unrealized_pnl": float(pos.get("unrealized_pnl", pos.get("unrealized_pl", 0))),
+                    "market_value": float(getattr(pos, "market_value", 0) or 0),
+                    "avg_entry": float(getattr(pos, "avg_entry_price", 0) or 0),
+                    "unrealized_pnl": float(getattr(pos, "unrealized_pl", 0) or 0),
                     "raw": pos,
                 }
         except Exception as e:
@@ -348,7 +354,8 @@ class DisasterRecovery:
         """
         positions = {}
         try:
-            trades = db.get_open_trades()
+            # BUG-FIX: database module uses load_open_positions(), not get_open_trades()
+            trades = db.load_open_positions()
             for trade in trades:
                 symbol = trade.get("symbol", "")
                 positions[symbol] = {
@@ -501,7 +508,11 @@ class DisasterRecovery:
         """
         reconstructed = 0
         try:
-            broker_orders = broker_client.get_orders(status="open")
+            # BUG-FIX: Alpaca SDK uses GetOrdersRequest for filtering
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            _req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            broker_orders = broker_client.get_orders(filter=_req)
             internal_orders = db.get_pending_orders()
 
             # Set of broker order IDs already tracked

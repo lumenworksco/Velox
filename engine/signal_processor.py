@@ -675,6 +675,7 @@ def _resolve_signal_conflicts(signals: list[Signal], now: datetime) -> list[Sign
     """V12 12.1: Resolve conflicting signals for the same symbol.
 
     Rules:
+    - Pair signals (with pair_id) are EXCLUDED from dedup — both legs are needed.
     - Same symbol, same direction: keep highest conviction only (deduplicate).
     - Same symbol, opposite directions: skip both (conflicting = no edge).
 
@@ -682,8 +683,18 @@ def _resolve_signal_conflicts(signals: list[Signal], now: datetime) -> list[Sign
     """
     from collections import defaultdict
 
-    by_symbol: dict[str, list[Signal]] = defaultdict(list)
+    # BUG-FIX: Separate pair signals from non-pair signals.
+    # Pair signals must NOT be deduped — both legs are required for execution.
+    pair_signals: list[Signal] = []
+    non_pair_signals: list[Signal] = []
     for sig in signals:
+        if getattr(sig, "pair_id", None):
+            pair_signals.append(sig)
+        else:
+            non_pair_signals.append(sig)
+
+    by_symbol: dict[str, list[Signal]] = defaultdict(list)
+    for sig in non_pair_signals:
         by_symbol[sig.symbol].append(sig)
 
     resolved: list[Signal] = []
@@ -723,6 +734,9 @@ def _resolve_signal_conflicts(signals: list[Signal], now: datetime) -> list[Sign
                     now, sig.symbol, sig.strategy, sig.side, False, "signal_dedup"
                 )
         resolved.append(best)
+
+    # BUG-FIX: Re-add pair signals (they were excluded from dedup)
+    resolved.extend(pair_signals)
 
     if len(resolved) < len(signals):
         logger.info(
@@ -1170,7 +1184,7 @@ def _process_single_signal(
     seasonality_mult = 1.0
     if getattr(config, "INTRADAY_SEASONALITY_ENABLED", False) and IntradaySeasonality:
         try:
-            seasonality_mult = _get_seasonality().get_window_score(signal.strategy, now)
+            seasonality_mult = _get_seasonality().get_window_score(now, signal.strategy)
         except Exception as exc:
             handle_failure(FailureMode.DEGRADE_GRACEFULLY,
                            "signal_processor.seasonality", exc,
