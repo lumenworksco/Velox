@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Velox Performance Tear Sheet</title>
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+        font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', 'Cascadia Code', monospace;
+        background: #0a0e17;
+        color: #e2e8f0;
+        line-height: 1.6;
+        padding: 40px;
+        max-width: 1100px;
+        margin: 0 auto;
+    }
+
+    .header {
+        text-align: center;
+        margin-bottom: 40px;
+        padding-bottom: 24px;
+        border-bottom: 1px solid #1e293b;
+    }
+
+    .header h1 {
+        font-size: 28px;
+        font-weight: 700;
+        letter-spacing: 2px;
+        color: #f8fafc;
+        margin-bottom: 4px;
+    }
+
+    .header .subtitle {
+        font-size: 14px;
+        color: #64748b;
+    }
+
+    .header .period {
+        font-size: 13px;
+        color: #94a3b8;
+        margin-top: 8px;
+    }
+
+    .header .generated {
+        font-size: 11px;
+        color: #475569;
+        margin-top: 4px;
+    }
+
+    h2 {
+        font-size: 16px;
+        font-weight: 600;
+        color: #94a3b8;
+        letter-spacing: 1.5px;
+        text-transform: uppercase;
+        margin: 36px 0 16px 0;
+        padding-bottom: 8px;
+        border-bottom: 1px solid #1e293b;
+    }
+
+    .kpi-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 16px;
+        margin-bottom: 36px;
+    }
+
+    .kpi {
+        background: #111827;
+        border: 1px solid #1e293b;
+        border-radius: 8px;
+        padding: 16px 20px;
+        text-align: center;
+    }
+
+    .kpi .kpi-label {
+        font-size: 11px;
+        color: #64748b;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        margin-bottom: 6px;
+    }
+
+    .kpi .kpi-value {
+        font-size: 22px;
+        font-weight: 700;
+        color: #f8fafc;
+    }
+
+    .kpi .kpi-value.positive { color: #22c55e; }
+    .kpi .kpi-value.negative { color: #ef4444; }
+
+    .chart-container {
+        background: #111827;
+        border: 1px solid #1e293b;
+        border-radius: 8px;
+        padding: 20px;
+        margin-bottom: 36px;
+        overflow-x: auto;
+    }
+
+    .chart-container svg {
+        display: block;
+        margin: 0 auto;
+        max-width: 100%;
+        height: auto;
+    }
+
+    .data-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 24px;
+        font-size: 13px;
+    }
+
+    .data-table th {
+        background: #111827;
+        color: #94a3b8;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        font-size: 11px;
+        padding: 10px 12px;
+        text-align: right;
+        border-bottom: 2px solid #1e293b;
+    }
+
+    .data-table th:first-child { text-align: left; }
+
+    .data-table td {
+        padding: 8px 12px;
+        text-align: right;
+        border-bottom: 1px solid #1e293b;
+        color: #cbd5e1;
+    }
+
+    .data-table td.label {
+        text-align: left;
+        color: #f8fafc;
+        font-weight: 500;
+    }
+
+    .data-table td.positive { color: #22c55e; }
+    .data-table td.negative { color: #ef4444; }
+    .data-table td.na { color: #334155; }
+    .data-table td.ytd { font-weight: 700; }
+
+    .data-table tbody tr:hover {
+        background: #0f172a;
+    }
+
+    .monthly-table th, .monthly-table td {
+        text-align: center;
+        padding: 8px 6px;
+    }
+
+    .two-col {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 24px;
+    }
+
+    .metric-list {
+        background: #111827;
+        border: 1px solid #1e293b;
+        border-radius: 8px;
+        padding: 20px;
+    }
+
+    .metric-row {
+        display: flex;
+        justify-content: space-between;
+        padding: 8px 0;
+        border-bottom: 1px solid #1a2332;
+    }
+
+    .metric-row:last-child { border-bottom: none; }
+
+    .metric-row .metric-label {
+        color: #94a3b8;
+        font-size: 13px;
+    }
+
+    .metric-row .metric-value {
+        color: #f8fafc;
+        font-weight: 600;
+        font-size: 13px;
+    }
+
+    .metric-row .metric-value.positive { color: #22c55e; }
+    .metric-row .metric-value.negative { color: #ef4444; }
+
+    .footer {
+        text-align: center;
+        margin-top: 48px;
+        padding-top: 24px;
+        border-top: 1px solid #1e293b;
+        color: #475569;
+        font-size: 11px;
+    }
+
+    @media print {
+        body { background: #0a0e17; padding: 20px; }
+        .kpi-grid { grid-template-columns: repeat(4, 1fr); }
+    }
+
+    @media (max-width: 768px) {
+        body { padding: 16px; }
+        .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+        .two-col { grid-template-columns: 1fr; }
+    }
+</style>
+</head>
+<body>
+
+<div class="header">
+    <h1>VELOX PERFORMANCE TEAR SHEET</h1>
+    <span class="subtitle">Last 1 days</span>
+    <div class="period">N/A  &mdash;  N/A</div>
+    <div class="generated">Generated 2026-04-14 00:12</div>
+</div>
+
+<!-- KPI Cards -->
+<div class="kpi-grid">
+    <div class="kpi">
+        <div class="kpi-label">Total Return</div>
+        <div class="kpi-value positive">0.00%</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi-label">Annualized Return</div>
+        <div class="kpi-value positive">0.00%</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi-label">Sharpe Ratio</div>
+        <div class="kpi-value">0.00</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi-label">Max Drawdown</div>
+        <div class="kpi-value negative">0.00%</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi-label">Win Rate</div>
+        <div class="kpi-value">33.3%</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi-label">Profit Factor</div>
+        <div class="kpi-value">1.19</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi-label">Total Trades</div>
+        <div class="kpi-value">3</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi-label">Avg Trade P&L</div>
+        <div class="kpi-value positive">+$149.08</div>
+    </div>
+</div>
+
+<!-- Summary Statistics -->
+<h2>Summary Statistics</h2>
+<div class="two-col">
+    <div class="metric-list">
+        <div class="metric-row">
+            <span class="metric-label">Total Return</span>
+            <span class="metric-value positive">0.00%</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Annualized Return</span>
+            <span class="metric-value positive">0.00%</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Sharpe Ratio</span>
+            <span class="metric-value">0.00</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Sortino Ratio</span>
+            <span class="metric-value">0.00</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Calmar Ratio</span>
+            <span class="metric-value">0.00</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Max Drawdown</span>
+            <span class="metric-value negative">0.00% (0d)</span>
+        </div>
+    </div>
+    <div class="metric-list">
+        <div class="metric-row">
+            <span class="metric-label">Win Rate</span>
+            <span class="metric-value">33.3%</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Profit Factor</span>
+            <span class="metric-value">1.19</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Total Trades</span>
+            <span class="metric-value">3</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Avg Trade P&L</span>
+            <span class="metric-value positive">+$149.08</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Avg Hold Time</span>
+            <span class="metric-value">15m</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Trading Period</span>
+            <span class="metric-value">N/A &mdash; N/A</span>
+        </div>
+    </div>
+</div>
+
+<!-- Equity Curve -->
+<h2>Equity Curve &amp; Drawdown</h2>
+<div class="chart-container">
+    <svg xmlns="http://www.w3.org/2000/svg" width="900" height="100"><text x="20" y="50" fill="#888" font-family="monospace">No snapshot data available</text></svg>
+</div>
+
+<!-- Monthly Returns -->
+<h2>Monthly Returns (%)</h2>
+<p style="color:#475569;">Insufficient data for monthly breakdown.</p>
+
+<!-- Strategy Breakdown -->
+<h2>Strategy Breakdown</h2>
+<table class="data-table"><thead><tr>
+            <th>Strategy</th><th>Trades</th><th>Win Rate</th>
+            <th>Avg P&L</th><th>Sharpe</th><th>Total P&L</th>
+        </tr></thead><tbody><tr>
+                <td class="label">re-adopted</td>
+                <td>2</td>
+                <td>50.0%</td>
+                <td class="positive">+$1,302.69</td>
+                <td>9.87</td>
+                <td class="positive">+$2,605.39</td>
+            </tr><tr>
+                <td class="label">ORB</td>
+                <td>1</td>
+                <td>0.0%</td>
+                <td class="negative">$-2,158.15</td>
+                <td>0.00</td>
+                <td class="negative">$-2,158.15</td>
+            </tr></tbody></table>
+
+<!-- Risk Metrics -->
+<h2>Risk Metrics</h2>
+<div class="two-col">
+    <div class="metric-list">
+        <div class="metric-row">
+            <span class="metric-label">Daily VaR (95%)</span>
+            <span class="metric-value negative">0.00%</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Daily P&L Volatility</span>
+            <span class="metric-value">0.00%</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Best Day</span>
+            <span class="metric-value positive">0.00%</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Worst Day</span>
+            <span class="metric-value negative">0.00%</span>
+        </div>
+    </div>
+    <div class="metric-list">
+        <div class="metric-row">
+            <span class="metric-label">Best Trade</span>
+            <span class="metric-value positive">+$2,840.09</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Worst Trade</span>
+            <span class="metric-value negative">$-2,158.15</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Max Win Streak</span>
+            <span class="metric-value">1 trades</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Max Loss Streak</span>
+            <span class="metric-value">2 trades</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Avg Exposure</span>
+            <span class="metric-value">0.0%</span>
+        </div>
+    </div>
+</div>
+
+<div class="footer">
+    Velox V12 Algorithmic Trading System &mdash; Generated 2026-04-14 00:12<br>
+    Past performance is not indicative of future results.
+</div>
+
+</body>
+</html>

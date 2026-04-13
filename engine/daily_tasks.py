@@ -228,7 +228,18 @@ def weekly_tasks(current: datetime, kalman_pairs, param_optimizer=None,
 
     if param_optimizer:
         try:
-            results = param_optimizer.optimize_all()
+            # BUG-FIX: BayesianOptimizer has optimize_strategy(), not optimize_all().
+            # Iterate over active strategies and optimize each one.
+            import database as _db
+            _trade_history = _db.get_trade_history()
+            results = []
+            for strategy_name in config.STRATEGY_ALLOCATIONS:
+                try:
+                    result = param_optimizer.optimize_strategy(strategy_name, _trade_history)
+                    if result and getattr(result, "applied", False):
+                        results.append(result)
+                except Exception as _e:
+                    logger.warning(f"Parameter optimization failed for {strategy_name}: {_e}")
             if results:
                 logger.info(f"Parameter optimization: {len(results)} strategies updated")
         except Exception as e:

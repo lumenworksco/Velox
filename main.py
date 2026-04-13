@@ -352,7 +352,18 @@ except ImportError:
     EventBus = None
 
 # --- Logging setup ---
-_file_handler = logging.FileHandler(config.LOG_FILE)
+# BUG-FIX: Use RotatingFileHandler instead of basic FileHandler to prevent
+# log files from growing unbounded and to handle rotation properly.
+# Also write to /app/logs/ (volume-mounted) instead of /app/bot.log (ephemeral).
+from logging.handlers import RotatingFileHandler
+import os as _os
+
+_log_dir = _os.path.dirname(config.LOG_FILE) or "."
+_os.makedirs(_log_dir, exist_ok=True)
+
+_file_handler = RotatingFileHandler(
+    config.LOG_FILE, maxBytes=50_000_000, backupCount=5,  # 50 MB, 5 backups
+)
 _file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
 _stream_handler = logging.StreamHandler(sys.stdout)
 _stream_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
@@ -599,7 +610,7 @@ def main():
             )
             # Test risk manager sizing (dry-run)
             from risk.risk_manager import RiskManager
-            test_risk = RiskManager(equity=100_000.0, cash=100_000.0)
+            test_risk = RiskManager(starting_equity=100_000.0, current_equity=100_000.0, current_cash=100_000.0)
             test_qty = test_risk.calculate_position_size(
                 entry_price=test_signal.entry_price,
                 stop_price=test_signal.stop_loss,
@@ -1075,7 +1086,9 @@ def main():
     try:
         dr = _ctr.get("disaster_recovery")
         try:
-            dr.recover_state()
+            from data import get_trading_client
+            _dr_client = get_trading_client()
+            dr.recover_state(broker_client=_dr_client, db=database)
         except Exception as e:
             logger.warning(f"V11 state recovery incomplete: {e}")
         features.append("DR")
@@ -1241,8 +1254,15 @@ def main():
                 if (current.weekday() == 6 and current_time >= time(0, 0)
                         and last_sunday_task != current.date()):
                     last_sunday_task = current.date()
+                    # Pass the actual HMM detector (not the MarketRegime wrapper)
+                    _hmm_det = None
+                    try:
+                        from strategies.regime import _get_hmm_detector
+                        _hmm_det = _get_hmm_detector()
+                    except Exception:
+                        pass
                     weekly_tasks(current, kalman_pairs, param_optimizer, walk_forward,
-                                hmm_detector=regime_detector)
+                                hmm_detector=_hmm_det)
 
                 # -------------------------------------------------------
                 # Update regime

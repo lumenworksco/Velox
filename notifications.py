@@ -34,16 +34,17 @@ def _send_telegram(message: str, parse_mode: str = "Markdown"):
         url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
 
         def _post(text: str, mode):
+            payload = {
+                "chat_id": config.TELEGRAM_CHAT_ID,
+                "text": text,
+                "disable_web_page_preview": True,
+            }
+            # BUG-FIX: Only include parse_mode if not None — Telegram API
+            # rejects "parse_mode": null with 400 "unsupported parse_mode"
+            if mode:
+                payload["parse_mode"] = mode
             with httpx.Client(timeout=10) as client:
-                return client.post(
-                    url,
-                    json={
-                        "chat_id": config.TELEGRAM_CHAT_ID,
-                        "text": text,
-                        "parse_mode": mode,
-                        "disable_web_page_preview": True,
-                    },
-                )
+                return client.post(url, json=payload)
 
         resp = _post(message, parse_mode)
         if resp.status_code == 400 and parse_mode and "parse" in resp.text.lower():

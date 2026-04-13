@@ -642,8 +642,8 @@ REPLAY_DATA_RETENTION_DAYS = 90
 
 STATE_FILE = "state.json"
 DB_FILE = "bot.db"
-LOG_FILE = "bot.log"
-AUDIT_LOG_FILE = "audit.log"
+LOG_FILE = os.getenv("LOG_FILE", "logs/bot.log")
+AUDIT_LOG_FILE = os.getenv("AUDIT_LOG_FILE", "logs/audit.log")
 STATE_SAVE_INTERVAL_SEC = 60
 
 # T4-004: Connection pool tuning — increased from 3 to 10 for market hours throughput
