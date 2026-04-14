@@ -391,13 +391,33 @@ class ExitOrchestrator:
                 mark_symbol_close_attempted(symbol)
                 _seen_in_batch.add(symbol)
 
+                # BUG-FIX (2026-04-14): validate exit_price against live snapshot.
+                # Old phantom fills from historical orders caused a -$19,911 INTC
+                # trade to be booked on a 2-second hold. If the looked-up fill
+                # differs from the snapshot by more than 5%, prefer the snapshot.
+                snap_price = None
+                try:
+                    snap = get_snapshot(symbol)
+                    snap_price = (
+                        float(snap.latest_trade.price)
+                        if snap and snap.latest_trade else None
+                    )
+                except Exception:
+                    snap_price = None
+
                 exit_price = get_filled_exit_price(symbol, side=trade.side)
+                if exit_price is not None and snap_price is not None and snap_price > 0:
+                    if abs(exit_price - snap_price) / snap_price > 0.05:
+                        logger.warning(
+                            "ExitOrchestrator: %s fill lookup returned $%.2f but "
+                            "live snapshot is $%.2f (>5%% diff) — rejecting and "
+                            "using snapshot (entry=$%.2f reason=%s)",
+                            symbol, exit_price, snap_price, trade.entry_price,
+                            action.reason,
+                        )
+                        exit_price = snap_price
                 if exit_price is None:
-                    try:
-                        snap = get_snapshot(symbol)
-                        exit_price = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
-                    except Exception:
-                        exit_price = trade.entry_price
+                    exit_price = snap_price if snap_price is not None else trade.entry_price
 
                 pnl = (exit_price - trade.entry_price) * trade.qty * (1 if trade.side == "buy" else -1)
                 risk_manager.close_trade(symbol, exit_price, now, exit_reason=action.reason)
@@ -497,13 +517,28 @@ class ExitOrchestrator:
         # V12 HOTFIX: Mark recently closed
         mark_symbol_close_attempted(symbol)
 
+        # BUG-FIX (2026-04-14): validate exit_price against live snapshot.
+        snap_price = None
+        try:
+            snap = get_snapshot(symbol)
+            snap_price = (
+                float(snap.latest_trade.price)
+                if snap and snap.latest_trade else None
+            )
+        except Exception:
+            snap_price = None
+
         exit_price = get_filled_exit_price(symbol, side=trade.side)
+        if exit_price is not None and snap_price is not None and snap_price > 0:
+            if abs(exit_price - snap_price) / snap_price > 0.05:
+                logger.warning(
+                    "ExitOrchestrator WS: %s fill lookup returned $%.2f but "
+                    "live snapshot is $%.2f (>5%% diff) — rejecting",
+                    symbol, exit_price, snap_price,
+                )
+                exit_price = snap_price
         if exit_price is None:
-            try:
-                snap = get_snapshot(symbol)
-                exit_price = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
-            except Exception:
-                exit_price = trade.entry_price
+            exit_price = snap_price if snap_price is not None else trade.entry_price
 
         now = datetime.now(config.ET)
         risk_manager.close_trade(symbol, exit_price, now, exit_reason=reason)
@@ -765,8 +800,22 @@ class ExitOrchestrator:
     def _check_rsi_exit(
         self, trade, current_price: float, now: datetime,
     ) -> Optional[ExitAction]:
-        """Exit if RSI is extremely overbought/oversold and trade is profitable."""
+        """Exit if RSI is extremely overbought/oversold and trade is profitable.
+
+        BUG-FIX (2026-04-14): The docstring says "and trade is profitable" but
+        the old code didn't check! That caused META (ORB) to exit at -6.2%
+        under reason=rsi_overbought despite the bracket SL=$648.10 (only -1.5%
+        from entry). Now we require the trade to be in the green before using
+        RSI as a profit-taking exit — RSI is a mean-reversion indicator, not a
+        stop loss.
+        """
         try:
+            # Must be profitable — RSI exits are profit takers, not stops.
+            if trade.side == "buy" and current_price <= trade.entry_price:
+                return None
+            if trade.side == "sell" and current_price >= trade.entry_price:
+                return None
+
             import pandas_ta as ta
             from data import get_intraday_bars
             from alpaca.data.timeframe import TimeFrame, TimeFrameUnit

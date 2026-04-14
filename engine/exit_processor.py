@@ -336,13 +336,28 @@ def handle_strategy_exits(exit_actions: list[dict], risk: RiskManager, now: date
             mark_symbol_close_attempted(symbol)
             _seen.add(symbol)
 
+            # BUG-FIX (2026-04-14): validate exit_price against live snapshot.
+            snap_price = None
+            try:
+                snap = get_snapshot(symbol)
+                snap_price = (
+                    float(snap.latest_trade.price)
+                    if snap and snap.latest_trade else None
+                )
+            except Exception:
+                snap_price = None
+
             exit_price = get_filled_exit_price(symbol, side=trade.side)
+            if exit_price is not None and snap_price is not None and snap_price > 0:
+                if abs(exit_price - snap_price) / snap_price > 0.05:
+                    logger.warning(
+                        "exit_processor: %s fill lookup returned $%.2f but "
+                        "snapshot is $%.2f (>5%% diff) — using snapshot",
+                        symbol, exit_price, snap_price,
+                    )
+                    exit_price = snap_price
             if exit_price is None:
-                try:
-                    snap = get_snapshot(symbol)
-                    exit_price = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
-                except Exception:
-                    exit_price = trade.entry_price
+                exit_price = snap_price if snap_price is not None else trade.entry_price
 
             # V12 6.1: Capture commission from the order
             commission = get_order_commission(trade.order_id)

@@ -763,6 +763,16 @@ def save_open_positions(open_trades: dict):
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("DELETE FROM open_positions")
             for symbol, trade in open_trades.items():
+                # BUG-FIX (2026-04-14): TWAP execution stores order_id as a
+                # LIST of slice IDs; SQLite can't bind a list. Serialise to a
+                # comma-joined string so it persists (and is readable on load).
+                _raw_oid = getattr(trade, 'order_id', None)
+                if isinstance(_raw_oid, (list, tuple)):
+                    _oid = ",".join(str(x) for x in _raw_oid)
+                elif _raw_oid is None:
+                    _oid = ""
+                else:
+                    _oid = str(_raw_oid)
                 conn.execute(
                     """INSERT INTO open_positions (symbol, strategy, side, entry_price,
                        qty, entry_time, take_profit, stop_loss, alpaca_order_id,
@@ -772,7 +782,7 @@ def save_open_positions(open_trades: dict):
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (symbol, trade.strategy, trade.side, trade.entry_price,
                      trade.qty, _to_iso(trade.entry_time), trade.take_profit,
-                     trade.stop_loss, trade.order_id,
+                     trade.stop_loss, _oid,
                      getattr(trade, 'hold_type', 'day'),
                      _to_iso(trade.time_stop),
                      _to_iso(getattr(trade, 'max_hold_date', None)),
@@ -794,6 +804,19 @@ def load_open_positions() -> list[dict]:
     conn = _get_conn()
     rows = conn.execute("SELECT * FROM open_positions").fetchall()
     return [dict(row) for row in rows]
+
+
+def get_pending_orders() -> list[dict]:
+    """Return orders submitted by the bot that have not yet filled or cancelled.
+
+    BUG-FIX (2026-04-14): ops.disaster_recovery calls this to reconcile
+    orders on restart. The OMS keeps in-memory state only; open orders
+    that survive a crash are visible on the broker side (Alpaca) and are
+    reconciled there by broker_sync. Return an empty list so callers fall
+    through to the broker-side reconciliation path instead of logging a
+    WARNING every startup.
+    """
+    return []
 
 
 # --- T1-008: Overnight Hold Persistence ---

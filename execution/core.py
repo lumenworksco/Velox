@@ -201,6 +201,7 @@ def _chase_unfilled_order(
     amended = False
     converted = False
     current_order_id = order_id
+    final_fill_qty = 0  # BUG-FIX (2026-04-14): track whether any shares filled
 
     try:
         while True:
@@ -208,6 +209,13 @@ def _chase_unfilled_order(
             if elapsed > 30:
                 # 30s: cancel entirely
                 try:
+                    # BUG-FIX (2026-04-14): record final fill qty BEFORE
+                    # cancelling so we can detect zero-fill cancellations.
+                    try:
+                        _pre = client.get_order_by_id(current_order_id)
+                        final_fill_qty = int(float(getattr(_pre, "filled_qty", 0) or 0))
+                    except Exception:
+                        final_fill_qty = 0
                     client.cancel_order_by_id(current_order_id)
                     logger.warning(
                         f"V12 7.2: Chase timeout 30s — cancelled order "
@@ -316,6 +324,20 @@ def _chase_unfilled_order(
     finally:
         with _chase_lock:
             _active_chases.pop(order_id, None)
+        # BUG-FIX (2026-04-14): if the chase ended with zero fills, roll back
+        # the optimistic trade registration in the risk manager so downstream
+        # exit logic doesn't close a phantom position (observed: META ORB
+        # 2026-04-14 15:14:23 chase timeout → phantom -$3,580 close at 15:33).
+        if final_fill_qty == 0:
+            try:
+                from container import Container
+                rm = Container.instance().risk_manager
+                if rm is not None:
+                    rm.cancel_trade(signal.symbol,
+                                    reason="chase_timeout_no_fill")
+            except Exception as _e:
+                logger.debug(f"V12 7.2: risk.cancel_trade failed for "
+                             f"{signal.symbol}: {_e}")
 
 
 def _start_chase_thread(order_id: str, signal: Signal, qty: int) -> None:

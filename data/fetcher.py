@@ -5,7 +5,7 @@ import logging
 import random
 import threading
 import time as _time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
@@ -376,47 +376,98 @@ def get_intraday_bars(symbol: str, timeframe: TimeFrame, start: datetime, end: d
     return get_bars(symbol, timeframe, start=start, end=end)
 
 
-def get_filled_exit_info(symbol: str, side: str = "buy") -> tuple[float | None, str | None]:
+def get_filled_exit_info(symbol: str, side: str = "buy",
+                         after: datetime | None = None,
+                         max_age_minutes: int = 10) -> tuple[float | None, str | None]:
     """Look up the actual fill price and exit reason for a recently closed position.
 
     When a bracket order's TP or SL leg fires at the broker, the position
     disappears. This function checks closed orders for the symbol to find
     the actual fill price and whether it was a stop or limit order.
 
+    BUG-FIX (2026-04-14): Previously this returned the FIRST matching historical
+    SELL order without any time filter, which caused catastrophic phantom P&L
+    reports (e.g. INTC logged -$19,911 / -34% on a 2-second hold because an
+    old SELL fill at $41.92 was returned as today's "exit price"). Now we
+    filter to orders filled within the last `max_age_minutes` minutes by
+    default, and prefer the MOST RECENTLY FILLED order rather than the first
+    one returned.
+
     Args:
         symbol: The stock symbol
         side: The side of the ENTRY ("buy" for long, "sell" for short)
+        after: Optional datetime — only consider orders filled at/after this time
+        max_age_minutes: Ignore orders older than this many minutes (default 10).
+            Used as a safety net when `after` is not provided.
     Returns:
         Tuple of (fill_price, exit_reason) or (None, None) if not found.
         exit_reason is "stop_loss", "take_profit", or "market_close".
     """
     try:
         client = get_trading_client()
+        # BUG-FIX: request a larger window and ask Alpaca for recent orders.
+        # `after` on GetOrdersRequest is the order SUBMIT time in UTC.
+        now_utc = datetime.now(timezone.utc)
+        submit_cutoff = after or (now_utc - timedelta(minutes=max_age_minutes * 3))
+        # Make sure the cutoff is tz-aware UTC (Alpaca expects UTC)
+        if submit_cutoff.tzinfo is None:
+            submit_cutoff = submit_cutoff.replace(tzinfo=timezone.utc)
+        else:
+            submit_cutoff = submit_cutoff.astimezone(timezone.utc)
+
         request = GetOrdersRequest(
             status=QueryOrderStatus.CLOSED,
             symbols=[symbol],
-            limit=10,
+            limit=50,
+            after=submit_cutoff,
         )
         orders = client.get_orders(request)
 
         exit_side = "sell" if side == "buy" else "buy"
+        fill_cutoff = now_utc - timedelta(minutes=max_age_minutes)
+        if after is not None:
+            # If caller provided an explicit `after`, use that as the floor
+            after_utc = after if after.tzinfo else after.replace(tzinfo=timezone.utc)
+            fill_cutoff = max(fill_cutoff, after_utc.astimezone(timezone.utc))
+
+        # Collect matching fills, then pick the MOST RECENT one. Many brokers
+        # return orders unsorted or in submit order, not fill order.
+        candidates: list[tuple[datetime, float, str]] = []
         for order in orders:
-            if (order.symbol == symbol
-                    and order.side == exit_side
-                    and order.status == "filled"
+            if not (order.symbol == symbol
+                    and str(order.side).lower().endswith(exit_side)
+                    and str(order.status).lower().endswith("filled")
                     and order.filled_avg_price is not None):
-                price = float(order.filled_avg_price)
-                # Determine exit reason from order type
-                order_type = str(getattr(order, "order_type", "")).lower()
-                if "stop" in order_type:
-                    reason = "stop_loss"
-                elif "limit" in order_type:
-                    reason = "take_profit"
-                elif "market" in order_type:
-                    reason = "market_close"
-                else:
-                    reason = "broker_exit"
-                return price, reason
+                continue
+
+            # Filter by fill time (filled_at) — must be after cutoff.
+            # If filled_at is missing, fall back to submitted_at/updated_at.
+            filled_at = (getattr(order, "filled_at", None)
+                         or getattr(order, "updated_at", None)
+                         or getattr(order, "submitted_at", None))
+            if filled_at is None:
+                continue
+            if filled_at.tzinfo is None:
+                filled_at = filled_at.replace(tzinfo=timezone.utc)
+            if filled_at < fill_cutoff:
+                continue  # Too old — almost certainly an earlier trade
+
+            price = float(order.filled_avg_price)
+            order_type = str(getattr(order, "order_type", "")).lower()
+            if "stop" in order_type:
+                reason = "stop_loss"
+            elif "limit" in order_type:
+                reason = "take_profit"
+            elif "market" in order_type:
+                reason = "market_close"
+            else:
+                reason = "broker_exit"
+            candidates.append((filled_at, price, reason))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            _, price, reason = candidates[0]
+            return price, reason
     except Exception as e:
         logger.warning(f"Failed to look up fill info for {symbol}: {e}")
     return None, None

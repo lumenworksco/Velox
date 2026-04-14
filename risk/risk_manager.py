@@ -417,6 +417,36 @@ class RiskManager:
             f"TP={trade.take_profit:.2f} SL={trade.stop_loss:.2f}"
         )
 
+    def cancel_trade(self, symbol: str, reason: str = "") -> bool:
+        """Remove a tracked trade that never filled (thread-safe).
+
+        BUG-FIX (2026-04-14): When a chase order times out and is cancelled,
+        the entry was registered optimistically but never actually filled.
+        This method removes the phantom trade from `open_trades` WITHOUT
+        recording any P&L, so downstream exit logic doesn't close a
+        position the broker never opened.
+
+        Returns True if the trade was removed, False if not tracked.
+        """
+        with self._lock:
+            trade = self.open_trades.pop(symbol, None)
+        if trade is None:
+            return False
+        logger.warning(
+            f"Trade cancelled (never filled): {trade.side.upper()} {trade.qty} "
+            f"{symbol} @ {trade.entry_price:.2f} ({trade.strategy}) — {reason}"
+        )
+        try:
+            log_event(EventType.POSITION_CANCELLED
+                      if hasattr(EventType, 'POSITION_CANCELLED')
+                      else EventType.POSITION_CLOSED,
+                      "risk_manager",
+                      symbol=symbol, strategy=trade.strategy,
+                      details=f"reason={reason} (never_filled)")
+        except Exception:
+            pass
+        return True
+
     def close_trade(self, symbol: str, exit_price: float, now: datetime,
                     exit_reason: str = "", commission: float = 0.0):
         """Close a trade, record P&L, and log to database (thread-safe).

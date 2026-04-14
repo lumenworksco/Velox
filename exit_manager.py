@@ -330,8 +330,18 @@ class ExitManager:
         return None
 
     def _check_rsi_exit(self, trade, current_price: float, risk_manager, now: datetime) -> dict | None:
-        """Exit if RSI is extremely overbought/oversold and trade is profitable."""
+        """Exit if RSI is extremely overbought/oversold and trade is profitable.
+
+        BUG-FIX (2026-04-14): enforce 'profitable' precondition actually, not
+        just in the docstring. See exit_orchestrator._check_rsi_exit for the
+        detailed rationale (META ORB -6.2% phantom exit).
+        """
         try:
+            if trade.side == "buy" and current_price <= trade.entry_price:
+                return None
+            if trade.side == "sell" and current_price >= trade.entry_price:
+                return None
+
             market_open = datetime(now.year, now.month, now.day, 9, 30, tzinfo=config.ET)
             bars = get_intraday_bars(trade.symbol, TimeFrame(1, TimeFrameUnit.Minute), start=market_open, end=now)
             if bars.empty or len(bars) < 20:

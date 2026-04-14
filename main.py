@@ -581,6 +581,10 @@ def main():
             if not ml_models:
                 issues.append("No trained ML model found in models/ — ML will return neutral (0.5)")
             else:
+                # BUG-FIX (2026-04-14): glob() returns filesystem-order results
+                # which is non-deterministic. Sort by mtime so we always pick the
+                # newest trained model (matches the training script's convention).
+                ml_models.sort(key=lambda p: _os.path.getmtime(p))
                 logger.info(f"V12 preflight: ML model found: {ml_models[-1]}")
         except Exception as e:
             logger.debug("Preflight: ML model check failed: %s", e)

@@ -460,7 +460,10 @@ class DisasterRecovery:
 
         elif disc.action == "remove":
             try:
-                internal = db.get_open_trades()
+                # BUG-FIX (2026-04-14): database module exposes load_open_positions(),
+                # not get_open_trades(). The old call crashed disaster recovery
+                # whenever a discrepancy needed resolution.
+                internal = db.load_open_positions()
                 for trade in internal:
                     if trade.get("symbol") == disc.symbol:
                         trade_id = trade.get("trade_id", trade.get("id"))
@@ -477,7 +480,8 @@ class DisasterRecovery:
 
         elif disc.action == "adjust":
             try:
-                internal = db.get_open_trades()
+                # BUG-FIX (2026-04-14): same rename as above.
+                internal = db.load_open_positions()
                 for trade in internal:
                     if trade.get("symbol") == disc.symbol:
                         trade_id = trade.get("trade_id", trade.get("id"))
