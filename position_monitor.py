@@ -86,6 +86,14 @@ class PositionMonitor:
                 self._loop.run_until_complete(self._connect_and_stream())
                 consecutive_failures = 0  # Reset on successful connection
             except Exception as e:
+                # BUG-FIX (2026-04-14): `stop()` calls loop.stop(), which causes
+                # any pending Future inside _connect_and_stream to raise
+                # "Event loop stopped before Future completed". That's expected
+                # on shutdown — log it as INFO, not ERROR, so it doesn't pollute
+                # the log and trigger false alerts.
+                if not self._running:
+                    logger.info(f"WebSocket shutting down ({e})")
+                    break
                 logger.error(f"WebSocket error: {e}")
                 self._connected = False
                 consecutive_failures += 1

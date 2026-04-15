@@ -391,13 +391,33 @@ class ExitOrchestrator:
                 mark_symbol_close_attempted(symbol)
                 _seen_in_batch.add(symbol)
 
+                # BUG-FIX (2026-04-14): validate exit_price against live snapshot.
+                # Old phantom fills from historical orders caused a -$19,911 INTC
+                # trade to be booked on a 2-second hold. If the looked-up fill
+                # differs from the snapshot by more than 5%, prefer the snapshot.
+                snap_price = None
+                try:
+                    snap = get_snapshot(symbol)
+                    snap_price = (
+                        float(snap.latest_trade.price)
+                        if snap and snap.latest_trade else None
+                    )
+                except Exception:
+                    snap_price = None
+
                 exit_price = get_filled_exit_price(symbol, side=trade.side)
+                if exit_price is not None and snap_price is not None and snap_price > 0:
+                    if abs(exit_price - snap_price) / snap_price > 0.05:
+                        logger.warning(
+                            "ExitOrchestrator: %s fill lookup returned $%.2f but "
+                            "live snapshot is $%.2f (>5%% diff) — rejecting and "
+                            "using snapshot (entry=$%.2f reason=%s)",
+                            symbol, exit_price, snap_price, trade.entry_price,
+                            action.reason,
+                        )
+                        exit_price = snap_price
                 if exit_price is None:
-                    try:
-                        snap = get_snapshot(symbol)
-                        exit_price = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
-                    except Exception:
-                        exit_price = trade.entry_price
+                    exit_price = snap_price if snap_price is not None else trade.entry_price
 
                 pnl = (exit_price - trade.entry_price) * trade.qty * (1 if trade.side == "buy" else -1)
                 risk_manager.close_trade(symbol, exit_price, now, exit_reason=action.reason)
@@ -497,13 +517,28 @@ class ExitOrchestrator:
         # V12 HOTFIX: Mark recently closed
         mark_symbol_close_attempted(symbol)
 
+        # BUG-FIX (2026-04-14): validate exit_price against live snapshot.
+        snap_price = None
+        try:
+            snap = get_snapshot(symbol)
+            snap_price = (
+                float(snap.latest_trade.price)
+                if snap and snap.latest_trade else None
+            )
+        except Exception:
+            snap_price = None
+
         exit_price = get_filled_exit_price(symbol, side=trade.side)
+        if exit_price is not None and snap_price is not None and snap_price > 0:
+            if abs(exit_price - snap_price) / snap_price > 0.05:
+                logger.warning(
+                    "ExitOrchestrator WS: %s fill lookup returned $%.2f but "
+                    "live snapshot is $%.2f (>5%% diff) — rejecting",
+                    symbol, exit_price, snap_price,
+                )
+                exit_price = snap_price
         if exit_price is None:
-            try:
-                snap = get_snapshot(symbol)
-                exit_price = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
-            except Exception:
-                exit_price = trade.entry_price
+            exit_price = snap_price if snap_price is not None else trade.entry_price
 
         now = datetime.now(config.ET)
         risk_manager.close_trade(symbol, exit_price, now, exit_reason=reason)
@@ -564,13 +599,56 @@ class ExitOrchestrator:
     def _check_adaptive_exit(
         self, trade, current_price: float, state: PositionExitState,
     ) -> Optional[ExitAction]:
-        """VIX-aware z-score exit for mean-reversion strategies."""
+        """VIX-aware z-score exit for mean-reversion strategies.
+
+        BUG-FIX (2026-04-15): Previously fabricated mu=entry_price, which made
+        z = (price - entry_price) / sigma ≈ 0 immediately after entry →
+        full_reversion fired within 1 second → instant forced close
+        (INTC lost $217 this way on 2026-04-15). Now requires real OU params
+        stored on the trade at signal time; falls back to DB; otherwise skips.
+        """
         try:
+            # --- Gate 1: real OU params required (no more fabricated values) --
+            mu = getattr(trade, 'entry_mu', 0.0) or 0.0
+            sigma = getattr(trade, 'entry_sigma', 0.0) or 0.0
+            half_life_hours = getattr(trade, 'entry_half_life_hours', 0.0) or 0.0
+
+            # Fallback: try DB lookup for trades that pre-dated the field
+            if mu <= 0.0 or sigma <= 0.0:
+                try:
+                    import database
+                    from datetime import datetime as _dt
+                    _today = _dt.now(trade.entry_time.tzinfo).strftime("%Y-%m-%d") \
+                        if trade.entry_time else _dt.now().strftime("%Y-%m-%d")
+                    row = database.get_ou_parameters(trade.symbol, _today)
+                    if row:
+                        mu = float(row.get('mu', 0.0) or 0.0)
+                        sigma = float(row.get('sigma', 0.0) or 0.0)
+                        half_life_hours = float(row.get('half_life', 0.0) or 0.0)
+                except Exception:
+                    pass
+
+            # No valid OU model → skip adaptive exit (fail-closed, not fake)
+            if mu <= 0.0 or sigma <= 0.0:
+                return None
+
+            # --- Gate 2: grace period — never exit in first 5 minutes -----
+            # Defense in depth against stale/wrong params. A real reversion
+            # on a 24h-half-life process cannot happen in < 5 minutes.
+            if trade.entry_time is not None:
+                from datetime import datetime as _dt, timedelta as _td
+                age = _dt.now(trade.entry_time.tzinfo) - trade.entry_time
+                if age < _td(minutes=5):
+                    return None
+
+            if half_life_hours <= 0.0:
+                half_life_hours = 24.0  # Safe default only for time-stop math
+
             vix = get_vix_level()
             ou_params = {
-                'mu': trade.entry_price,
-                'sigma': trade.entry_atr if trade.entry_atr > 0 else trade.entry_price * 0.02,
-                'half_life': 24.0,
+                'mu': mu,
+                'sigma': sigma,
+                'half_life': half_life_hours,
             }
             exit_reason, exit_type = self._adaptive_mgr.should_exit(
                 position_side=trade.side,
@@ -765,8 +843,22 @@ class ExitOrchestrator:
     def _check_rsi_exit(
         self, trade, current_price: float, now: datetime,
     ) -> Optional[ExitAction]:
-        """Exit if RSI is extremely overbought/oversold and trade is profitable."""
+        """Exit if RSI is extremely overbought/oversold and trade is profitable.
+
+        BUG-FIX (2026-04-14): The docstring says "and trade is profitable" but
+        the old code didn't check! That caused META (ORB) to exit at -6.2%
+        under reason=rsi_overbought despite the bracket SL=$648.10 (only -1.5%
+        from entry). Now we require the trade to be in the green before using
+        RSI as a profit-taking exit — RSI is a mean-reversion indicator, not a
+        stop loss.
+        """
         try:
+            # Must be profitable — RSI exits are profit takers, not stops.
+            if trade.side == "buy" and current_price <= trade.entry_price:
+                return None
+            if trade.side == "sell" and current_price >= trade.entry_price:
+                return None
+
             import pandas_ta as ta
             from data import get_intraday_bars
             from alpaca.data.timeframe import TimeFrame, TimeFrameUnit

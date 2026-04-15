@@ -130,6 +130,30 @@ def sync_positions_with_broker(risk: RiskManager, now: datetime, ws_monitor=None
             trade = risk.open_trades[symbol]
 
             exit_price, broker_reason = get_filled_exit_info(symbol, side=trade.side)
+
+            # BUG-FIX (2026-04-14): sanity-check the looked-up fill price
+            # against the live snapshot. If the fill is >5% away from
+            # snapshot, it's almost certainly a stale historical order —
+            # ignore it and fall through to the snapshot path below.
+            if exit_price is not None:
+                try:
+                    _snap = get_snapshot(symbol)
+                    _snap_price = (
+                        float(_snap.latest_trade.price)
+                        if _snap and _snap.latest_trade else None
+                    )
+                    if _snap_price and _snap_price > 0:
+                        if abs(exit_price - _snap_price) / _snap_price > 0.05:
+                            logger.warning(
+                                "broker_sync: %s fill lookup returned $%.2f but "
+                                "snapshot is $%.2f (>5%% diff) — rejecting",
+                                symbol, exit_price, _snap_price,
+                            )
+                            exit_price = None
+                            broker_reason = None
+                except Exception:
+                    pass
+
             if exit_price is None:
                 broker_reason = "broker_sync"
                 # V11.3 T7: Improved fallback chain for exit price

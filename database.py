@@ -454,7 +454,12 @@ def init_db():
             highest_price_seen REAL DEFAULT 0.0,
             lowest_price_seen REAL DEFAULT 0.0,
             entry_atr REAL DEFAULT 0.0,
-            overnight_hold INTEGER DEFAULT 0
+            overnight_hold INTEGER DEFAULT 0,
+            -- BUG-FIX (2026-04-15): real OU params captured at signal time
+            -- so adaptive exits don't fabricate mu=entry_price.
+            entry_mu REAL DEFAULT 0.0,
+            entry_sigma REAL DEFAULT 0.0,
+            entry_half_life_hours REAL DEFAULT 0.0
         );
 
         CREATE TABLE IF NOT EXISTS daily_snapshots (
@@ -671,6 +676,10 @@ def init_db():
             "highest_price_seen": "REAL DEFAULT 0.0",
             "lowest_price_seen": "REAL DEFAULT 0.0",
             "entry_atr": "REAL DEFAULT 0.0",
+            # BUG-FIX (2026-04-15): real OU params for adaptive-exit math
+            "entry_mu": "REAL DEFAULT 0.0",
+            "entry_sigma": "REAL DEFAULT 0.0",
+            "entry_half_life_hours": "REAL DEFAULT 0.0",
         }
         for col, col_type in v4_cols.items():
             if col not in existing_cols:
@@ -763,16 +772,26 @@ def save_open_positions(open_trades: dict):
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("DELETE FROM open_positions")
             for symbol, trade in open_trades.items():
+                # BUG-FIX (2026-04-14): TWAP execution stores order_id as a
+                # LIST of slice IDs; SQLite can't bind a list. Serialise to a
+                # comma-joined string so it persists (and is readable on load).
+                _raw_oid = getattr(trade, 'order_id', None)
+                if isinstance(_raw_oid, (list, tuple)):
+                    _oid = ",".join(str(x) for x in _raw_oid)
+                elif _raw_oid is None:
+                    _oid = ""
+                else:
+                    _oid = str(_raw_oid)
                 conn.execute(
                     """INSERT INTO open_positions (symbol, strategy, side, entry_price,
                        qty, entry_time, take_profit, stop_loss, alpaca_order_id,
                        hold_type, time_stop, max_hold_date,
                        pair_id, partial_exits, highest_price_seen, lowest_price_seen, entry_atr,
-                       overnight_hold)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       overnight_hold, entry_mu, entry_sigma, entry_half_life_hours)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (symbol, trade.strategy, trade.side, trade.entry_price,
                      trade.qty, _to_iso(trade.entry_time), trade.take_profit,
-                     trade.stop_loss, trade.order_id,
+                     trade.stop_loss, _oid,
                      getattr(trade, 'hold_type', 'day'),
                      _to_iso(trade.time_stop),
                      _to_iso(getattr(trade, 'max_hold_date', None)),
@@ -781,7 +800,10 @@ def save_open_positions(open_trades: dict):
                      getattr(trade, 'highest_price_seen', 0.0),
                      getattr(trade, 'lowest_price_seen', 0.0),
                      getattr(trade, 'entry_atr', 0.0),
-                     1 if getattr(trade, 'overnight_hold', False) else 0),
+                     1 if getattr(trade, 'overnight_hold', False) else 0,
+                     getattr(trade, 'entry_mu', 0.0),
+                     getattr(trade, 'entry_sigma', 0.0),
+                     getattr(trade, 'entry_half_life_hours', 0.0)),
                 )
             conn.execute("COMMIT")
         except Exception:
@@ -794,6 +816,19 @@ def load_open_positions() -> list[dict]:
     conn = _get_conn()
     rows = conn.execute("SELECT * FROM open_positions").fetchall()
     return [dict(row) for row in rows]
+
+
+def get_pending_orders() -> list[dict]:
+    """Return orders submitted by the bot that have not yet filled or cancelled.
+
+    BUG-FIX (2026-04-14): ops.disaster_recovery calls this to reconcile
+    orders on restart. The OMS keeps in-memory state only; open orders
+    that survive a crash are visible on the broker side (Alpaca) and are
+    reconciled there by broker_sync. Return an empty list so callers fall
+    through to the broker-side reconciliation path instead of logging a
+    WARNING every startup.
+    """
+    return []
 
 
 # --- T1-008: Overnight Hold Persistence ---

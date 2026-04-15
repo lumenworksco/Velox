@@ -22,6 +22,7 @@ class EventType(str, Enum):
     ORDER_REJECTED = "order.rejected"
     POSITION_OPENED = "position.opened"
     POSITION_CLOSED = "position.closed"
+    POSITION_CANCELLED = "position.cancelled"  # BUG-FIX (2026-04-14): rolled-back entry
     EXIT_TRIGGERED = "exit.triggered"
     CIRCUIT_BREAKER = "circuit_breaker.triggered"
     KILL_SWITCH = "kill_switch.activated"

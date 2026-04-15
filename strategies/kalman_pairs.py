@@ -518,25 +518,35 @@ class KalmanPairsTrader:
                 # T1-007: Ensure hedge_ratio is scalar float (theta[0] may be ndarray element)
                 hedge_ratio = float(np.squeeze(state.get('theta', [1.0, 0.0])[0]))
 
+                # BUG-FIX (2026-04-14): Previously the strategy emitted the
+                # long leg unconditionally and the short leg only if
+                # ALLOW_SHORT=True and the symbol wasn't in NO_SHORT_SYMBOLS.
+                # When shorts are disabled (our default), signal_processor
+                # then rejected the pair at len()==1 and logged a WARNING —
+                # 163 noisy warnings/day with no trades. Pairs are strictly
+                # market-neutral; if one leg can't be filled, neither should.
+
                 # --- Spread too wide (z > entry): short sym1, long sym2
                 if zscore > config.PAIRS_ZSCORE_ENTRY:
+                    can_short_sym1 = config.ALLOW_SHORT and sym1 not in config.NO_SHORT_SYMBOLS
+                    if not can_short_sym1:
+                        logger.debug(
+                            "Pairs skip %s/%s (z=%.2f): cannot short %s (ALLOW_SHORT=%s)",
+                            sym1, sym2, zscore, sym1, config.ALLOW_SHORT,
+                        )
+                        continue
                     pair_id = f"PAIR_{sym1}_{sym2}_{now.strftime('%H%M')}"
-
-                    # Short leg (sym1)
-                    if config.ALLOW_SHORT and sym1 not in config.NO_SHORT_SYMBOLS:
-                        signals.append(Signal(
-                            symbol=sym1,
-                            strategy="KALMAN_PAIRS",
-                            side="sell",
-                            entry_price=round(price1, 2),
-                            take_profit=round(price1 * (1 - config.PAIRS_TP_PCT), 2),
-                            stop_loss=round(price1 * (1 + config.PAIRS_SL_PCT), 2),
-                            reason=f"Pairs short z={zscore:.2f} vs {sym2}",
-                            hold_type="day",
-                            pair_id=pair_id,
-                        ))
-
-                    # Long leg (sym2)
+                    signals.append(Signal(
+                        symbol=sym1,
+                        strategy="KALMAN_PAIRS",
+                        side="sell",
+                        entry_price=round(price1, 2),
+                        take_profit=round(price1 * (1 - config.PAIRS_TP_PCT), 2),
+                        stop_loss=round(price1 * (1 + config.PAIRS_SL_PCT), 2),
+                        reason=f"Pairs short z={zscore:.2f} vs {sym2}",
+                        hold_type="day",
+                        pair_id=pair_id,
+                    ))
                     signals.append(Signal(
                         symbol=sym2,
                         strategy="KALMAN_PAIRS",
@@ -551,9 +561,14 @@ class KalmanPairsTrader:
 
                 # --- Spread too narrow (z < -entry): long sym1, short sym2
                 elif zscore < -config.PAIRS_ZSCORE_ENTRY:
+                    can_short_sym2 = config.ALLOW_SHORT and sym2 not in config.NO_SHORT_SYMBOLS
+                    if not can_short_sym2:
+                        logger.debug(
+                            "Pairs skip %s/%s (z=%.2f): cannot short %s (ALLOW_SHORT=%s)",
+                            sym1, sym2, zscore, sym2, config.ALLOW_SHORT,
+                        )
+                        continue
                     pair_id = f"PAIR_{sym1}_{sym2}_{now.strftime('%H%M')}"
-
-                    # Long leg (sym1)
                     signals.append(Signal(
                         symbol=sym1,
                         strategy="KALMAN_PAIRS",
@@ -565,20 +580,17 @@ class KalmanPairsTrader:
                         hold_type="day",
                         pair_id=pair_id,
                     ))
-
-                    # Short leg (sym2)
-                    if config.ALLOW_SHORT and sym2 not in config.NO_SHORT_SYMBOLS:
-                        signals.append(Signal(
-                            symbol=sym2,
-                            strategy="KALMAN_PAIRS",
-                            side="sell",
-                            entry_price=round(price2, 2),
-                            take_profit=round(price2 * (1 - config.PAIRS_TP_PCT), 2),
-                            stop_loss=round(price2 * (1 + config.PAIRS_SL_PCT), 2),
-                            reason=f"Pairs short z={zscore:.2f} vs {sym1}",
-                            hold_type="day",
-                            pair_id=pair_id,
-                        ))
+                    signals.append(Signal(
+                        symbol=sym2,
+                        strategy="KALMAN_PAIRS",
+                        side="sell",
+                        entry_price=round(price2, 2),
+                        take_profit=round(price2 * (1 - config.PAIRS_TP_PCT), 2),
+                        stop_loss=round(price2 * (1 + config.PAIRS_SL_PCT), 2),
+                        reason=f"Pairs short z={zscore:.2f} vs {sym1}",
+                        hold_type="day",
+                        pair_id=pair_id,
+                    ))
 
             except Exception as e:
                 logger.debug(f"Pairs scan error for {sym1}/{sym2}: {e}")

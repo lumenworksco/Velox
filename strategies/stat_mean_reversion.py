@@ -205,9 +205,15 @@ class StatMeanReversion:
                 if intraday_ou:
                     mu = intraday_ou['mu']
                     sigma = intraday_ou['sigma']
+                    # Intraday refit uses 2-min bars, so half-life is in units
+                    # of 2-min bars. Convert to hours.
+                    half_life_hours_used = float(intraday_ou.get('half_life', 12.0)) * (2.0 / 60.0)
                 else:
                     mu = ou['mu']
                     sigma = ou['sigma']
+                    # Universe-prep OU fit; already stored half_life in bar units.
+                    # Use a conservative default of 12h if unknown.
+                    half_life_hours_used = 12.0
 
                 zscore = compute_zscore(price, mu, sigma)
 
@@ -311,6 +317,16 @@ class StatMeanReversion:
                         stop_loss=round(stop_price, 2),
                         reason=f"MR long z={zscore:.2f} RSI={rsi:.0f}",
                         hold_type="day",
+                        # BUG-FIX (2026-04-15): Carry real OU params so the
+                        # adaptive exit can compute a correct z-score instead
+                        # of fabricating mu=entry_price (which triggered
+                        # instant full_reversion).
+                        metadata={
+                            'ou_mu': float(mu),
+                            'ou_sigma': float(sigma),
+                            'ou_half_life_hours': float(half_life_hours_used),
+                            'entry_zscore': float(zscore),
+                        },
                     ))
 
                 # === SHORT entry: price above mean ===
@@ -351,6 +367,13 @@ class StatMeanReversion:
                         stop_loss=round(stop_price, 2),
                         reason=f"MR short z={zscore:.2f} RSI={rsi:.0f}",
                         hold_type="day",
+                        # BUG-FIX (2026-04-15): Carry real OU params (see long side).
+                        metadata={
+                            'ou_mu': float(mu),
+                            'ou_sigma': float(sigma),
+                            'ou_half_life_hours': float(half_life_hours_used),
+                            'entry_zscore': float(zscore),
+                        },
                     ))
 
             except Exception as e:
@@ -378,16 +401,32 @@ class StatMeanReversion:
                 continue
 
             try:
+                # BUG-FIX (2026-04-14): Grace period after entry.
+                # TWAP slicing can take 4+ minutes; by the time the last slice
+                # lands the z-score may have drifted further in the entry
+                # direction (e.g. deeper oversold for a long). Previously this
+                # fired the z-stop within 2 seconds of the trade "opening"
+                # (INTC: opened 14:13:45 closed 14:13:47, reason MR z-stop).
+                # Skip strategy-level exit checks for the first ~5 minutes;
+                # bracket TP/SL at the broker still protect capital.
+                if hasattr(trade, 'entry_time') and trade.entry_time:
+                    elapsed_sec = (now - trade.entry_time).total_seconds()
+                    if elapsed_sec < 300:  # 5 minutes
+                        continue
+
                 ou = self.ou_params.get(symbol)
                 if not ou:
                     continue
 
-                # Get current price from recent bars
-                lookback = now - timedelta(minutes=10)
+                # BUG-FIX (2026-04-14): Use the SAME 2-hour lookback as scan().
+                # Previously exit used only 10 minutes (~5 bars of 2-min data),
+                # producing near-zero price_sigma and absurd z-scores like
+                # z=-87 that triggered phantom stops on healthy positions.
+                lookback = now - timedelta(hours=2)
                 bars = get_intraday_bars(
                     symbol, TimeFrame(2, TimeFrameUnit.Minute), start=lookback, end=now
                 )
-                if bars is None or bars.empty:
+                if bars is None or bars.empty or len(bars) < 20:
                     continue
 
                 close = bars["close"]
@@ -397,12 +436,31 @@ class StatMeanReversion:
                 # with entry logic. OU sigma is std of price CHANGES which is
                 # too small for meaningful z-score thresholds on exits.
                 price_sigma = float(close.iloc[:-1].std()) if len(close) > 2 else ou['sigma']
+
+                # BUG-FIX (2026-04-14): enforce a sane floor on price_sigma.
+                # During very calm bars sigma can collapse to <$0.01 on a $100
+                # stock, exploding any z-score. Floor at 0.1% of price or the
+                # OU fit's sigma, whichever is larger.
+                floor_sigma = max(float(price) * 0.001, float(ou.get('sigma', 0.0) or 0.0))
+                if price_sigma < floor_sigma:
+                    price_sigma = floor_sigma
                 if price_sigma < 1e-10:
                     logger.debug(f"MR exit skip {symbol}: price_sigma ~0")
                     continue
 
                 # Compute current z-score using price_sigma (consistent with scan())
                 zscore = (price - ou['mu']) / price_sigma
+
+                # BUG-FIX (2026-04-14): refuse to act on extreme z-scores.
+                # |z| > 8 means the OU model parameters are stale/inconsistent
+                # with the current price regime — do NOT blindly fire a stop.
+                if abs(zscore) > 8.0:
+                    logger.warning(
+                        "MR exit: extreme z=%.2f for %s (price=%.2f mu=%.2f sigma=%.4f) "
+                        "— ignoring this cycle (OU params likely stale)",
+                        zscore, symbol, price, ou['mu'], price_sigma,
+                    )
+                    continue
 
                 # Time stop: 2x half_life
                 if hasattr(trade, 'entry_time') and trade.entry_time:

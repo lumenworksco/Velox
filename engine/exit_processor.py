@@ -216,14 +216,50 @@ def check_advanced_exits(risk: RiskManager, now: datetime) -> list[dict]:
         # 3. Scale-out on losers approaching stop
         actions.extend(_check_scale_out_loser(trade, current_price))
 
-        # 4. Adaptive exit for STAT_MR and VWAP positions (fail-open)
+        # 4. Adaptive exit for STAT_MR and VWAP positions (fail-closed on missing OU)
+        # BUG-FIX (2026-04-15): Previously fabricated mu=entry_price, which made
+        # z ≈ 0 immediately and forced-closed positions within 1 second of entry
+        # (INTC -$217 on 2026-04-15). Now requires real OU params stored on the
+        # trade at signal time; falls back to DB; otherwise skips.
         if _ADAPTIVE_EXIT_AVAILABLE and trade.strategy in _ADAPTIVE_EXIT_STRATEGIES:
             try:
+                mu = getattr(trade, 'entry_mu', 0.0) or 0.0
+                sigma = getattr(trade, 'entry_sigma', 0.0) or 0.0
+                half_life_hours = getattr(trade, 'entry_half_life_hours', 0.0) or 0.0
+
+                # Fallback: DB lookup for trades that pre-dated the field
+                if mu <= 0.0 or sigma <= 0.0:
+                    try:
+                        import database
+                        from datetime import datetime as _dt
+                        _today = _dt.now(trade.entry_time.tzinfo).strftime("%Y-%m-%d") \
+                            if trade.entry_time else _dt.now().strftime("%Y-%m-%d")
+                        row = database.get_ou_parameters(symbol, _today)
+                        if row:
+                            mu = float(row.get('mu', 0.0) or 0.0)
+                            sigma = float(row.get('sigma', 0.0) or 0.0)
+                            half_life_hours = float(row.get('half_life', 0.0) or 0.0)
+                    except Exception:
+                        pass
+
+                # No valid OU model → skip adaptive exit (fail-closed, not fake)
+                if mu <= 0.0 or sigma <= 0.0:
+                    continue
+
+                # Grace period: never exit in first 5 minutes
+                if trade.entry_time is not None:
+                    age = now - trade.entry_time
+                    if age < timedelta(minutes=5):
+                        continue
+
+                if half_life_hours <= 0.0:
+                    half_life_hours = 24.0
+
                 vix = get_vix_level()
                 ou_params = {
-                    'mu': trade.entry_price,
-                    'sigma': trade.entry_atr if trade.entry_atr > 0 else trade.entry_price * 0.02,
-                    'half_life': 24.0,
+                    'mu': mu,
+                    'sigma': sigma,
+                    'half_life': half_life_hours,
                 }
                 exit_reason, exit_type = _adaptive_exit_mgr.should_exit(
                     position_side=trade.side,
@@ -336,13 +372,28 @@ def handle_strategy_exits(exit_actions: list[dict], risk: RiskManager, now: date
             mark_symbol_close_attempted(symbol)
             _seen.add(symbol)
 
+            # BUG-FIX (2026-04-14): validate exit_price against live snapshot.
+            snap_price = None
+            try:
+                snap = get_snapshot(symbol)
+                snap_price = (
+                    float(snap.latest_trade.price)
+                    if snap and snap.latest_trade else None
+                )
+            except Exception:
+                snap_price = None
+
             exit_price = get_filled_exit_price(symbol, side=trade.side)
+            if exit_price is not None and snap_price is not None and snap_price > 0:
+                if abs(exit_price - snap_price) / snap_price > 0.05:
+                    logger.warning(
+                        "exit_processor: %s fill lookup returned $%.2f but "
+                        "snapshot is $%.2f (>5%% diff) — using snapshot",
+                        symbol, exit_price, snap_price,
+                    )
+                    exit_price = snap_price
             if exit_price is None:
-                try:
-                    snap = get_snapshot(symbol)
-                    exit_price = float(snap.latest_trade.price) if snap and snap.latest_trade else trade.entry_price
-                except Exception:
-                    exit_price = trade.entry_price
+                exit_price = snap_price if snap_price is not None else trade.entry_price
 
             # V12 6.1: Capture commission from the order
             commission = get_order_commission(trade.order_id)

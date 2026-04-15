@@ -315,9 +315,15 @@ def set_edgar_monitor(monitor) -> None:
 
 
 def register_stopout(symbol: str) -> None:
-    """Register a stop-loss event — blocks re-entry for REENTRY_COOLDOWN_MIN minutes."""
+    """Register a stop-loss event — blocks re-entry for REENTRY_COOLDOWN_MIN minutes.
+
+    BUG-FIX (2026-04-14): expiry must be tz-aware to match the tz-aware `now`
+    passed into `_is_in_cooldown` from main.py. Previously `datetime.now()`
+    produced a naive datetime, which crashed the main loop with
+    'can't compare offset-naive and offset-aware datetimes'.
+    """
     cooldown_min = getattr(config, "REENTRY_COOLDOWN_MIN", 15)
-    expiry = datetime.now() + timedelta(minutes=cooldown_min)
+    expiry = datetime.now(config.ET) + timedelta(minutes=cooldown_min)
     with _state.lock:
         _state.stopout_cooldowns[symbol] = expiry
     logger.info("Cooldown: %s blocked for re-entry until %s (%d min)",
@@ -325,11 +331,21 @@ def register_stopout(symbol: str) -> None:
 
 
 def _is_in_cooldown(symbol: str, now: datetime) -> bool:
-    """Check if a symbol is in post-stop-loss cooldown."""
+    """Check if a symbol is in post-stop-loss cooldown.
+
+    BUG-FIX (2026-04-14): defensively normalise tz to avoid crashes from
+    legacy naive entries in the cooldown dict.
+    """
     with _state.lock:
         expiry = _state.stopout_cooldowns.get(symbol)
         if expiry is None:
             return False
+        # Defensive: if stored expiry is tz-naive, localise it to ET
+        if expiry.tzinfo is None and now.tzinfo is not None:
+            expiry = expiry.replace(tzinfo=config.ET)
+            _state.stopout_cooldowns[symbol] = expiry
+        elif expiry.tzinfo is not None and now.tzinfo is None:
+            now = now.replace(tzinfo=config.ET)
         if now >= expiry:
             del _state.stopout_cooldowns[symbol]
             return False
@@ -1591,6 +1607,14 @@ def _process_single_signal(
     elif signal.strategy == "BETA_HEDGE":
         hold_type = "day"
 
+    # BUG-FIX (2026-04-15): Pull real OU params out of signal.metadata so
+    # adaptive exits can compute a correct z-score. Defaults to 0.0 (which
+    # _check_adaptive_exit treats as "no OU model → skip adaptive exit").
+    _meta = getattr(signal, "metadata", None) or {}
+    _entry_mu = float(_meta.get("ou_mu", 0.0) or 0.0)
+    _entry_sigma = float(_meta.get("ou_sigma", 0.0) or 0.0)
+    _entry_half_life_hours = float(_meta.get("ou_half_life_hours", 0.0) or 0.0)
+
     trade = TradeRecord(
         symbol=signal.symbol,
         strategy=signal.strategy,
@@ -1606,6 +1630,9 @@ def _process_single_signal(
         max_hold_date=max_hold_date,
         pair_id=getattr(signal, "pair_id", ""),
         highest_price_seen=signal.entry_price,
+        entry_mu=_entry_mu,
+        entry_sigma=_entry_sigma,
+        entry_half_life_hours=_entry_half_life_hours,
     )
     risk.register_trade(trade)
 

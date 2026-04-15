@@ -63,6 +63,10 @@ open_positions = Table(
     Column("highest_price_seen", Float, default=0.0),
     Column("lowest_price_seen", Float, default=0.0),
     Column("entry_atr", Float, default=0.0),
+    # BUG-FIX (2026-04-15): real OU params for adaptive-exit math
+    Column("entry_mu", Float, default=0.0),
+    Column("entry_sigma", Float, default=0.0),
+    Column("entry_half_life_hours", Float, default=0.0),
 )
 
 daily_snapshots = Table(
