@@ -205,9 +205,15 @@ class StatMeanReversion:
                 if intraday_ou:
                     mu = intraday_ou['mu']
                     sigma = intraday_ou['sigma']
+                    # Intraday refit uses 2-min bars, so half-life is in units
+                    # of 2-min bars. Convert to hours.
+                    half_life_hours_used = float(intraday_ou.get('half_life', 12.0)) * (2.0 / 60.0)
                 else:
                     mu = ou['mu']
                     sigma = ou['sigma']
+                    # Universe-prep OU fit; already stored half_life in bar units.
+                    # Use a conservative default of 12h if unknown.
+                    half_life_hours_used = 12.0
 
                 zscore = compute_zscore(price, mu, sigma)
 
@@ -311,6 +317,16 @@ class StatMeanReversion:
                         stop_loss=round(stop_price, 2),
                         reason=f"MR long z={zscore:.2f} RSI={rsi:.0f}",
                         hold_type="day",
+                        # BUG-FIX (2026-04-15): Carry real OU params so the
+                        # adaptive exit can compute a correct z-score instead
+                        # of fabricating mu=entry_price (which triggered
+                        # instant full_reversion).
+                        metadata={
+                            'ou_mu': float(mu),
+                            'ou_sigma': float(sigma),
+                            'ou_half_life_hours': float(half_life_hours_used),
+                            'entry_zscore': float(zscore),
+                        },
                     ))
 
                 # === SHORT entry: price above mean ===
@@ -351,6 +367,13 @@ class StatMeanReversion:
                         stop_loss=round(stop_price, 2),
                         reason=f"MR short z={zscore:.2f} RSI={rsi:.0f}",
                         hold_type="day",
+                        # BUG-FIX (2026-04-15): Carry real OU params (see long side).
+                        metadata={
+                            'ou_mu': float(mu),
+                            'ou_sigma': float(sigma),
+                            'ou_half_life_hours': float(half_life_hours_used),
+                            'entry_zscore': float(zscore),
+                        },
                     ))
 
             except Exception as e:

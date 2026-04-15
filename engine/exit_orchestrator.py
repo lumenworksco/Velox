@@ -599,13 +599,56 @@ class ExitOrchestrator:
     def _check_adaptive_exit(
         self, trade, current_price: float, state: PositionExitState,
     ) -> Optional[ExitAction]:
-        """VIX-aware z-score exit for mean-reversion strategies."""
+        """VIX-aware z-score exit for mean-reversion strategies.
+
+        BUG-FIX (2026-04-15): Previously fabricated mu=entry_price, which made
+        z = (price - entry_price) / sigma ≈ 0 immediately after entry →
+        full_reversion fired within 1 second → instant forced close
+        (INTC lost $217 this way on 2026-04-15). Now requires real OU params
+        stored on the trade at signal time; falls back to DB; otherwise skips.
+        """
         try:
+            # --- Gate 1: real OU params required (no more fabricated values) --
+            mu = getattr(trade, 'entry_mu', 0.0) or 0.0
+            sigma = getattr(trade, 'entry_sigma', 0.0) or 0.0
+            half_life_hours = getattr(trade, 'entry_half_life_hours', 0.0) or 0.0
+
+            # Fallback: try DB lookup for trades that pre-dated the field
+            if mu <= 0.0 or sigma <= 0.0:
+                try:
+                    import database
+                    from datetime import datetime as _dt
+                    _today = _dt.now(trade.entry_time.tzinfo).strftime("%Y-%m-%d") \
+                        if trade.entry_time else _dt.now().strftime("%Y-%m-%d")
+                    row = database.get_ou_parameters(trade.symbol, _today)
+                    if row:
+                        mu = float(row.get('mu', 0.0) or 0.0)
+                        sigma = float(row.get('sigma', 0.0) or 0.0)
+                        half_life_hours = float(row.get('half_life', 0.0) or 0.0)
+                except Exception:
+                    pass
+
+            # No valid OU model → skip adaptive exit (fail-closed, not fake)
+            if mu <= 0.0 or sigma <= 0.0:
+                return None
+
+            # --- Gate 2: grace period — never exit in first 5 minutes -----
+            # Defense in depth against stale/wrong params. A real reversion
+            # on a 24h-half-life process cannot happen in < 5 minutes.
+            if trade.entry_time is not None:
+                from datetime import datetime as _dt, timedelta as _td
+                age = _dt.now(trade.entry_time.tzinfo) - trade.entry_time
+                if age < _td(minutes=5):
+                    return None
+
+            if half_life_hours <= 0.0:
+                half_life_hours = 24.0  # Safe default only for time-stop math
+
             vix = get_vix_level()
             ou_params = {
-                'mu': trade.entry_price,
-                'sigma': trade.entry_atr if trade.entry_atr > 0 else trade.entry_price * 0.02,
-                'half_life': 24.0,
+                'mu': mu,
+                'sigma': sigma,
+                'half_life': half_life_hours,
             }
             exit_reason, exit_type = self._adaptive_mgr.should_exit(
                 position_side=trade.side,

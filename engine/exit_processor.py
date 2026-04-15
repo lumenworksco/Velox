@@ -216,14 +216,50 @@ def check_advanced_exits(risk: RiskManager, now: datetime) -> list[dict]:
         # 3. Scale-out on losers approaching stop
         actions.extend(_check_scale_out_loser(trade, current_price))
 
-        # 4. Adaptive exit for STAT_MR and VWAP positions (fail-open)
+        # 4. Adaptive exit for STAT_MR and VWAP positions (fail-closed on missing OU)
+        # BUG-FIX (2026-04-15): Previously fabricated mu=entry_price, which made
+        # z ≈ 0 immediately and forced-closed positions within 1 second of entry
+        # (INTC -$217 on 2026-04-15). Now requires real OU params stored on the
+        # trade at signal time; falls back to DB; otherwise skips.
         if _ADAPTIVE_EXIT_AVAILABLE and trade.strategy in _ADAPTIVE_EXIT_STRATEGIES:
             try:
+                mu = getattr(trade, 'entry_mu', 0.0) or 0.0
+                sigma = getattr(trade, 'entry_sigma', 0.0) or 0.0
+                half_life_hours = getattr(trade, 'entry_half_life_hours', 0.0) or 0.0
+
+                # Fallback: DB lookup for trades that pre-dated the field
+                if mu <= 0.0 or sigma <= 0.0:
+                    try:
+                        import database
+                        from datetime import datetime as _dt
+                        _today = _dt.now(trade.entry_time.tzinfo).strftime("%Y-%m-%d") \
+                            if trade.entry_time else _dt.now().strftime("%Y-%m-%d")
+                        row = database.get_ou_parameters(symbol, _today)
+                        if row:
+                            mu = float(row.get('mu', 0.0) or 0.0)
+                            sigma = float(row.get('sigma', 0.0) or 0.0)
+                            half_life_hours = float(row.get('half_life', 0.0) or 0.0)
+                    except Exception:
+                        pass
+
+                # No valid OU model → skip adaptive exit (fail-closed, not fake)
+                if mu <= 0.0 or sigma <= 0.0:
+                    continue
+
+                # Grace period: never exit in first 5 minutes
+                if trade.entry_time is not None:
+                    age = now - trade.entry_time
+                    if age < timedelta(minutes=5):
+                        continue
+
+                if half_life_hours <= 0.0:
+                    half_life_hours = 24.0
+
                 vix = get_vix_level()
                 ou_params = {
-                    'mu': trade.entry_price,
-                    'sigma': trade.entry_atr if trade.entry_atr > 0 else trade.entry_price * 0.02,
-                    'half_life': 24.0,
+                    'mu': mu,
+                    'sigma': sigma,
+                    'half_life': half_life_hours,
                 }
                 exit_reason, exit_type = _adaptive_exit_mgr.should_exit(
                     position_side=trade.side,

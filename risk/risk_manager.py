@@ -218,6 +218,15 @@ class TradeRecord:
     entry_atr: float = 0.0           # V4: ATR at time of entry
     partial_closed_qty: int = 0      # V10 BUG-004: cumulative qty closed via partial exits
     commission: float = 0.0          # V12 6.1: Commission paid on this trade (entry + exit)
+    # BUG-FIX (2026-04-15): Real OU parameters captured at signal time.
+    # Previously adaptive-exit callers fabricated mu=entry_price which made
+    # z ≈ 0 immediately and triggered 'full_reversion' within 1 second of
+    # entry (INTC lost $217 this way on 2026-04-15). These fields carry the
+    # true OU mu/sigma/half_life so the adaptive exit math is correct.
+    # Zero values mean "no OU model available" → adaptive exit is skipped.
+    entry_mu: float = 0.0            # OU long-run mean at signal time
+    entry_sigma: float = 0.0         # Rolling std of price LEVELS (for z-score math)
+    entry_half_life_hours: float = 0.0  # OU half-life in hours (not bars)
 
 
 @dataclass
@@ -657,6 +666,9 @@ class RiskManager:
                     highest_price_seen=float(row.get("highest_price_seen", 0.0)),
                     lowest_price_seen=float(row.get("lowest_price_seen", 0.0)),
                     entry_atr=float(row.get("entry_atr", 0.0)),
+                    entry_mu=float(row.get("entry_mu", 0.0) or 0.0),
+                    entry_sigma=float(row.get("entry_sigma", 0.0) or 0.0),
+                    entry_half_life_hours=float(row.get("entry_half_life_hours", 0.0) or 0.0),
                 )
             logger.info(f"Restored {len(self.open_trades)} open trades from database")
         except Exception as e:

@@ -454,7 +454,12 @@ def init_db():
             highest_price_seen REAL DEFAULT 0.0,
             lowest_price_seen REAL DEFAULT 0.0,
             entry_atr REAL DEFAULT 0.0,
-            overnight_hold INTEGER DEFAULT 0
+            overnight_hold INTEGER DEFAULT 0,
+            -- BUG-FIX (2026-04-15): real OU params captured at signal time
+            -- so adaptive exits don't fabricate mu=entry_price.
+            entry_mu REAL DEFAULT 0.0,
+            entry_sigma REAL DEFAULT 0.0,
+            entry_half_life_hours REAL DEFAULT 0.0
         );
 
         CREATE TABLE IF NOT EXISTS daily_snapshots (
@@ -671,6 +676,10 @@ def init_db():
             "highest_price_seen": "REAL DEFAULT 0.0",
             "lowest_price_seen": "REAL DEFAULT 0.0",
             "entry_atr": "REAL DEFAULT 0.0",
+            # BUG-FIX (2026-04-15): real OU params for adaptive-exit math
+            "entry_mu": "REAL DEFAULT 0.0",
+            "entry_sigma": "REAL DEFAULT 0.0",
+            "entry_half_life_hours": "REAL DEFAULT 0.0",
         }
         for col, col_type in v4_cols.items():
             if col not in existing_cols:
@@ -778,8 +787,8 @@ def save_open_positions(open_trades: dict):
                        qty, entry_time, take_profit, stop_loss, alpaca_order_id,
                        hold_type, time_stop, max_hold_date,
                        pair_id, partial_exits, highest_price_seen, lowest_price_seen, entry_atr,
-                       overnight_hold)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       overnight_hold, entry_mu, entry_sigma, entry_half_life_hours)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (symbol, trade.strategy, trade.side, trade.entry_price,
                      trade.qty, _to_iso(trade.entry_time), trade.take_profit,
                      trade.stop_loss, _oid,
@@ -791,7 +800,10 @@ def save_open_positions(open_trades: dict):
                      getattr(trade, 'highest_price_seen', 0.0),
                      getattr(trade, 'lowest_price_seen', 0.0),
                      getattr(trade, 'entry_atr', 0.0),
-                     1 if getattr(trade, 'overnight_hold', False) else 0),
+                     1 if getattr(trade, 'overnight_hold', False) else 0,
+                     getattr(trade, 'entry_mu', 0.0),
+                     getattr(trade, 'entry_sigma', 0.0),
+                     getattr(trade, 'entry_half_life_hours', 0.0)),
                 )
             conn.execute("COMMIT")
         except Exception:
