@@ -77,7 +77,7 @@ def build_dashboard(
     )
 
     # Header
-    header = f"  VELOX V9 | {mode} MODE | Regime: {regime_text} | PnL Lock: {lock_text} | Up: {uptime}"
+    header = f"  VELOX V12 | {mode} MODE | Regime: {regime_text} | PnL Lock: {lock_text} | Up: {uptime}"
 
     # Portfolio section
     day_pnl_dollars = risk.day_pnl * risk.starting_equity if risk.starting_equity else 0
@@ -317,7 +317,7 @@ def build_dashboard(
 
     return Panel(
         content,
-        title="[bold cyan]VELOX V9 -- Autonomous Algorithmic Trading System[/bold cyan]",
+        title="[bold cyan]VELOX V12 -- Autonomous Algorithmic Trading System[/bold cyan]",
         border_style="cyan",
     )
 
@@ -365,6 +365,6 @@ def print_startup_info(info: dict):
         f"  Cash:    ${info['cash']:,.2f}\n"
         f"  Market:  {market}\n"
         f"  Next:    {info.get('next_open', 'N/A')}",
-        title="[bold green]VELOX V9 -- CONNECTION VERIFIED[/bold green]",
+        title="[bold green]VELOX V12 -- CONNECTION VERIFIED[/bold green]",
         border_style="green",
     ))

@@ -1147,11 +1147,11 @@ async def v2_health():
     try:
         uptime_sec = _time.time() - _start_time
         result["uptime_seconds"] = round(uptime_sec)
-        result["version"] = "V9"
+        result["version"] = "V12"
         result["paper_mode"] = config.PAPER_MODE
     except Exception as e:
         result["uptime_seconds"] = 0
-        result["version"] = "V9"
+        result["version"] = "V12"
 
     try:
         health_data = _v9_state.get("system_health", {})

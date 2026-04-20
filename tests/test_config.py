@@ -7,18 +7,19 @@ from datetime import time
 class TestStrategyAllocations:
     """Tests for STRATEGY_ALLOCATIONS."""
 
-    def test_allocations_sum_within_budget(self):
-        """Strategy allocations must sum to at most 1.0 (100% of capital).
+    def test_allocations_sum_to_one(self):
+        """All strategy allocations (including 0.0 disabled weights) must
+        sum to approximately 1.0.
 
-        2026-04-17: with demoted strategies (ORB weight=0 pending alpha
-        recovery), the total can drop below 1.0 — the gap stays in cash.
-        The invariant is that allocations never OVER-commit the budget;
-        under-commitment is acceptable and intentional during demotion.
+        2026-04-17: disabled strategies keep their key in the dict with
+        weight 0.0. When a strategy is disabled its weight is redistributed
+        to the remaining actives so the total still sums to 1.0 — cash
+        drag from under-commitment is not acceptable.
         """
         import config
         total = sum(config.STRATEGY_ALLOCATIONS.values())
-        assert 0.5 <= total <= 1.0 + 1e-9, (
-            f"Allocations sum to {total} — outside acceptable [0.5, 1.0]"
+        assert abs(total - 1.0) < 1e-9, (
+            f"Allocations sum to {total}, expected 1.0"
         )
 
     def test_allocations_are_non_negative(self):

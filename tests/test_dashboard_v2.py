@@ -291,8 +291,8 @@ class TestTerminalDashboard:
             num_symbols=50,
         )
         assert panel is not None
-        # Should contain V9 in title
-        assert "V9" in str(panel.title)
+        # Should contain V12 in title
+        assert "V12" in str(panel.title)
 
     def test_builds_with_v9_data(self):
         """Dashboard should display V9 intelligence lines when provided."""
@@ -363,7 +363,7 @@ class TestTerminalDashboard:
             last_scan_time=None,
             num_symbols=50,
         )
-        assert "V9" in str(panel.title)
+        assert "V12" in str(panel.title)
         assert "V8" not in str(panel.title)
 
 
