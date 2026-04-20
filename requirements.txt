@@ -3,7 +3,7 @@
 alpaca-py==0.43.2
 pandas==3.0.1
 pandas-ta==0.4.71b0
-numpy==2.2.6
+numpy==2.4.4
 rich==14.3.3
 
 # Data & ML
