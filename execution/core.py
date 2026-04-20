@@ -238,8 +238,20 @@ def _chase_unfilled_order(
             # If filled or terminal — stop chasing
             if status in ("filled", "partially_filled", "cancelled", "canceled",
                           "expired", "rejected", "replaced"):
+                # BUG-FIX (2026-04-17, Bug E): record the actual filled qty
+                # on the status-break path too.  Previously `final_fill_qty`
+                # was only set in the 30s timeout branch, so any terminal
+                # status (e.g. cancelled with zero fills, partially_filled)
+                # fell through with final_fill_qty=0, which either mis-
+                # triggered full rollback or left the optimistic full qty
+                # in risk.open_trades on a partial fill.
+                try:
+                    final_fill_qty = int(float(getattr(order, "filled_qty", 0) or 0))
+                except Exception:
+                    final_fill_qty = 0
                 logger.debug(
-                    f"V12 7.2: Chase ended for {current_order_id} — status={status}"
+                    f"V12 7.2: Chase ended for {current_order_id} — status={status} "
+                    f"filled_qty={final_fill_qty}"
                 )
                 break
 
@@ -328,16 +340,28 @@ def _chase_unfilled_order(
         # the optimistic trade registration in the risk manager so downstream
         # exit logic doesn't close a phantom position (observed: META ORB
         # 2026-04-14 15:14:23 chase timeout → phantom -$3,580 close at 15:33).
-        if final_fill_qty == 0:
-            try:
-                from container import Container
-                rm = Container.instance().risk_manager
-                if rm is not None:
+        # BUG-FIX (2026-04-17, Bug E): on a PARTIAL fill the optimistic
+        # registration left risk.open_trades[sym].qty at the full requested
+        # size, which caused exits to over-sell and flip the position short.
+        # Now: zero fills → cancel; partial fills → sync qty to the real
+        # filled amount so subsequent exits match the broker position.
+        try:
+            from container import Container
+            rm = Container.instance().risk_manager
+            if rm is not None:
+                if final_fill_qty == 0:
                     rm.cancel_trade(signal.symbol,
                                     reason="chase_timeout_no_fill")
-            except Exception as _e:
-                logger.debug(f"V12 7.2: risk.cancel_trade failed for "
-                             f"{signal.symbol}: {_e}")
+                elif final_fill_qty < qty and signal.symbol in rm.open_trades:
+                    prev_qty = rm.open_trades[signal.symbol].qty
+                    rm.open_trades[signal.symbol].qty = final_fill_qty
+                    logger.warning(
+                        f"V12 7.2: Chase partial fill for {signal.symbol} — "
+                        f"synced risk qty {prev_qty} → {final_fill_qty}"
+                    )
+        except Exception as _e:
+            logger.debug(f"V12 7.2: risk rollback/sync failed for "
+                         f"{signal.symbol}: {_e}")
 
 
 def _start_chase_thread(order_id: str, signal: Signal, qty: int) -> None:
@@ -971,10 +995,37 @@ def submit_twap_order(
             order = _submit_order(signal, qty, client)
             oid = str(order.id)
             order_ids.append(oid)
-            total_filled += qty
+            # BUG-FIX (2026-04-17): accumulate ACTUAL filled qty, not the
+            # submitted qty. Previously `total_filled += qty` reported
+            # optimistic full fills, causing the OMS parent state to
+            # transition to FILLED (line ~1156) even when slices were
+            # partial/unfilled, masking real partial fills in metrics.
+            # Poll briefly (up to ~2s) for the broker to update filled_qty;
+            # if still zero, leave the accrual to the end-of-slice reconcile
+            # path (lines ~1053-1063) which re-queries every order_id.
+            slice_filled = 0
+            try:
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    try:
+                        cur = client.get_order_by_id(oid)
+                        slice_filled = int(float(getattr(cur, "filled_qty", 0) or 0))
+                        status = str(getattr(cur, "status", "")).lower()
+                        if slice_filled >= qty or status in (
+                            "filled", "partially_filled", "cancelled",
+                            "canceled", "expired", "rejected",
+                        ):
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+            except Exception as _pe:
+                logger.debug(f"TWAP slice poll failed for {oid}: {_pe}")
+            total_filled += slice_filled
             logger.info(
                 f"TWAP slice {i+1}/{slices}: {signal.side.upper()} {qty} "
-                f"{signal.symbol} ({signal.strategy}) order_id={oid}"
+                f"{signal.symbol} ({signal.strategy}) order_id={oid} "
+                f"filled={slice_filled}/{qty}"
             )
 
             # BUG-011: Update child order state in OMS
@@ -1089,11 +1140,33 @@ def submit_twap_order(
                             )
                             remainder_oid = str(remainder_order.id)
                             order_ids.append(remainder_oid)
-                            total_filled += unfilled_qty
+                            # BUG-FIX (2026-04-17): poll the remainder market
+                            # order for actual filled_qty instead of assuming
+                            # the full unfilled_qty filled. Consistent with
+                            # the per-slice poll above.
+                            remainder_filled = 0
+                            try:
+                                _d2 = time.monotonic() + 2.0
+                                while time.monotonic() < _d2:
+                                    try:
+                                        _cur = client.get_order_by_id(remainder_oid)
+                                        remainder_filled = int(float(getattr(_cur, "filled_qty", 0) or 0))
+                                        _st = str(getattr(_cur, "status", "")).lower()
+                                        if remainder_filled >= unfilled_qty or _st in (
+                                            "filled", "partially_filled", "cancelled",
+                                            "canceled", "expired", "rejected",
+                                        ):
+                                            break
+                                    except Exception:
+                                        pass
+                                    time.sleep(0.2)
+                            except Exception as _pe2:
+                                logger.debug(f"TWAP remainder poll failed: {_pe2}")
+                            total_filled += remainder_filled
                             logger.info(
                                 f"V12 2.1: Remainder market order submitted: "
                                 f"{unfilled_qty} {signal.symbol} "
-                                f"order_id={remainder_oid}"
+                                f"order_id={remainder_oid} filled={remainder_filled}/{unfilled_qty}"
                             )
                         except Exception as mkt_err:
                             logger.error(
@@ -1114,8 +1187,18 @@ def submit_twap_order(
                                     f"for {signal.symbol}: {close_err2}"
                                 )
 
-            # Update total_filled to reflect actual broker fills
-            total_filled = actual_filled_qty
+            # Update total_filled to reflect actual broker fills across
+            # ALL order_ids (including any remainder market order submitted
+            # above). BUG-FIX (2026-04-17): previously overwrote with the
+            # pre-remainder query result, discarding remainder fills.
+            _final_filled = 0
+            for _oid in order_ids:
+                try:
+                    _o = client.get_order_by_id(_oid)
+                    _final_filled += int(float(getattr(_o, "filled_qty", 0) or 0))
+                except Exception:
+                    pass
+            total_filled = _final_filled
 
         # Sleep between slices (not after the last one)
         if i < slices - 1 and not slice_failed:

@@ -161,12 +161,28 @@ SECTOR_GROUPS = {
 # ============================================================
 
 STRATEGY_ALLOCATIONS = {
-    'STAT_MR': 0.25,         # V12 AUDIT: Reduced from 0.35 — crowded edge, high alpha decay
-    'VWAP': 0.13,            # V12 AUDIT: Reduced from 0.20 — overlaps with STAT_MR
-    'KALMAN_PAIRS': 0.27,    # V12 AUDIT: Increased from 0.20 — uncorrelated, diversifying
-    'ORB': 0.12,             # V12 AUDIT: Increased from 0.10 — good risk mgmt
-    'MICRO_MOM': 0.05,       # V12 AUDIT: Reduced from 0.10 — weak signals, high alpha decay
-    'PEAD': 0.18,            # V12 AUDIT: Increased from 0.05 — orthogonal, proven academic edge
+    # 2026-04-17: ORB demoted to 0.0 after CRITICAL alpha-decay alert. Its
+    # 0.12 weight is redistributed proportionally across the five remaining
+    # active strategies (scaled by 1/0.88) so the active total is back at
+    # 1.00 and no single already-concentrated strategy picks up all of it.
+    #     Pre-demotion: STAT_MR 0.25 / VWAP 0.13 / KALMAN_PAIRS 0.27 /
+    #                   MICRO_MOM 0.05 / PEAD 0.18  (sum 0.88, ORB 0.12)
+    #     Post:         0.28 / 0.15 / 0.31 / 0.06 / 0.20            (sum 1.00)
+    'STAT_MR': 0.28,         # 2026-04-17: +0.03 (was 0.25) — proportional pickup of ORB
+    'VWAP': 0.15,            # 2026-04-17: +0.02 (was 0.13) — proportional pickup of ORB
+    'KALMAN_PAIRS': 0.31,    # 2026-04-17: +0.04 (was 0.27) — proportional pickup of ORB
+    'ORB': 0.0,              # 2026-04-17: DEMOTED — CRITICAL alpha-decay alert.
+                             # Strategy code retained; re-enable when alpha recovers.
+    'MICRO_MOM': 0.06,       # 2026-04-17: +0.01 (was 0.05) — proportional pickup of ORB
+    'PEAD': 0.20,            # 2026-04-17: +0.02 (was 0.18) — proportional pickup of ORB
+}
+
+# 2026-04-17: strategies explicitly disabled pending alpha recovery. Scanner /
+# signal-processor should skip these. Keep separate from the allocations dict
+# so "0.0 weight" vs "disabled" can be distinguished in logs/metrics.
+DISABLED_STRATEGIES = {'ORB'}
+DISABLED_STRATEGIES_REASON = {
+    'ORB': 'CRITICAL alpha-decay alert on 2026-04-17',
 }
 
 # --- Statistical Mean Reversion ---
@@ -174,6 +190,12 @@ MR_ZSCORE_ENTRY = 1.5
 MR_ZSCORE_EXIT_FULL = 0.2
 MR_ZSCORE_EXIT_PARTIAL = 0.5
 MR_ZSCORE_STOP = 2.5
+# 2026-04-17: |z| above this threshold on an OPEN STAT_MR position forces a
+# full exit with reason mr_zscore_blowout (e.g. MSFT z=-16.45, AMZN z=-12.54
+# on 2026-04-17). Previously the exit path warned and held the position.
+# Guarded by the same 5-minute registered_at grace used in
+# exit_orchestrator._check_adaptive_exit to avoid flapping on fresh fills.
+MR_ZSCORE_FORCE_EXIT = 8.0
 MR_RSI_PERIOD = 7
 MR_RSI_OVERSOLD = 40
 MR_RSI_OVERBOUGHT = 60

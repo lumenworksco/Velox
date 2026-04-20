@@ -319,11 +319,18 @@ class StatMeanReversion:
                         hold_type="day",
                         # BUG-FIX (2026-04-15): Carry real OU params so the
                         # adaptive exit can compute a correct z-score instead
-                        # of fabricating mu=entry_price (which triggered
-                        # instant full_reversion).
+                        # of fabricating mu=entry_price.
+                        # BUG-FIX (2026-04-16): Store price_sigma (std of price
+                        # LEVELS) in ou_sigma — the adaptive exit uses this for
+                        # z-score math. The raw OU residual sigma (std of price
+                        # CHANGES) is ~2-3x smaller, which caused z to jump past
+                        # MR_ZSCORE_STOP (2.5) on normal tick noise and fire
+                        # premature stop_loss exits (HOOD -$210, LYFT -$38).
+                        # price_sigma matches the sigma used by STAT_MR itself
+                        # for stop/target placement (stop = mu - 2.5*price_sigma).
                         metadata={
                             'ou_mu': float(mu),
-                            'ou_sigma': float(sigma),
+                            'ou_sigma': float(price_sigma),
                             'ou_half_life_hours': float(half_life_hours_used),
                             'entry_zscore': float(zscore),
                         },
@@ -367,10 +374,11 @@ class StatMeanReversion:
                         stop_loss=round(stop_price, 2),
                         reason=f"MR short z={zscore:.2f} RSI={rsi:.0f}",
                         hold_type="day",
-                        # BUG-FIX (2026-04-15): Carry real OU params (see long side).
+                        # BUG-FIX (2026-04-15 + 2026-04-16): Carry real OU params,
+                        # use price_sigma not OU residual sigma (see long side).
                         metadata={
                             'ou_mu': float(mu),
-                            'ou_sigma': float(sigma),
+                            'ou_sigma': float(price_sigma),
                             'ou_half_life_hours': float(half_life_hours_used),
                             'entry_zscore': float(zscore),
                         },
@@ -451,15 +459,47 @@ class StatMeanReversion:
                 # Compute current z-score using price_sigma (consistent with scan())
                 zscore = (price - ou['mu']) / price_sigma
 
-                # BUG-FIX (2026-04-14): refuse to act on extreme z-scores.
-                # |z| > 8 means the OU model parameters are stale/inconsistent
-                # with the current price regime — do NOT blindly fire a stop.
-                if abs(zscore) > 8.0:
+                # BUG-FIX (2026-04-17): extreme-z force-exit.
+                # Previously this path warned "ignoring this cycle" and held
+                # the position while |z| blew out (Apr 17: MSFT z=-16.45,
+                # AMZN z=-12.54 sat open). Whether the blowout is a real
+                # adverse move or stale OU params, holding is the wrong
+                # default — force a full exit via the normal pipeline so the
+                # audit trail and risk accounting stay consistent.
+                #
+                # Guarded by the same 5-minute registered_at grace used in
+                # exit_orchestrator._check_adaptive_exit so a TWAP-delayed
+                # fill doesn't get force-exited the moment it goes live.
+                force_exit_threshold = getattr(config, 'MR_ZSCORE_FORCE_EXIT', 8.0)
+                if abs(zscore) >= force_exit_threshold:
+                    grace_anchor = getattr(trade, 'registered_at', None) or trade.entry_time
+                    past_grace = True
+                    if grace_anchor is not None:
+                        try:
+                            tz = grace_anchor.tzinfo
+                            _now_for_grace = now if getattr(now, 'tzinfo', None) else (
+                                datetime.now(tz) if tz else datetime.now()
+                            )
+                            past_grace = (_now_for_grace - grace_anchor) >= timedelta(minutes=5)
+                        except Exception:
+                            past_grace = True
+                    if not past_grace:
+                        logger.warning(
+                            "MR force-exit deferred (grace): z=%.2f %s — within 5min of registered_at",
+                            zscore, symbol,
+                        )
+                        continue
                     logger.warning(
-                        "MR exit: extreme z=%.2f for %s (price=%.2f mu=%.2f sigma=%.4f) "
-                        "— ignoring this cycle (OU params likely stale)",
+                        "MR force-exit: extreme z=%.2f for %s (price=%.2f mu=%.2f sigma=%.4f) "
+                        "— emitting full exit (reason=mr_zscore_blowout)",
                         zscore, symbol, price, ou['mu'], price_sigma,
                     )
+                    exits.append({
+                        "symbol": symbol,
+                        "action": "full",
+                        "reason": f"mr_zscore_blowout z={zscore:.2f}",
+                    })
+                    self._stop_cooldowns[symbol] = now
                     continue
 
                 # Time stop: 2x half_life

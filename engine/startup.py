@@ -109,6 +109,15 @@ def _init_optional(name: str, cls, enabled_flag: str, *args, **kwargs):
 
 def initialize_strategies():
     """Create all strategy instances."""
+    # 2026-04-17: log disabled strategies at startup so ops can confirm the
+    # demotion is in effect (see DISABLED_STRATEGIES in config/settings.py).
+    disabled = getattr(config, 'DISABLED_STRATEGIES', set()) or set()
+    reasons = getattr(config, 'DISABLED_STRATEGIES_REASON', {}) or {}
+    for name in sorted(disabled):
+        logger.warning(
+            "Strategy %s is DISABLED (entry scans skipped) — reason: %s",
+            name, reasons.get(name, "unspecified"),
+        )
     return {
         "stat_mr": StatMeanReversion(),
         "kalman_pairs": KalmanPairsTrader(),

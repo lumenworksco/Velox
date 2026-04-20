@@ -227,6 +227,13 @@ class TradeRecord:
     entry_mu: float = 0.0            # OU long-run mean at signal time
     entry_sigma: float = 0.0         # Rolling std of price LEVELS (for z-score math)
     entry_half_life_hours: float = 0.0  # OU half-life in hours (not bars)
+    # BUG-FIX (2026-04-16): entry_time is captured at signal-generation time,
+    # NOT at actual fill time. TWAP execution takes ~5 minutes (5 slices x 60s),
+    # so by the time register_trade() fires, entry_time is already ~5min old
+    # and any grace period anchored on it is already expired. registered_at
+    # captures the moment the trade actually became "live" in risk.open_trades
+    # — use this for grace-period math in adaptive exits.
+    registered_at: datetime | None = None
 
 
 @dataclass
@@ -417,6 +424,12 @@ class RiskManager:
 
     def register_trade(self, trade: TradeRecord):
         """Register a new open trade (thread-safe)."""
+        # BUG-FIX (2026-04-16): stamp registered_at at the moment the trade
+        # becomes live so grace-period math is anchored on actual fill time
+        # rather than signal-generation time (TWAP execution gap can be 5+ min).
+        if trade.registered_at is None:
+            tz = trade.entry_time.tzinfo if trade.entry_time else None
+            trade.registered_at = datetime.now(tz) if tz else datetime.now()
         with self._lock:
             self.open_trades[trade.symbol] = trade
             self.signals_today += 1
