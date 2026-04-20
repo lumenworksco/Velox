@@ -164,9 +164,18 @@ STRATEGY_ALLOCATIONS = {
     'STAT_MR': 0.25,         # V12 AUDIT: Reduced from 0.35 — crowded edge, high alpha decay
     'VWAP': 0.13,            # V12 AUDIT: Reduced from 0.20 — overlaps with STAT_MR
     'KALMAN_PAIRS': 0.27,    # V12 AUDIT: Increased from 0.20 — uncorrelated, diversifying
-    'ORB': 0.12,             # V12 AUDIT: Increased from 0.10 — good risk mgmt
+    'ORB': 0.0,              # 2026-04-17: DEMOTED — CRITICAL alpha-decay alert.
+                             # Strategy code retained; re-enable when alpha recovers.
     'MICRO_MOM': 0.05,       # V12 AUDIT: Reduced from 0.10 — weak signals, high alpha decay
     'PEAD': 0.18,            # V12 AUDIT: Increased from 0.05 — orthogonal, proven academic edge
+}
+
+# 2026-04-17: strategies explicitly disabled pending alpha recovery. Scanner /
+# signal-processor should skip these. Keep separate from the allocations dict
+# so "0.0 weight" vs "disabled" can be distinguished in logs/metrics.
+DISABLED_STRATEGIES = {'ORB'}
+DISABLED_STRATEGIES_REASON = {
+    'ORB': 'CRITICAL alpha-decay alert on 2026-04-17',
 }
 
 # --- Statistical Mean Reversion ---
@@ -174,6 +183,12 @@ MR_ZSCORE_ENTRY = 1.5
 MR_ZSCORE_EXIT_FULL = 0.2
 MR_ZSCORE_EXIT_PARTIAL = 0.5
 MR_ZSCORE_STOP = 2.5
+# 2026-04-17: |z| above this threshold on an OPEN STAT_MR position forces a
+# full exit with reason mr_zscore_blowout (e.g. MSFT z=-16.45, AMZN z=-12.54
+# on 2026-04-17). Previously the exit path warned and held the position.
+# Guarded by the same 5-minute registered_at grace used in
+# exit_orchestrator._check_adaptive_exit to avoid flapping on fresh fills.
+MR_ZSCORE_FORCE_EXIT = 8.0
 MR_RSI_PERIOD = 7
 MR_RSI_OVERSOLD = 40
 MR_RSI_OVERBOUGHT = 60

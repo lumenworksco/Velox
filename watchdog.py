@@ -399,6 +399,19 @@ class PositionReconciler:
                 logger.warning(
                     f"RECONCILER: Phantom position {symbol} — removing from DB"
                 )
+                # BUG-FIX (2026-04-17, Bug D): also remove from
+                # risk_manager.open_trades, otherwise the next
+                # save_open_positions() in main.py re-inserts the phantom
+                # into the DB from the in-memory risk state.
+                try:
+                    from container import Container
+                    rm = Container.instance().risk_manager
+                    if rm is not None:
+                        rm.cancel_trade(symbol, reason="reconciler_phantom")
+                except Exception as _e:
+                    logger.debug(
+                        f"RECONCILER: risk.cancel_trade failed for {symbol}: {_e}"
+                    )
                 self._remove_from_db(symbol)
 
             elif at_broker and not in_db:
@@ -419,6 +432,19 @@ class PositionReconciler:
                         f"DB={db_qty}, broker={broker_qty} — updating DB"
                     )
                     self._update_qty_in_db(symbol, broker_qty)
+                    # BUG-FIX (2026-04-17, Bug F): also update the
+                    # in-memory risk_manager.open_trades qty; otherwise the
+                    # next save_open_positions() overwrites the DB back to
+                    # the stale qty.
+                    try:
+                        from container import Container
+                        rm = Container.instance().risk_manager
+                        if rm is not None and symbol in rm.open_trades:
+                            rm.open_trades[symbol].qty = broker_qty
+                    except Exception as _e:
+                        logger.debug(
+                            f"RECONCILER: risk qty update failed for {symbol}: {_e}"
+                        )
 
         all_reconciled = len(phantoms) == 0 and len(unknowns) == 0 and len(mismatches) == 0
 

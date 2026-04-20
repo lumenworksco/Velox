@@ -7,17 +7,35 @@ from datetime import time
 class TestStrategyAllocations:
     """Tests for STRATEGY_ALLOCATIONS."""
 
-    def test_allocations_sum_to_one(self):
-        """All strategy allocations must sum to approximately 1.0."""
+    def test_allocations_sum_within_budget(self):
+        """Strategy allocations must sum to at most 1.0 (100% of capital).
+
+        2026-04-17: with demoted strategies (ORB weight=0 pending alpha
+        recovery), the total can drop below 1.0 — the gap stays in cash.
+        The invariant is that allocations never OVER-commit the budget;
+        under-commitment is acceptable and intentional during demotion.
+        """
         import config
         total = sum(config.STRATEGY_ALLOCATIONS.values())
-        assert abs(total - 1.0) < 1e-9, f"Allocations sum to {total}, expected 1.0"
+        assert 0.5 <= total <= 1.0 + 1e-9, (
+            f"Allocations sum to {total} — outside acceptable [0.5, 1.0]"
+        )
 
-    def test_allocations_are_positive(self):
-        """Every allocation weight must be strictly positive."""
+    def test_allocations_are_non_negative(self):
+        """Every allocation weight must be non-negative.
+
+        2026-04-17: allow 0.0 for disabled strategies (previously required
+        strictly positive).
+        """
         import config
+        disabled = getattr(config, 'DISABLED_STRATEGIES', set()) or set()
         for strategy, weight in config.STRATEGY_ALLOCATIONS.items():
-            assert weight > 0, f"Allocation for {strategy} is not positive: {weight}"
+            assert weight >= 0, f"Allocation for {strategy} is negative: {weight}"
+            if strategy not in disabled:
+                assert weight > 0, (
+                    f"Active strategy {strategy} has zero weight — "
+                    f"add it to DISABLED_STRATEGIES if intended"
+                )
 
     def test_allocations_are_floats(self):
         """Allocation weights must be numeric (int or float)."""

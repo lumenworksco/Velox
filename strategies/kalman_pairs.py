@@ -19,6 +19,7 @@ from strategies.base import Signal
 from database import (
     save_kalman_pair, get_active_kalman_pairs,
     deactivate_kalman_pair, deactivate_all_kalman_pairs,
+    record_kalman_p_reset, get_recent_kalman_p_reset_counts,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,29 @@ class KalmanPairsTrader:
         # V12 2.6: Track consecutive data-fetch failures per pair for halt detection
         self._pair_fetch_failures: dict[str, int] = {}  # pair_id -> consecutive failure count
         self._HALT_FAILURE_THRESHOLD = 3  # Close pair after this many consecutive failures
+
+        # 2026-04-17: Rolling 24h P-matrix reset tracking. A pair that resets
+        # >3 times in 24h is considered numerically broken and skipped for
+        # the rest of the session (Apr 17: BAC_GS, CRM_NOW, JPM_GS, JPM_BAC,
+        # GLD_SLV, AMD_INTC all hit the reset path). Counts persist across
+        # restarts via the kalman_p_resets table so a crash-loop can't
+        # silently reset the safeguard.
+        self._P_RESET_WINDOW_HOURS = 24
+        self._P_RESET_MAX = 3
+        self._p_reset_times: dict[str, list[datetime]] = {}
+        self._skipped_pairs: set[str] = set()
+        try:
+            recent = get_recent_kalman_p_reset_counts(self._P_RESET_WINDOW_HOURS)
+            for pk, n in recent.items():
+                if n > self._P_RESET_MAX:
+                    self._skipped_pairs.add(pk)
+                    logger.warning(
+                        "Kalman pair %s has %d P-resets in last %dh (from DB) — "
+                        "skipping for this session",
+                        pk, n, self._P_RESET_WINDOW_HOURS,
+                    )
+        except Exception as e:
+            logger.debug(f"Kalman P-reset history load failed: {e}")
 
     def reset_daily(self):
         """Don't clear pairs — they persist for up to a week."""
@@ -341,6 +365,35 @@ class KalmanPairsTrader:
             '_spread': spread,  # Kept for half-life estimation, not persisted
         }
 
+    def _register_p_reset(self, pair_key: str, reason: str) -> None:
+        """Record a P-matrix reset event (in-memory + DB) and auto-skip the
+        pair for the rest of the session if it exceeds the rolling 24h cap.
+
+        2026-04-17: added in response to 6 pairs hitting ill-conditioned P
+        in a single session. A pair that resets more than _P_RESET_MAX
+        times within _P_RESET_WINDOW_HOURS is numerically unstable and
+        continuing to trade it risks runaway hedge-ratio divergence.
+        """
+        now = datetime.now(config.ET)
+        window_start = now - timedelta(hours=self._P_RESET_WINDOW_HOURS)
+        times = self._p_reset_times.setdefault(pair_key, [])
+        times.append(now)
+        # Prune entries outside the rolling window
+        self._p_reset_times[pair_key] = [t for t in times if t >= window_start]
+        count = len(self._p_reset_times[pair_key])
+        try:
+            record_kalman_p_reset(pair_key, reason)
+        except Exception as e:
+            logger.debug(f"record_kalman_p_reset failed for {pair_key}: {e}")
+        if count > self._P_RESET_MAX and pair_key not in self._skipped_pairs:
+            self._skipped_pairs.add(pair_key)
+            logger.warning(
+                "Kalman pair %s P-reset count %d exceeds %d in last %dh "
+                "— skipping this pair for remainder of session (reason=%s)",
+                pair_key, count, self._P_RESET_MAX,
+                self._P_RESET_WINDOW_HOURS, reason,
+            )
+
     def _update_kalman(self, pair_key: str, price1: float, price2: float) -> float:
         """Update Kalman filter and return current spread z-score.
 
@@ -349,6 +402,13 @@ class KalmanPairsTrader:
 
         Returns z-score of the spread.
         """
+        # 2026-04-17: skip pairs that have been flagged as chronically
+        # ill-conditioned. Returning 0.0 makes the caller treat the pair
+        # as "no signal" without triggering entries or exits from stale
+        # state.
+        if pair_key in self._skipped_pairs:
+            return 0.0
+
         state = self.kalman_state.get(pair_key)
         if not state:
             return 0.0
@@ -390,6 +450,11 @@ class KalmanPairsTrader:
                     "V12 FINAL: P matrix pre-update reset for %s (cond > 1e6, count=%d)",
                     pair_key, _n,
                 )
+            self._register_p_reset(pair_key, "pre_update_cond")
+            if pair_key in self._skipped_pairs:
+                # Skip was just triggered — drop out without computing an update.
+                state['P'] = P
+                return 0.0
 
         # Innovation covariance
         R = config.KALMAN_OBS_NOISE  # Observation noise
@@ -441,11 +506,13 @@ class KalmanPairsTrader:
                         f"(cond={cond:.2e}, count={_n}), resetting to identity"
                     )
                 P = np.eye(2) * 1.0
+                self._register_p_reset(pair_key, "post_update_cond")
         except np.linalg.LinAlgError:
             logger.warning(
                 f"V12 2.7: P matrix singular for {pair_key}, resetting to identity"
             )
             P = np.eye(2) * 1.0
+            self._register_p_reset(pair_key, "singular")
 
         # BUG-014: Assert dimensions after Kalman update to catch corruption early
         assert theta.shape == (2,), (

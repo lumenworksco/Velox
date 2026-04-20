@@ -312,12 +312,19 @@ def scan_all_strategies(
     else:
         logger.debug("V12 4.2: KALMAN_PAIRS skipped — outside time window at %s", current.time())
 
-    if orb_strategy and is_strategy_in_time_window("ORB", current):
+    # 2026-04-17: respect DISABLED_STRATEGIES — skip entry scans for
+    # strategies we've demoted (exit management still runs via
+    # exit_orchestrator so existing positions can be closed cleanly).
+    import config as _cfg_ds
+    _disabled = getattr(_cfg_ds, 'DISABLED_STRATEGIES', set()) or set()
+    if orb_strategy and is_strategy_in_time_window("ORB", current) and "ORB" not in _disabled:
         try:
             orb_signals = orb_strategy.scan(current, regime)
             signals.extend(orb_signals)
         except Exception as e:
             logger.error(f"ORB scan failed: {e}")
+    elif orb_strategy and "ORB" in _disabled:
+        logger.debug("ORB scan skipped — strategy disabled in DISABLED_STRATEGIES")
     elif orb_strategy:
         logger.debug("V12 4.2: ORB skipped — outside time window at %s", current.time())
 

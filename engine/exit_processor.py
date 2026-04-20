@@ -246,9 +246,14 @@ def check_advanced_exits(risk: RiskManager, now: datetime) -> list[dict]:
                 if mu <= 0.0 or sigma <= 0.0:
                     continue
 
-                # Grace period: never exit in first 5 minutes
-                if trade.entry_time is not None:
-                    age = now - trade.entry_time
+                # Grace period: never exit in first 5 minutes after the trade
+                # actually became live (registered_at). BUG-FIX (2026-04-16):
+                # entry_time captures signal-gen time — TWAP takes 5 min so
+                # anchoring on entry_time means the grace is already expired
+                # when register_trade fires. Use registered_at instead.
+                grace_anchor = getattr(trade, 'registered_at', None) or trade.entry_time
+                if grace_anchor is not None:
+                    age = now - grace_anchor
                     if age < timedelta(minutes=5):
                         continue
 

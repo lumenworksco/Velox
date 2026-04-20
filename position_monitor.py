@@ -26,6 +26,11 @@ class PositionMonitor:
         self._subscribed_symbols: set[str] = set()
         self._close_callback = None  # Set by main.py to handle position closes
         self.monitoring_disabled = False  # Set True after repeated WS failures
+        # BUG-FIX (2026-04-16): subscribe_quotes can be called twice for the
+        # same symbol (once at stream connect, once via _add_subscription) so
+        # _on_quote fires N times per quote → N _trigger_close calls per tick.
+        # De-duplicate by tracking which symbols are already being closed.
+        self._close_in_progress: set[str] = set()
 
     @property
     def is_connected(self) -> bool:
@@ -70,6 +75,7 @@ class PositionMonitor:
     def unsubscribe(self, symbol: str):
         """Unsubscribe from quotes for a symbol."""
         self._subscribed_symbols.discard(symbol)
+        self._close_in_progress.discard(symbol)  # Clear dedup guard on unsubscribe
         if self._loop and self._stream and self._connected:
             self._loop.call_soon_threadsafe(
                 lambda: asyncio.ensure_future(self._remove_subscription(symbol))
@@ -80,6 +86,13 @@ class PositionMonitor:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         consecutive_failures = 0
+        # BUG-FIX (2026-04-17): exponential backoff on SSL-class errors.
+        # Apr 17 logs showed 3 SSL EOF disconnections within minutes that all
+        # reconnected instantly (same WEBSOCKET_RECONNECT_SEC as any other
+        # error), hammering the TLS handshake. Back off 1, 2, 4, 8, ... up
+        # to 60s on SSL-class failures, and reset on any successful message
+        # (see _on_quote). Non-SSL errors keep the existing fixed delay.
+        self._ssl_backoff_sec = 0.0
 
         while self._running:
             try:
@@ -97,6 +110,31 @@ class PositionMonitor:
                 logger.error(f"WebSocket error: {e}")
                 self._connected = False
                 consecutive_failures += 1
+                # Detect SSL-class errors by type or by message substring
+                # (the Alpaca stream client sometimes wraps the SSLError in
+                # a plain Exception with "EOF occurred in violation of
+                # protocol" or "SSL" in the message).
+                _is_ssl = False
+                try:
+                    import ssl as _ssl_mod
+                    if isinstance(e, _ssl_mod.SSLError):
+                        _is_ssl = True
+                except Exception:
+                    pass
+                if not _is_ssl:
+                    _msg = str(e).lower()
+                    if ("ssl" in _msg) or ("eof occurred" in _msg):
+                        _is_ssl = True
+                if _is_ssl:
+                    # 1s → 2 → 4 → 8 → 16 → 32 → cap 60
+                    if self._ssl_backoff_sec <= 0.0:
+                        self._ssl_backoff_sec = 1.0
+                    else:
+                        self._ssl_backoff_sec = min(60.0, self._ssl_backoff_sec * 2.0)
+                    logger.warning(
+                        "WebSocket SSL error — backing off %.1fs before reconnect",
+                        self._ssl_backoff_sec,
+                    )
 
                 # Alert after 3 consecutive failures
                 if consecutive_failures == 3:
@@ -123,13 +161,15 @@ class PositionMonitor:
                     self._last_disconnect_log = 0.0
                 import time as _time_mod
                 _now_ts = _time_mod.time()
+                # BUG-FIX (2026-04-17): use SSL backoff delay when active.
+                _delay = self._ssl_backoff_sec if self._ssl_backoff_sec > 0 else config.WEBSOCKET_RECONNECT_SEC
                 if _now_ts - self._last_disconnect_log > 60:
                     logger.info(
                         f"WebSocket disconnected, reconnecting in "
-                        f"{config.WEBSOCKET_RECONNECT_SEC}s..."
+                        f"{_delay:.1f}s..."
                     )
                     self._last_disconnect_log = _now_ts
-                _time_mod.sleep(config.WEBSOCKET_RECONNECT_SEC)
+                _time_mod.sleep(_delay)
 
     async def _connect_and_stream(self):
         """Connect to Alpaca WebSocket and stream quotes."""
@@ -165,6 +205,12 @@ class PositionMonitor:
                 return
 
             self._stream.subscribe_quotes(self._on_quote, *symbols)
+            # Track which symbols are already subscribed in this stream session.
+            # BUG-FIX (2026-04-16): _add_subscription must NOT re-subscribe
+            # symbols that were already registered at connect time, otherwise
+            # subscribe_quotes is called twice → _on_quote fires twice per quote
+            # → hundreds of duplicate log lines and redundant close callbacks.
+            self._stream_subscribed: set[str] = set(symbols)
 
             self._connected = True
             logger.info(f"WebSocket connected, monitoring {len(symbols)} symbols")
@@ -177,6 +223,11 @@ class PositionMonitor:
 
     async def _on_quote(self, quote):
         """Handle incoming quote — check SL/TP/trailing stop."""
+        # BUG-FIX (2026-04-17): any successful message resets the SSL
+        # backoff — the connection is healthy, so the next disconnect
+        # should start fresh at 1s rather than continuing the ramp.
+        if getattr(self, "_ssl_backoff_sec", 0.0) > 0.0:
+            self._ssl_backoff_sec = 0.0
         try:
             symbol = quote.symbol
             if symbol not in self._risk.open_trades:
@@ -228,7 +279,16 @@ class PositionMonitor:
             logger.error(f"WS quote handler error for {quote.symbol}: {e}")
 
     def _trigger_close(self, symbol: str, reason: str):
-        """Trigger a position close via the callback."""
+        """Trigger a position close via the callback.
+
+        BUG-FIX (2026-04-16): De-duplicate close triggers — duplicate
+        subscribe_quotes registrations cause _on_quote to fire N times per
+        tick, generating hundreds of spurious 'WS: PLTR hit take profit' log
+        lines and N redundant close callbacks. Guard with _close_in_progress.
+        """
+        if symbol in self._close_in_progress:
+            return
+        self._close_in_progress.add(symbol)
         if self._close_callback:
             try:
                 self._close_callback(symbol, reason)
@@ -239,7 +299,13 @@ class PositionMonitor:
         """Add a symbol subscription to the running stream."""
         try:
             if self._stream:
+                # BUG-FIX (2026-04-16): skip if already subscribed in this
+                # stream session (it was already registered at connect time).
+                if hasattr(self, '_stream_subscribed') and symbol in self._stream_subscribed:
+                    return
                 self._stream.subscribe_quotes(self._on_quote, symbol)
+                if hasattr(self, '_stream_subscribed'):
+                    self._stream_subscribed.add(symbol)
                 logger.info(f"WS: Subscribed to {symbol}")
         except Exception as e:
             logger.error(f"WS: Failed to subscribe to {symbol}: {e}")

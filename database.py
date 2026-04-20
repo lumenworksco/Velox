@@ -9,7 +9,7 @@ import logging
 import queue
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -576,6 +576,18 @@ def init_db():
             last_updated TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_kalman_active ON kalman_pairs(active);
+
+        -- 2026-04-17: per-pair Kalman P-matrix reset event log, used to
+        -- skip chronically ill-conditioned pairs (>3 resets in 24h). One
+        -- row per reset event so rolling-window queries are straightforward.
+        CREATE TABLE IF NOT EXISTS kalman_p_resets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pair_key TEXT NOT NULL,
+            reset_time TEXT NOT NULL,
+            reason TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_kpr_pair_time
+            ON kalman_p_resets(pair_key, reset_time);
 
         -- V6: Daily consistency metrics
         CREATE TABLE IF NOT EXISTS consistency_log (
@@ -1374,6 +1386,31 @@ def deactivate_all_kalman_pairs():
     conn = _get_conn()
     conn.execute("UPDATE kalman_pairs SET active = 0")
     conn.commit()
+
+
+# 2026-04-17: Kalman P-matrix reset tracking ---------------------------------
+
+def record_kalman_p_reset(pair_key: str, reason: str = ""):
+    """Append a Kalman P-matrix reset event for rolling-window analysis."""
+    conn = _get_conn()
+    now_str = _to_iso(datetime.now(config.ET))
+    conn.execute(
+        "INSERT INTO kalman_p_resets (pair_key, reset_time, reason) VALUES (?, ?, ?)",
+        (pair_key, now_str, reason),
+    )
+    conn.commit()
+
+
+def get_recent_kalman_p_reset_counts(hours: int = 24) -> dict[str, int]:
+    """Return {pair_key: count} of resets within the last N hours."""
+    conn = _get_conn()
+    cutoff = _to_iso(datetime.now(config.ET) - timedelta(hours=hours))
+    rows = conn.execute(
+        "SELECT pair_key, COUNT(*) AS n FROM kalman_p_resets "
+        "WHERE reset_time >= ? GROUP BY pair_key",
+        (cutoff,),
+    ).fetchall()
+    return {r['pair_key']: int(r['n']) for r in rows}
 
 
 # =============================================================================

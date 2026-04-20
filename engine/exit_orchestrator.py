@@ -633,11 +633,16 @@ class ExitOrchestrator:
                 return None
 
             # --- Gate 2: grace period — never exit in first 5 minutes -----
-            # Defense in depth against stale/wrong params. A real reversion
-            # on a 24h-half-life process cannot happen in < 5 minutes.
-            if trade.entry_time is not None:
+            # BUG-FIX (2026-04-16): anchor on registered_at, not entry_time.
+            # entry_time is captured at signal-generation time; TWAP execution
+            # takes ~5min so entry_time is already 5min old when the trade
+            # actually goes live. HOOD/LYFT lost money on 2026-04-16 because
+            # age(entry_time)=5:17 already exceeded the 5-min grace at exit.
+            # registered_at is set by risk.register_trade() at actual fill time.
+            grace_anchor = getattr(trade, 'registered_at', None) or trade.entry_time
+            if grace_anchor is not None:
                 from datetime import datetime as _dt, timedelta as _td
-                age = _dt.now(trade.entry_time.tzinfo) - trade.entry_time
+                age = _dt.now(grace_anchor.tzinfo) - grace_anchor
                 if age < _td(minutes=5):
                     return None
 
