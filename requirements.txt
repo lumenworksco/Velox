@@ -37,7 +37,7 @@ structlog==25.5.0
 prometheus-client==0.24.1
 
 # LLM (optional)
-anthropic==0.94.1
+anthropic==0.96.0
 
 # Testing
 pytest==9.0.3
